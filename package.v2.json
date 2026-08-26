@@ -1,0 +1,18 @@
+{
+  "MediaArchiver": {
+    "name": "媒体一键归档",
+    "description": "在线验证 Emby 剧集所属平台，并归档 Remux、平台剧集及伦理内容。",
+    "labels": "Emby,TMDb,115,媒体库",
+    "version": "1.2.0",
+    "icon": "folder-move.svg",
+    "author": "李明宇",
+    "system_version": ">=2.0.0",
+    "level": 1,
+    "history": {
+      "v1.2.0": "增加 TMDb 在线验证，按剧名或 TMDb 编号识别平台并移动整部剧集文件夹",
+      "v1.1.1": "严格按需求使用 copy2/move，并补全苹果关键词和专区优先级",
+      "v1.1.0": "修复按钮与 Emby Items 接口，增加后台执行、分页和状态页",
+      "v1.0.0": "首次发布"
+    }
+  }
+}
