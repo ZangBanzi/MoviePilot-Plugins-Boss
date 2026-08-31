@@ -1,6 +1,6 @@
 # 媒体虚拟库（MoviePilot v2）
 
-版本：`3.2.0`  
+版本：`3.2.1`  
 作者：`Boss`  
 插件类/市场键：`MediaArchiver`
 
@@ -39,6 +39,10 @@ flowchart TD
 “自动维护新增与删除”默认开启。同步间隔、多服务器、TMDB 覆盖、自定义榜单 Feed 等低频参数都收在“高级设置（通常不用改）”中。
 
 > 配置页的 API Key 使用密码输入框。不要把真实 Key 写入 `README.md`、`package.v2.json`、GitHub Issue 或运行截图。
+
+### Emby 4.9 Collection 创建兼容
+
+`v3.2.1` 修复部分 Emby 4.9 构建在创建空 Collection 时返回 `HTTP 500 Object reference not set` 的问题。插件现在使用首个命中的原 Emby `ItemId` 作为种子创建 BoxSet，再补齐其余成员；规则当前零命中时不创建空 BoxSet，等首次命中后自动创建。
 
 ## 功能组成
 
@@ -173,7 +177,7 @@ MoviePilot-Plugins-Boss/
 
 1. 把新 `__init__.py` 覆盖到 `plugins.v2/mediaarchiver/__init__.py`。
 2. 把索引片段的内容合并到仓库根目录 `package.v2.json`；如果仓库只有这一个插件，可直接使用提供的完整文件。
-3. 提交到 GitHub `main` 分支，在 MoviePilot 插件市场刷新并升级到 `3.2.0`。
+3. 提交到 GitHub `main` 分支，在 MoviePilot 插件市场刷新并升级到 `3.2.1`。
 4. 打开插件，填写 Emby 302 服务器地址与 API Key。
 5. 按需开启“媒体属性专区”和/或“榜单虚拟库”，并选择具体专区/榜单。
 6. 保存后点“测试连接”，成功后点“一键重建”。如果旧版 MoviePilot 前端不执行插件按钮事件，展开高级设置，开启“旧版界面兼容：开启后保存即执行一次重建”再保存。
