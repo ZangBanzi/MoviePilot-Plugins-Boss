@@ -103,7 +103,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/3.2",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/3.2.1",
             },
             method=method.upper(),
         )
@@ -179,12 +179,23 @@ class EmbyClient:
                     self._collection_cache[str(item["Name"]).strip().casefold()] = str(item["Id"])
         return self._collection_cache.get(name.strip().casefold())
 
-    def ensure_collection(self, name: str) -> str:
+    def ensure_collection(self, name: str, item_ids: Iterable[str] = ()) -> str:
+        """取得或创建 BoxSet。
+
+        Emby 4.9 的部分构建在创建空 Collection 时会抛 NullReferenceException，
+        因此新建时必须同时传入至少一个真实 ItemId 作为种子。
+        """
         existing = self.find_collection(name)
         if existing:
             return existing
+        seeds = sorted({str(item_id).strip() for item_id in item_ids if str(item_id).strip()})
+        if not seeds:
+            # 当前规则零命中时不创建空壳；以后首次命中时再创建。
+            return ""
         payload = self.request_json(
-            "POST", "/Collections", {"Name": name, "IsLocked": False},
+            "POST", "/Collections", {
+                "Name": name, "IsLocked": False, "Ids": seeds[0],
+            },
             expected=(200, 201, 204),
         )
         collection_id = payload.get("Id") or (payload.get("Collection") or {}).get("Id")
@@ -507,7 +518,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/3.2",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/3.2.1",
         }
         merged.update(headers or {})
         body = None
@@ -730,7 +741,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/3.2 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/3.2.1 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -939,7 +950,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "按媒体属性和热门榜单维护 Emby 原生 BoxSet，原 ItemId 与302播放链路保持不变。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "3.2.0"
+    plugin_version = "3.2.1"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -1796,8 +1807,12 @@ class MediaArchiver(_PluginBase):
             existing_id = str(attribute_collections.get(key) or "")
             if enabled:
                 collection_id, current = self._managed_collection(
-                    client, attribute_collections, key, rule["name"], create=True
+                    client, attribute_collections, key, rule["name"], create=True,
+                    initial_ids=desired_attributes[key],
                 )
+                if not collection_id:
+                    attribute_counts[key] = 0
+                    continue
                 change = self._reconcile(
                     client, collection_id, desired_attributes[key], current=current
                 )
@@ -1833,8 +1848,11 @@ class MediaArchiver(_PluginBase):
                 continue
             wanted = index.match(result.entries)
             collection_id, current = self._managed_collection(
-                client, ranking_collections, key, name, create=True
+                client, ranking_collections, key, name, create=True, initial_ids=wanted
             )
+            if not collection_id:
+                ranking_counts[key] = 0
+                continue
             change = self._reconcile(client, collection_id, wanted, current=current)
             added += change["added"]
             removed += change["removed"]
@@ -1893,6 +1911,7 @@ class MediaArchiver(_PluginBase):
         key: str,
         name: str,
         create: bool,
+        initial_ids: Iterable[str] = (),
     ) -> Tuple[str, Set[str]]:
         collection_id = str(mapping.get(key) or "")
         if collection_id:
@@ -1909,7 +1928,9 @@ class MediaArchiver(_PluginBase):
                 client._collection_cache = None
         if not create:
             return "", set()
-        collection_id = client.ensure_collection(name)
+        collection_id = client.ensure_collection(name, initial_ids)
+        if not collection_id:
+            return "", set()
         mapping[key] = collection_id
         return collection_id, client.collection_members(collection_id)
 
