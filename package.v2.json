@@ -1,17 +1,17 @@
 {
   "MediaArchiver": {
-    "name": "Boss 媒体一键归档",
-    "description": "低占用整理 STRM，或通过 CloudDrive2 服务端整理 115 网盘文件。",
-    "labels": "STRM,CloudDrive2,115,Emby,媒体库",
-    "version": "2.2.0",
+    "name": "媒体虚拟库",
+    "description": "TgtoDrive风格的Emby 302直连与榜单投射 + Remux/4K/Dolby Vision/HDR/Atmos属性专区；只维护BoxSet。",
+    "labels": "Emby,Collection,BoxSet,虚拟库,榜单,Netflix,Disney+,Remux,4K,HDR,Dolby Vision,Atmos",
+    "version": "3.2.0",
     "icon": "folder-move.svg",
     "author": "Boss",
+    "system_version": ">=2.0.0",
     "level": 1,
     "history": {
-      "v2.2.0": "改用MoviePilot V2标准onlyonce保存触发，修复点击后任务完全不运行",
-      "v2.1.0": "修复V2按钮调用；增加STRM/原网盘分页、CD2地址配置和数据页运行日志",
-      "v2.0.0": "新增 STRM 与 CD2 WebDAV 双模式；自动识别电影/电视剧路径；服务端 MOVE/COPY；优化扫描和 NAS 占用",
-      "v1.0.0": "首次发布"
+      "v3.2.0": "配置页改为Emby 302地址/API Key直连优先，新增连接测试、傻瓜式功能开关、折叠高级设置和友好状态页；旧MoviePilot服务器配置仍可兼容",
+      "v3.1.0": "在五类属性专区上新增 TgtoDrive 风格的 12 组平台榜单选择、多 Emby 服务器、独立 BoxSet、外部源失败保护和增量差异清理；不包含榜单合集梯队功能",
+      "v3.0.0": "彻底重写为 Emby 媒体属性虚拟库；新增五类 Collection、全量重建、Webhook 增量同步和删除清理；不再包含 STRM/CD2/115 文件整理功能"
     }
   }
 }
