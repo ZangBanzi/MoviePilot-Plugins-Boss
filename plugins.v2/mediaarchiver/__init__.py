@@ -1,14 +1,21 @@
-"""MoviePilot v2：媒体属性专区 + TgtoDrive 风格榜单虚拟库。
+"""MoviePilot v2：媒体属性 + 榜单首页虚拟媒体库。
 
-只维护 Emby Collection/BoxSet 与原媒体 ItemId 的逻辑关联；不访问、不移动、
-不复制、不重命名任何真实媒体文件，也不会改写 MediaSource.Path。
+通过轻量 Emby 反向代理向 ``/Users/{id}/Views`` 注入一级媒体库，
+再把虚拟库查询映射回原媒体 ItemId。不创建 Collection/BoxSet，不访问、
+不移动、不复制、不重命名真实媒体文件，也不改写 MediaSource.Path。
 """
 from __future__ import annotations
 
 import html
+import hashlib
+import http.client
+import http.server
 import json
 import math
 import re
+import select
+import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -46,7 +53,8 @@ class EmbyClient:
 
     ITEM_FIELDS = (
         "Path,FileName,MediaSources,MediaStreams,Width,Height,Container,"
-        "ProviderIds,ProductionYear,PremiereDate,OriginalTitle,SortName,Genres,Studios"
+        "ProviderIds,ProductionYear,PremiereDate,DateCreated,DateLastSaved,"
+        "OriginalTitle,SortName,Genres,Studios,CommunityRating,OfficialRating"
     )
 
     def __init__(self, base_url: str, api_key: str, timeout: int = 30):
@@ -61,7 +69,6 @@ class EmbyClient:
         self.api_key = str(api_key).strip()
         self.timeout = max(5, min(int(timeout), 120))
         self.api_root = self._discover_api_root()
-        self._collection_cache: Optional[Dict[str, str]] = None
 
     def _discover_api_root(self) -> str:
         candidates = [self.base_url]
@@ -103,7 +110,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/3.2.1",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.0.0",
             },
             method=method.upper(),
         )
@@ -169,45 +176,6 @@ class EmbyClient:
                 return None
             raise
 
-    def find_collection(self, name: str) -> Optional[str]:
-        if self._collection_cache is None:
-            self._collection_cache = {}
-            for item in self._paged_items(
-                Recursive=True, IncludeItemTypes="BoxSet", Fields="Path"
-            ):
-                if item.get("Id") and item.get("Name"):
-                    self._collection_cache[str(item["Name"]).strip().casefold()] = str(item["Id"])
-        return self._collection_cache.get(name.strip().casefold())
-
-    def ensure_collection(self, name: str, item_ids: Iterable[str] = ()) -> str:
-        """取得或创建 BoxSet。
-
-        Emby 4.9 的部分构建在创建空 Collection 时会抛 NullReferenceException，
-        因此新建时必须同时传入至少一个真实 ItemId 作为种子。
-        """
-        existing = self.find_collection(name)
-        if existing:
-            return existing
-        seeds = sorted({str(item_id).strip() for item_id in item_ids if str(item_id).strip()})
-        if not seeds:
-            # 当前规则零命中时不创建空壳；以后首次命中时再创建。
-            return ""
-        payload = self.request_json(
-            "POST", "/Collections", {
-                "Name": name, "IsLocked": False, "Ids": seeds[0],
-            },
-            expected=(200, 201, 204),
-        )
-        collection_id = payload.get("Id") or (payload.get("Collection") or {}).get("Id")
-        if not collection_id:
-            self._collection_cache = None
-            collection_id = self.find_collection(name)
-        if not collection_id:
-            raise RuntimeError(f"Emby 已响应创建，但未能取得 Collection：{name}")
-        if self._collection_cache is not None:
-            self._collection_cache[name.strip().casefold()] = str(collection_id)
-        return str(collection_id)
-
     def collection_members(self, collection_id: str) -> Set[str]:
         items = self._paged_items(
             ParentId=collection_id,
@@ -228,14 +196,6 @@ class EmbyClient:
         if batch:
             yield batch
 
-    def add_items(self, collection_id: str, item_ids: Iterable[str]) -> None:
-        for batch in self._chunks(sorted(set(item_ids))):
-            self.request_json(
-                "POST",
-                f"/Collections/{urllib.parse.quote(collection_id, safe='')}/Items",
-                {"Ids": ",".join(batch)}, expected=(200, 204),
-            )
-
     def remove_items(self, collection_id: str, item_ids: Iterable[str]) -> None:
         for batch in self._chunks(sorted(set(item_ids))):
             path = f"/Collections/{urllib.parse.quote(collection_id, safe='')}/Items"
@@ -246,6 +206,59 @@ class EmbyClient:
                 if err.status not in (404, 405):
                     raise
                 self.request_json("POST", path + "/Delete", query, expected=(200, 204))
+
+
+class VirtualProxyServer(http.server.ThreadingHTTPServer):
+    """MoviePilot 插件内的轻量 Emby 反代服务。"""
+
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, address: Tuple[str, int], owner: Any):
+        self.owner = owner
+        super().__init__(address, VirtualProxyHandler)
+
+
+class VirtualProxyHandler(http.server.BaseHTTPRequestHandler):
+    """仅负责 HTTP 入口；虚拟视图与上游转发由插件实例处理。"""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "MediaVirtualLibrary/4.0"
+
+    def _dispatch(self) -> None:
+        try:
+            self.server.owner._proxy_dispatch(self)  # type: ignore[attr-defined]
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as err:  # pragma: no cover - 真实网络容错
+            try:
+                self.server.owner._record("ERROR", f"虚拟库反代请求失败：{err}")  # type: ignore[attr-defined]
+                payload = json.dumps(
+                    {"error": "Media virtual-library proxy failed", "detail": str(err)},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                self.send_response(502)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(payload)
+            except Exception:
+                pass
+            self.close_connection = True
+
+    do_GET = _dispatch
+    do_HEAD = _dispatch
+    do_POST = _dispatch
+    do_PUT = _dispatch
+    do_PATCH = _dispatch
+    do_DELETE = _dispatch
+    do_OPTIONS = _dispatch
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        # 避免每个海报/API 请求刷屏，错误会进入插件运行日志。
+        return
 
 
 @dataclass(frozen=True)
@@ -365,7 +378,7 @@ class RankingFetcher:
     """独立榜单取数层。
 
     精确来源优先级：自定义 JSON Feed > 官方/公开接口 > 网页兼容解析。
-    任何来源失败都会返回 ``ok=False``，同步层会保留旧 BoxSet，不会误清空。
+    任何来源失败都会返回 ``ok=False``，同步层会保留上次虚拟库成员，不会误清空。
     """
 
     PLATFORM_PROVIDERS: Dict[str, Tuple[str, ...]] = {
@@ -518,7 +531,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/3.2.1",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.0.0",
         }
         merged.update(headers or {})
         body = None
@@ -741,7 +754,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/3.2.1 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.0.0 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -945,12 +958,12 @@ class LibraryIndex:
 
 
 class MediaArchiver(_PluginBase):
-    """媒体属性专区与独立榜单虚拟库。"""
+    """媒体属性专区与独立榜单首页虚拟库。"""
 
     plugin_name = "媒体虚拟库"
-    plugin_desc = "按媒体属性和热门榜单维护 Emby 原生 BoxSet，原 ItemId 与302播放链路保持不变。"
+    plugin_desc = "把媒体属性和热门榜单注入 Emby 首页一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "3.2.1"
+    plugin_version = "4.0.0"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -980,6 +993,17 @@ class MediaArchiver(_PluginBase):
         self._emby_servers: List[str] = []
         self._manual_url = ""
         self._manual_key = ""
+        self._home_view_enabled = True
+        self._proxy_bind = "0.0.0.0"
+        self._proxy_port = 8099
+        self._proxy_server: Optional[VirtualProxyServer] = None
+        self._proxy_thread: Optional[threading.Thread] = None
+        self._proxy_lock = threading.RLock()
+        self._virtual_views: Dict[str, Dict[str, Any]] = {}
+        self._proxy_item_index: Dict[str, Dict[str, Any]] = {}
+        self._proxy_status: Dict[str, Any] = {
+            "running": False, "message": "反代未启动", "requests": 0,
+        }
         self._use_moviepilot_servers = False
         self._timeout = 30
         self._sync_interval = 60
@@ -1007,6 +1031,7 @@ class MediaArchiver(_PluginBase):
         self._ranking_cache: Dict[str, RankingResult] = {}
 
     def init_plugin(self, config: Optional[dict] = None) -> None:
+        self._stop_proxy()
         self._cancel_timers()
         self._stopping = False
         cfg = dict(config or {})
@@ -1030,10 +1055,19 @@ class MediaArchiver(_PluginBase):
         self._emby_servers = [str(x).strip() for x in selected_servers if str(x).strip()]
         self._manual_url = str(cfg.get("manual_url") or "").strip()
         incoming_key = str(cfg.get("manual_api_key") or "").strip()
-        # 某些前端会把密码框回传为星号；这不是新 Key，沿用内存中的旧值。
-        if incoming_key and set(incoming_key) == {"*"}:
-            incoming_key = self._manual_key
+        # 密码框留空或回传星号时沿用已保存 Key，避免只改端口就丢失连接。
+        saved_key = str(self.get_data("manual_api_key_secret") or "").strip()
+        if not incoming_key or set(incoming_key) == {"*"}:
+            incoming_key = saved_key or self._manual_key
+        elif incoming_key:
+            try:
+                self.save_data("manual_api_key_secret", incoming_key)
+            except Exception as err:
+                logger.warning("[媒体虚拟库] 保存 Emby API Key 失败：%s", err)
         self._manual_key = incoming_key
+        self._home_view_enabled = bool(cfg.get("home_view_enabled", True))
+        self._proxy_bind = str(cfg.get("proxy_bind") or "0.0.0.0").strip()
+        self._proxy_port = self._bounded_int(cfg.get("proxy_port"), 8099, 1024, 65535)
         self._use_moviepilot_servers = bool(cfg.get("use_moviepilot_servers", False))
         self._timeout = self._bounded_int(cfg.get("timeout"), 30, 5, 120)
         self._sync_interval = self._bounded_int(cfg.get("sync_interval"), 60, 10, 1440)
@@ -1055,6 +1089,10 @@ class MediaArchiver(_PluginBase):
         self._ranking_feed_url = str(cfg.get("ranking_feed_url") or "").strip()
         self._ranking_feed_token = str(cfg.get("ranking_feed_token") or "").strip()
         self._load_state()
+        self._restore_proxy_cache()
+
+        if self.get_state() and self._home_view_enabled:
+            self._start_proxy()
 
         if bool(cfg.get("rebuild_once", False)):
             reset = dict(cfg)
@@ -1105,6 +1143,123 @@ class MediaArchiver(_PluginBase):
         self.save_data("virtual_state", self._state)
         self.save_data("virtual_logs", list(self._logs))
 
+    @staticmethod
+    def _view_id(key: str) -> str:
+        """生成 Emby 风格的稳定 32 位 ID，同一专区重启后不变。"""
+        return hashlib.md5(f"mediaarchiver:{key}".encode("utf-8")).hexdigest()
+
+    def _restore_proxy_cache(self) -> None:
+        """从持久状态恢复虚拟库 ID/成员，等后台同步刷新媒体元数据。"""
+        states = [
+            value for value in (self._state.get("servers") or {}).values()
+            if isinstance(value, dict) and value.get("active", True)
+        ]
+        selected: Optional[Dict[str, Any]] = None
+        try:
+            wanted = urllib.parse.urlsplit(self._manual_url).netloc.casefold()
+        except Exception:
+            wanted = ""
+        if wanted:
+            for value in states:
+                try:
+                    if urllib.parse.urlsplit(str(value.get("api_root") or "")).netloc.casefold() == wanted:
+                        selected = value
+                        break
+                except Exception:
+                    continue
+        if selected is None and states:
+            selected = states[0]
+        restored: Dict[str, Dict[str, Any]] = {}
+        if selected:
+            for key, view in (selected.get("virtual_views") or {}).items():
+                if not isinstance(view, Mapping):
+                    continue
+                item_ids = [str(x) for x in (view.get("item_ids") or []) if str(x)]
+                if not item_ids:
+                    continue
+                normalized = dict(view)
+                normalized.update({
+                    "key": str(view.get("key") or key),
+                    "id": str(view.get("id") or self._view_id(str(key))),
+                    "item_ids": list(dict.fromkeys(item_ids)),
+                })
+                restored[str(normalized["id"])] = normalized
+        with self._proxy_lock:
+            self._virtual_views = restored
+
+    def _start_proxy(self) -> None:
+        """启动首页虚拟库反代；绑定失败不阻止 MoviePilot 本体启动。"""
+        if self._proxy_server or self._stopping:
+            return
+        if not self._manual_url:
+            self._proxy_status = {
+                "running": False, "message": "请先填写 Emby/302 上游地址", "requests": 0,
+            }
+            return
+        parsed = urllib.parse.urlsplit(self._manual_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            self._proxy_status = {
+                "running": False, "message": "Emby/302 上游地址无效", "requests": 0,
+            }
+            return
+        upstream_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if upstream_port == self._proxy_port and parsed.hostname in {
+            "127.0.0.1", "localhost", "0.0.0.0", self._proxy_bind,
+        }:
+            self._proxy_status = {
+                "running": False, "message": "反代端口不能与上游端口相同（会形成死循环）", "requests": 0,
+            }
+            return
+        try:
+            server = VirtualProxyServer((self._proxy_bind, self._proxy_port), self)
+            thread = threading.Thread(
+                target=server.serve_forever,
+                name="MediaVirtualLibraryProxy", daemon=True,
+            )
+            self._proxy_server = server
+            self._proxy_thread = thread
+            thread.start()
+            self._proxy_status = {
+                "running": True,
+                "message": f"已监听 {self._proxy_bind}:{self._proxy_port}",
+                "requests": 0,
+                "upstream": self._manual_url,
+            }
+            self._record(
+                "INFO", f"首页虚拟库反代已启动：{self._proxy_bind}:{self._proxy_port} -> {self._manual_url}",
+            )
+        except OSError as err:
+            self._proxy_server = None
+            self._proxy_thread = None
+            self._proxy_status = {
+                "running": False,
+                "message": f"反代端口启动失败：{err}",
+                "requests": 0,
+            }
+            self._record("ERROR", str(self._proxy_status["message"]))
+
+    def _stop_proxy(self) -> None:
+        server = getattr(self, "_proxy_server", None)
+        thread = getattr(self, "_proxy_thread", None)
+        self._proxy_server = None
+        self._proxy_thread = None
+        if server:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=3)
+        status = getattr(self, "_proxy_status", {})
+        self._proxy_status = {
+            "running": False, "message": "反代已停止",
+            "requests": int(status.get("requests") or 0),
+        }
+
     def get_state(self) -> bool:
         return bool(self._enabled and (self._attribute_enabled or self._ranking_enabled))
 
@@ -1129,12 +1284,80 @@ class MediaArchiver(_PluginBase):
              "auth": "bear", "summary": "测试已保存的 Emby 302 连接"},
             {"path": "/rebuild", "endpoint": self.rebuild, "methods": ["POST"],
              "auth": "bear", "summary": "一键重建全部虚拟库"},
+            {"path": "/cleanup_legacy_collections", "endpoint": self.cleanup_legacy_collections,
+             "methods": ["POST"], "auth": "bear", "summary": "清空旧版插件合集成员"},
             {"path": "/status", "endpoint": self.status, "methods": ["GET"],
              "auth": "bear", "summary": "查询同步状态"},
         ]
 
     def rebuild(self) -> schemas.Response:
         return self._start_sync("rebuild")
+
+    def cleanup_legacy_collections(self) -> schemas.Response:
+        """只清理 v3.x 已记录的 BoxSet 关联，不删除任何媒体 Item/文件。"""
+        if not self._run_lock.acquire(blocking=False):
+            return schemas.Response(success=False, message="已有同步或清理任务运行中")
+        try:
+            recorded: Set[str] = set()
+            states: List[Dict[str, Any]] = []
+            for state in (self._state.get("servers") or {}).values():
+                if not isinstance(state, dict):
+                    continue
+                states.append(state)
+                for field in ("attribute_collections", "ranking_collections"):
+                    recorded.update(
+                        str(value) for value in (state.get(field) or {}).values() if str(value)
+                    )
+            if not recorded:
+                return schemas.Response(
+                    success=True, message="未找到本插件记录的旧合集，无需清理",
+                    data={"collections": 0, "members": 0},
+                )
+            clients = self._create_clients()
+            cleared_members = cleared_collections = 0
+            failures: List[str] = []
+            for client, server_name in clients:
+                for collection_id in sorted(recorded):
+                    try:
+                        members = client.collection_members(collection_id)
+                        if members:
+                            client.remove_items(collection_id, members)
+                            cleared_members += len(members)
+                        cleared_collections += 1
+                    except EmbyHttpError as err:
+                        if err.status != 404:
+                            failures.append(f"{server_name}/{collection_id}：{err}")
+                    except Exception as err:
+                        failures.append(f"{server_name}/{collection_id}：{err}")
+            if failures and not cleared_collections:
+                raise RuntimeError("；".join(failures[:5]))
+            for state in states:
+                state["attribute_collections"] = {}
+                state["ranking_collections"] = {}
+                state["legacy_collections_cleaned"] = datetime.now().astimezone().isoformat(
+                    timespec="seconds"
+                )
+            self._save_state()
+            message = (
+                f"旧合集成员已清理：{cleared_collections} 个 BoxSet，"
+                f"{cleared_members} 条逻辑关联；原媒体与文件未删除"
+            )
+            if failures:
+                message += f"；{len(failures)} 项失败"
+            self._record("WARNING" if failures else "INFO", message)
+            return schemas.Response(
+                success=not failures, message=message,
+                data={
+                    "collections": cleared_collections, "members": cleared_members,
+                    "failures": failures,
+                },
+            )
+        except Exception as err:
+            message = f"清理旧合集失败：{err}"
+            self._record("ERROR", message)
+            return schemas.Response(success=False, message=message)
+        finally:
+            self._run_lock.release()
 
     def test_connection(self) -> schemas.Response:
         """测试已保存的 Emby 连接；只读取 System/Info，不扫描媒体库。"""
@@ -1170,10 +1393,440 @@ class MediaArchiver(_PluginBase):
             "selected_rankings": len(self._selected_rankings),
             "active_servers": active_servers,
             "source_status": self._state.get("source_status") or {},
+            "proxy": dict(self._proxy_status),
+            "virtual_views": len(self._virtual_views),
         })
         return schemas.Response(
             success=data.get("state") != "failed", message=str(data.get("message") or ""), data=data
         )
+
+    # ------------------------------------------------------------------
+    # Emby 首页虚拟库反向代理
+    # ------------------------------------------------------------------
+
+    _HOP_HEADERS = {
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailers", "transfer-encoding", "upgrade",
+    }
+
+    @staticmethod
+    def _route_path(path: str) -> str:
+        if path.casefold() == "/emby":
+            return "/"
+        if path.casefold().startswith("/emby/"):
+            return path[5:]
+        return path
+
+    @staticmethod
+    def _query_value(query: Mapping[str, List[str]], name: str, default: str = "") -> str:
+        for key, values in query.items():
+            if key.casefold() == name.casefold() and values:
+                return str(values[-1])
+        return default
+
+    def _proxy_dispatch(self, handler: VirtualProxyHandler) -> None:
+        self._proxy_status["requests"] = int(self._proxy_status.get("requests") or 0) + 1
+        parsed = urllib.parse.urlsplit(handler.path)
+        route = self._route_path(parsed.path)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+
+        if route.rstrip("/") == "/__mediaarchiver__/health":
+            self._send_json(handler, 200, {
+                "ok": True, "proxy": dict(self._proxy_status),
+                "views": len(self._virtual_views),
+                "items": len(self._proxy_item_index),
+            })
+            return
+
+        if str(handler.headers.get("Upgrade") or "").casefold() == "websocket":
+            self._proxy_websocket(handler)
+            return
+
+        views_match = re.fullmatch(r"/Users/[^/]+/Views/?", route, flags=re.I)
+        items_match = re.fullmatch(r"/Users/[^/]+/Items/?", route, flags=re.I)
+        latest_match = re.fullmatch(r"/Users/[^/]+/Items/Latest/?", route, flags=re.I)
+        detail_match = re.fullmatch(
+            r"/(?:Users/[^/]+/)?Items/([0-9a-f]{32})/?", route, flags=re.I
+        )
+        image_match = re.fullmatch(
+            r"/Items/([0-9a-f]{32})/Images/Primary(?:/\d+)?/?", route, flags=re.I
+        )
+
+        with self._proxy_lock:
+            view = dict(self._virtual_views.get(
+                self._query_value(query, "ParentId")
+            ) or {})
+
+        if detail_match:
+            with self._proxy_lock:
+                detail_view = dict(self._virtual_views.get(detail_match.group(1)) or {})
+            if detail_view:
+                self._send_json(handler, 200, self._synthetic_view(detail_view))
+                return
+
+        if image_match:
+            with self._proxy_lock:
+                image_view = dict(self._virtual_views.get(image_match.group(1)) or {})
+            if image_view:
+                item_ids = list(image_view.get("item_ids") or [])
+                if not item_ids:
+                    self._send_json(handler, 404, {"error": "virtual library is empty"})
+                    return
+                prefix = "/emby" if parsed.path.casefold().startswith("/emby/") else ""
+                target = (
+                    f"{prefix}/Items/{urllib.parse.quote(str(item_ids[0]), safe='')}"
+                    "/Images/Primary"
+                )
+                if parsed.query:
+                    target += "?" + parsed.query
+                self._proxy_forward(handler, target_path=target)
+                return
+
+        if (items_match or latest_match) and view:
+            self._serve_virtual_items(handler, view, query, latest=bool(latest_match))
+            return
+
+        if views_match:
+            self._proxy_forward(handler, transform=self._inject_views, force_identity=True)
+            return
+
+        self._proxy_forward(handler)
+
+    def _synthetic_view(
+        self, view: Mapping[str, Any], template: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        template = template or {}
+        view_id = str(view.get("id") or self._view_id(str(view.get("key") or view.get("name"))))
+        name = str(view.get("name") or "虚拟媒体库")
+        count = len(view.get("item_ids") or [])
+        return {
+            "Name": name,
+            "ServerId": str(template.get("ServerId") or view.get("server_id") or ""),
+            "Id": view_id,
+            "Guid": view_id,
+            "Etag": view_id,
+            "DateCreated": str(view.get("updated") or "2000-01-01T00:00:00.0000000Z"),
+            "CanDelete": False,
+            "CanDownload": False,
+            "SortName": name,
+            "ForcedSortName": name,
+            "ExternalUrls": [],
+            "Taglines": [],
+            "RemoteTrailers": [],
+            "ProviderIds": {},
+            "IsFolder": True,
+            "ParentId": str(template.get("ParentId") or "1"),
+            "Type": "CollectionFolder",
+            "CollectionType": str(view.get("collection_type") or "movies"),
+            "ChildCount": count,
+            "RecursiveItemCount": count,
+            "SupportsSync": True,
+            "UserData": {
+                "PlaybackPositionTicks": 0, "IsFavorite": False, "Played": False,
+            },
+        }
+
+    def _inject_views(
+        self, status: int, headers: List[Tuple[str, str]], body: bytes,
+    ) -> Tuple[int, List[Tuple[str, str]], bytes]:
+        if status < 200 or status >= 300:
+            return status, headers, body
+        payload = json.loads(body.decode("utf-8"))
+        if not isinstance(payload, dict):
+            return status, headers, body
+        items = payload.get("Items")
+        if not isinstance(items, list):
+            items = []
+            payload["Items"] = items
+        existing = {str(item.get("Id")) for item in items if isinstance(item, Mapping)}
+        template = next((item for item in items if isinstance(item, Mapping)), {})
+        with self._proxy_lock:
+            views = [dict(value) for value in self._virtual_views.values()]
+        for view in views:
+            if view.get("item_ids") and str(view.get("id")) not in existing:
+                items.append(self._synthetic_view(view, template))
+        payload["TotalRecordCount"] = len(items)
+        return status, headers, json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+
+    def _serve_virtual_items(
+        self,
+        handler: VirtualProxyHandler,
+        view: Mapping[str, Any],
+        query: Mapping[str, List[str]],
+        latest: bool,
+    ) -> None:
+        selected, total = self._select_view_item_ids(view, query, latest)
+        if not selected:
+            self._send_json(
+                handler, 200,
+                [] if latest else {"Items": [], "TotalRecordCount": total, "StartIndex": 0},
+            )
+            return
+
+        pairs = urllib.parse.parse_qsl(
+            urllib.parse.urlsplit(handler.path).query, keep_blank_values=True
+        )
+        discarded = {"parentid", "startindex", "limit", "ids", "sortby", "sortorder"}
+        pairs = [(key, value) for key, value in pairs if key.casefold() not in discarded]
+        pairs.extend([
+            ("Ids", ",".join(selected)),
+            ("Recursive", "true"),
+            ("StartIndex", "0"),
+            ("Limit", str(len(selected))),
+        ])
+        route = self._route_path(urllib.parse.urlsplit(handler.path).path)
+        raw_path = urllib.parse.urlsplit(handler.path).path
+        prefix = "/emby" if raw_path.casefold().startswith("/emby/") else ""
+        user_match = re.match(r"/Users/([^/]+)/", route, flags=re.I)
+        upstream_route = (
+            f"{prefix}/Users/{user_match.group(1)}/Items"
+            if user_match else f"{prefix}/Items"
+        )
+        target = upstream_route + "?" + urllib.parse.urlencode(pairs, doseq=True)
+
+        def transform(
+            status: int, headers: List[Tuple[str, str]], body: bytes,
+        ) -> Tuple[int, List[Tuple[str, str]], bytes]:
+            if status < 200 or status >= 300:
+                return status, headers, body
+            value = json.loads(body.decode("utf-8"))
+            raw_items = value.get("Items") if isinstance(value, dict) else value
+            if not isinstance(raw_items, list):
+                raw_items = []
+            by_id = {
+                str(item.get("Id")): item for item in raw_items if isinstance(item, Mapping)
+            }
+            ordered = [by_id[item_id] for item_id in selected if item_id in by_id]
+            result: Any = ordered if latest else {
+                "Items": ordered,
+                "TotalRecordCount": total,
+                "StartIndex": self._int_query(query, "StartIndex", 0, 0, 1_000_000),
+            }
+            return status, headers, json.dumps(
+                result, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+
+        self._proxy_forward(handler, target_path=target, transform=transform, force_identity=True)
+
+    def _select_view_item_ids(
+        self,
+        view: Mapping[str, Any],
+        query: Mapping[str, List[str]],
+        latest: bool,
+    ) -> Tuple[List[str], int]:
+        with self._proxy_lock:
+            index = dict(self._proxy_item_index)
+        ids = list(dict.fromkeys(str(x) for x in (view.get("item_ids") or []) if str(x)))
+        include_types = {
+            value.strip().casefold()
+            for value in self._query_value(query, "IncludeItemTypes").split(",") if value.strip()
+        }
+        search_term = self._query_value(query, "SearchTerm").strip().casefold()
+        years = {
+            self._number(value) for value in self._query_value(query, "Years").split(",") if value
+        }
+
+        def accepted(item_id: str) -> bool:
+            item = index.get(item_id) or {}
+            if include_types and str(item.get("Type") or "").casefold() not in include_types:
+                return False
+            if years and self._number(item.get("ProductionYear")) not in years:
+                return False
+            if search_term:
+                text = " ".join(str(item.get(key) or "") for key in (
+                    "Name", "OriginalTitle", "SortName", "ProductionYear",
+                )).casefold()
+                if search_term not in text:
+                    return False
+            return True
+
+        ids = [item_id for item_id in ids if accepted(item_id)]
+        sort_by = "DateCreated" if latest else self._query_value(query, "SortBy", "SortName").split(",")[0]
+        descending = latest or self._query_value(query, "SortOrder").casefold() == "descending"
+
+        def sort_key(item_id: str) -> Tuple[bool, Any, str]:
+            item = index.get(item_id) or {}
+            key = sort_by.casefold()
+            if key in {"datecreated", "datelastcontentadded", "datelastsaved", "premieredate"}:
+                value: Any = str(item.get(sort_by) or item.get("DateCreated") or item.get("PremiereDate") or "")
+            elif key in {"productionyear", "communityrating", "criticrating"}:
+                value = float(item.get(sort_by) or item.get("ProductionYear") or 0)
+            elif key == "random":
+                value = hashlib.sha1(item_id.encode("utf-8")).hexdigest()
+            else:
+                value = str(item.get(sort_by) or item.get("SortName") or item.get("Name") or "").casefold()
+            return (value in ("", 0, 0.0), value, item_id)
+
+        ids.sort(key=sort_key, reverse=descending)
+        total = len(ids)
+        start = 0 if latest else self._int_query(query, "StartIndex", 0, 0, 1_000_000)
+        default_limit = 16 if latest else 50
+        limit = self._int_query(query, "Limit", default_limit, 1, 200)
+        return ids[start:start + limit], total
+
+    def _int_query(
+        self, query: Mapping[str, List[str]], name: str, default: int,
+        minimum: int, maximum: int,
+    ) -> int:
+        return self._bounded_int(self._query_value(query, name, str(default)), default, minimum, maximum)
+
+    @staticmethod
+    def _send_json(handler: VirtualProxyHandler, status: int, value: Any) -> None:
+        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        if handler.command != "HEAD":
+            handler.wfile.write(payload)
+
+    def _upstream_path(self, incoming: str) -> str:
+        parsed_upstream = urllib.parse.urlsplit(self._manual_url)
+        parsed_incoming = urllib.parse.urlsplit(incoming)
+        base_path = parsed_upstream.path.rstrip("/")
+        path = parsed_incoming.path or "/"
+        if base_path and not (
+            path.casefold() == base_path.casefold()
+            or path.casefold().startswith(base_path.casefold() + "/")
+        ):
+            path = base_path + (path if path.startswith("/") else "/" + path)
+        if parsed_incoming.query:
+            path += "?" + parsed_incoming.query
+        return path
+
+    def _upstream_connection(self) -> Tuple[http.client.HTTPConnection, urllib.parse.SplitResult]:
+        target = urllib.parse.urlsplit(self._manual_url)
+        port = target.port or (443 if target.scheme == "https" else 80)
+        if target.scheme == "https":
+            return http.client.HTTPSConnection(
+                target.hostname, port, timeout=self._timeout,
+                context=ssl.create_default_context(),
+            ), target
+        return http.client.HTTPConnection(target.hostname, port, timeout=self._timeout), target
+
+    def _proxy_forward(
+        self,
+        handler: VirtualProxyHandler,
+        target_path: str = "",
+        transform: Optional[Callable[[int, List[Tuple[str, str]], bytes], Tuple[int, List[Tuple[str, str]], bytes]]] = None,
+        force_identity: bool = False,
+    ) -> None:
+        connection, target = self._upstream_connection()
+        length = self._number(handler.headers.get("Content-Length"))
+        body = handler.rfile.read(length) if length > 0 else None
+        headers: Dict[str, str] = {}
+        for key, value in handler.headers.items():
+            folded = key.casefold()
+            if folded in self._HOP_HEADERS or folded in {"host", "content-length"}:
+                continue
+            headers[key] = value
+        headers["Host"] = target.netloc
+        headers["X-Forwarded-For"] = handler.client_address[0]
+        headers["X-Forwarded-Proto"] = "https" if target.scheme == "https" else "http"
+        if force_identity:
+            headers["Accept-Encoding"] = "identity"
+        if body is not None:
+            headers["Content-Length"] = str(len(body))
+        request_target = self._upstream_path(target_path or handler.path)
+        try:
+            connection.request(handler.command, request_target, body=body, headers=headers)
+            response = connection.getresponse()
+            response_headers = list(response.getheaders())
+            if transform:
+                raw = response.read()
+                status, response_headers, raw = transform(
+                    int(response.status), response_headers, raw
+                )
+                handler.send_response(status)
+                for key, value in response_headers:
+                    if key.casefold() in self._HOP_HEADERS or key.casefold() in {
+                        "content-length", "content-encoding",
+                    }:
+                        continue
+                    handler.send_header(key, value)
+                handler.send_header("Content-Length", str(len(raw)))
+                handler.end_headers()
+                if handler.command != "HEAD":
+                    handler.wfile.write(raw)
+                return
+
+            handler.send_response(response.status, response.reason)
+            has_length = False
+            for key, value in response_headers:
+                folded = key.casefold()
+                if folded in self._HOP_HEADERS:
+                    continue
+                if folded == "content-length":
+                    has_length = True
+                handler.send_header(key, value)
+            if not has_length:
+                handler.send_header("Connection", "close")
+                handler.close_connection = True
+            handler.end_headers()
+            if handler.command != "HEAD":
+                while True:
+                    chunk = response.read(128 * 1024)
+                    if not chunk:
+                        break
+                    handler.wfile.write(chunk)
+        finally:
+            connection.close()
+
+    def _proxy_websocket(self, handler: VirtualProxyHandler) -> None:
+        target = urllib.parse.urlsplit(self._manual_url)
+        port = target.port or (443 if target.scheme == "https" else 80)
+        upstream: socket.socket = socket.create_connection(
+            (str(target.hostname), port), timeout=self._timeout
+        )
+        if target.scheme == "https":
+            upstream = ssl.create_default_context().wrap_socket(
+                upstream, server_hostname=str(target.hostname)
+            )
+        request_lines = [f"{handler.command} {self._upstream_path(handler.path)} HTTP/1.1"]
+        for key, value in handler.headers.items():
+            if key.casefold() == "host":
+                continue
+            request_lines.append(f"{key}: {value}")
+        request_lines.extend([f"Host: {target.netloc}", "", ""])
+        upstream.sendall("\r\n".join(request_lines).encode("iso-8859-1"))
+        response_head = b""
+        while b"\r\n\r\n" not in response_head and len(response_head) < 64 * 1024:
+            block = upstream.recv(4096)
+            if not block:
+                break
+            response_head += block
+        handler.connection.sendall(response_head)
+        if not response_head.startswith(b"HTTP/1.1 101") and not response_head.startswith(b"HTTP/1.0 101"):
+            upstream.close()
+            handler.close_connection = True
+            return
+        handler.connection.setblocking(False)
+        upstream.setblocking(False)
+        try:
+            while not self._stopping:
+                readable, _, exceptional = select.select(
+                    [handler.connection, upstream], [], [handler.connection, upstream], 1.0
+                )
+                if exceptional:
+                    break
+                for source in readable:
+                    try:
+                        data = source.recv(64 * 1024)
+                    except (BlockingIOError, ssl.SSLWantReadError):
+                        continue
+                    if not data:
+                        return
+                    destination = upstream if source is handler.connection else handler.connection
+                    destination.sendall(data)
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+            handler.close_connection = True
 
     def _server_options(self) -> List[Dict[str, str]]:
         options: List[Dict[str, str]] = []
@@ -1219,6 +1872,11 @@ class MediaArchiver(_PluginBase):
         else:
             connection_type = "info"
             connection_text = "尚未测试。填写地址和 API Key 后先保存，再点击“测试连接”。"
+        proxy_type = "success" if self._proxy_status.get("running") else "warning"
+        proxy_text = (
+            f"{self._proxy_status.get('message') or '反代未启动'}；"
+            f"客户端应连接 http://NAS-IP:{self._proxy_port}"
+        )
 
         attribute_cards: List[dict] = []
         for key, rule in self.ATTRIBUTE_RULES.items():
@@ -1279,7 +1937,7 @@ class MediaArchiver(_PluginBase):
                      "text": "填写你的 Emby 302 服务器地址和 API Key，勾选需要的虚拟库即可。"},
                     {"component": "VAlert", "props": {
                         "type": "info", "variant": "tonal", "class": "mb-4",
-                        "text": "只创建 Emby 原生 BoxSet，不复制文件、不改路径；播放仍使用原 ItemId、MediaSource 与 302 直链。",
+                        "text": "不创建、不写入 Emby 合集。专区作为首页一级虚拟媒体库；播放仍使用原 ItemId、MediaSource 与 302 直链。",
                     }},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
@@ -1300,9 +1958,29 @@ class MediaArchiver(_PluginBase):
                             }},
                         ]},
                     ]},
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
+                            {"component": "VSwitch", "props": {
+                                "model": "home_view_enabled",
+                                "label": "启用首页一级虚拟库（不放入合集）",
+                                "color": "primary", "hide-details": True,
+                            }},
+                        ]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
+                            {"component": "VTextField", "props": {
+                                "model": "proxy_port", "label": "虚拟库客户端端口",
+                                "type": "number", "prepend-inner-icon": "mdi-lan",
+                                "hint": "Docker 默认需映射 8099:8099", "persistent-hint": True,
+                            }},
+                        ]},
+                    ]},
                     {"component": "VAlert", "props": {
                         "type": connection_type, "variant": "tonal", "class": "my-3",
                         "title": "Emby 连接状态", "text": connection_text,
+                    }},
+                    {"component": "VAlert", "props": {
+                        "type": proxy_type, "variant": "tonal", "class": "my-3",
+                        "title": "首页虚拟库反代", "text": proxy_text,
                     }},
                     {"component": "div", "props": {"class": "d-flex flex-wrap ga-3"}, "content": [
                         {"component": "VBtn", "props": {
@@ -1317,6 +1995,13 @@ class MediaArchiver(_PluginBase):
                             "api": "plugin/MediaArchiver/rebuild", "method": "post",
                             "params": {"token": token},
                         }}},
+                        {"component": "VBtn", "props": {
+                            "color": "warning", "variant": "outlined",
+                            "prepend-icon": "mdi-broom",
+                        }, "text": "清空 v3.x 旧合集成员", "events": {"click": {
+                            "api": "plugin/MediaArchiver/cleanup_legacy_collections",
+                            "method": "post", "params": {"token": token},
+                        }}},
                     ]},
                 ]},
             ]},
@@ -1329,7 +2014,7 @@ class MediaArchiver(_PluginBase):
                                 "color": "primary", "hide-details": True,
                             }},
                             {"component": "div", "props": {"class": "text-caption mt-2"},
-                             "text": "把勾选的平台榜单投射成独立 Emby BoxSet。"},
+                             "text": "把勾选的平台榜单显示成首页独立栏目。"},
                         ]},
                     ]},
                 ]},
@@ -1382,7 +2067,7 @@ class MediaArchiver(_PluginBase):
             ]},
             {"component": "div", "props": {"class": "text-h5 font-weight-bold mb-1"}, "text": "选择榜单"},
             {"component": "div", "props": {"class": "text-body-2 mb-3"},
-             "text": "先勾选上方“启用榜单虚拟库”，再选择需要的榜单；每一项都会成为独立 BoxSet。"},
+             "text": "先勾选上方“启用榜单虚拟库”，再选择需要的榜单；每一项都会成为首页一级虚拟库。"},
             {"component": "VRow", "content": ranking_cards},
             {"component": "div", "props": {"class": "text-h5 font-weight-bold mt-5 mb-1"},
              "text": "媒体属性专区"},
@@ -1404,7 +2089,7 @@ class MediaArchiver(_PluginBase):
                         }},
                         {"component": "VSwitch", "props": {
                             "model": "use_moviepilot_servers",
-                            "label": "同时使用 MoviePilot 已配置的 Emby 服务器（多服务器兼容）",
+                            "label": "同时扫描 MoviePilot 已配置的 Emby（不会由本反代展示）",
                             "hide-details": True,
                         }},
                         {"component": "VSelect", "props": {
@@ -1413,6 +2098,12 @@ class MediaArchiver(_PluginBase):
                             "items": self._server_options(),
                         }},
                         {"component": "VRow", "content": [
+                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
+                                {"component": "VTextField", "props": {
+                                    "model": "proxy_bind", "label": "反代监听地址",
+                                    "hint": "Docker 内通常保持 0.0.0.0", "persistent-hint": True,
+                                }},
+                            ]},
                             {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                                 {"component": "VTextField", "props": {
                                     "model": "sync_interval", "label": "校准间隔（分钟）", "type": "number",
@@ -1471,12 +2162,14 @@ class MediaArchiver(_PluginBase):
             {"component": "VAlert", "props": {
                 "type": "success", "variant": "tonal", "class": "mt-5",
                 "title": "最简单的使用方法",
-                "text": "填写地址和 Key → 勾选需要的功能 → 保存 → 测试连接 → 一键重建。",
+                "text": "填写上游地址和 Key → 保存 → 一键重建 → Docker 映射 8099 端口 → Emby 客户端改连 NAS-IP:8099。",
             }},
         ]}
         defaults: Dict[str, Any] = {
             "enabled": True, "virtual_enabled": True, "ranking_enabled": False,
-            "auto_sync": True, "use_moviepilot_servers": False,
+            "auto_sync": True, "home_view_enabled": True,
+            "proxy_bind": "0.0.0.0", "proxy_port": 8099,
+            "use_moviepilot_servers": False,
             "emby_servers": [], "emby_server": "", "manual_url": "", "manual_api_key": "",
             "sync_interval": 60, "timeout": 30, "tmdb_api_key": "", "tmdb_domain": "",
             "ranking_regions": "US,GB,JP,KR,HK,TW", "ranking_limit": 100,
@@ -1568,6 +2261,15 @@ class MediaArchiver(_PluginBase):
                 "type": connection_type, "variant": "tonal", "class": "mb-3",
                 "title": "Emby 连接", "text": connection_message,
             }},
+            {"component": "VAlert", "props": {
+                "type": "success" if self._proxy_status.get("running") else "warning",
+                "variant": "tonal", "class": "mb-3",
+                "title": "首页虚拟库入口",
+                "text": (
+                    f"{self._proxy_status.get('message') or '反代未启动'}；"
+                    f"Emby 客户端请连接 http://NAS-IP:{self._proxy_port}"
+                ),
+            }},
             {"component": "div", "props": {"class": "d-flex flex-wrap ga-3 mb-3"}, "content": [
                 {"component": "VBtn", "props": {
                     "color": "primary", "variant": "outlined", "prepend-icon": "mdi-lan-connect",
@@ -1579,6 +2281,12 @@ class MediaArchiver(_PluginBase):
                     "color": "primary", "variant": "flat", "prepend-icon": "mdi-refresh",
                 }, "text": "一键重建", "events": {"click": {
                     "api": "plugin/MediaArchiver/rebuild", "method": "post",
+                    "params": {"token": token},
+                }}},
+                {"component": "VBtn", "props": {
+                    "color": "warning", "variant": "outlined", "prepend-icon": "mdi-broom",
+                }, "text": "清空 v3.x 旧合集成员", "events": {"click": {
+                    "api": "plugin/MediaArchiver/cleanup_legacy_collections", "method": "post",
                     "params": {"token": token},
                 }}},
             ]},
@@ -1771,7 +2479,7 @@ class MediaArchiver(_PluginBase):
         server_name: str,
         ranking_results: Mapping[str, RankingResult],
     ) -> Dict[str, int]:
-        """对一台 Emby 做集合成员差集；从不删除 BoxSet 本身。"""
+        """计算首页虚拟库成员；不调用 ``/Collections``。"""
         items = client.library_items()
         # Emby 少数版本会因多库查询返回重复 Item，按原 ItemId 去重。
         item_map = {str(item.get("Id")): item for item in items if item.get("Id")}
@@ -1784,11 +2492,18 @@ class MediaArchiver(_PluginBase):
             "name": server_name, "api_root": client.api_root,
             "active": True, "last_error": "",
         })
-        attribute_collections = state.setdefault("attribute_collections", {})
-        ranking_collections = state.setdefault("ranking_collections", {})
+        # v3.x 的映射仅供用户手动点击“清理旧合集”，v4 不再写入。
+        state.setdefault("attribute_collections", {})
+        state.setdefault("ranking_collections", {})
+        previous_views = {
+            str(key): dict(value) for key, value in (state.get("virtual_views") or {}).items()
+            if isinstance(value, Mapping)
+        }
+        next_views: Dict[str, Dict[str, Any]] = {}
         attribute_counts: Dict[str, int] = {}
         ranking_counts: Dict[str, int] = {}
-        added = removed = ranking_failed = 0
+        ranking_failed = 0
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
 
         desired_attributes: Dict[str, Set[str]] = {
             key: set() for key in self.ATTRIBUTE_RULES
@@ -1804,82 +2519,70 @@ class MediaArchiver(_PluginBase):
 
         for key, rule in self.ATTRIBUTE_RULES.items():
             enabled = self._attribute_enabled and key in self._enabled_rules
-            existing_id = str(attribute_collections.get(key) or "")
-            if enabled:
-                collection_id, current = self._managed_collection(
-                    client, attribute_collections, key, rule["name"], create=True,
-                    initial_ids=desired_attributes[key],
+            wanted = desired_attributes[key] if enabled else set()
+            attribute_counts[key] = len(wanted)
+            if wanted:
+                view_key = f"attribute:{key}"
+                next_views[view_key] = self._make_virtual_view(
+                    view_key, rule["name"], "attribute", wanted, item_map, now
                 )
-                if not collection_id:
-                    attribute_counts[key] = 0
-                    continue
-                change = self._reconcile(
-                    client, collection_id, desired_attributes[key], current=current
-                )
-                added += change["added"]
-                removed += change["removed"]
-                attribute_counts[key] = change["count"]
-            elif existing_id:
-                collection_id, current = self._managed_collection(
-                    client, attribute_collections, key, rule["name"], create=False
-                )
-                if collection_id:
-                    change = self._reconcile(client, collection_id, set(), current=current)
-                    removed += change["removed"]
-                attribute_counts[key] = 0
-            else:
-                attribute_counts[key] = 0
 
         active_rankings = self._selected_rankings if self._ranking_enabled else set()
-        for key in sorted(active_rankings):
+        for key in (rank_key for rank_key in RANK_META if rank_key in active_rankings):
             result = ranking_results.get(key)
             name = RANK_META[key]["collection"]
+            view_key = f"ranking:{key}"
             if not result or not result.ok:
                 ranking_failed += 1
-                existing_id = str(ranking_collections.get(key) or "")
-                if existing_id:
-                    collection_id, current = self._managed_collection(
-                        client, ranking_collections, key, name, create=False
-                    )
-                    ranking_counts[key] = len(current) if collection_id else 0
+                old = previous_views.get(view_key)
+                if old and old.get("item_ids"):
+                    next_views[view_key] = old
+                    ranking_counts[key] = len(old.get("item_ids") or [])
                 else:
                     ranking_counts[key] = 0
-                # 失败时不创建、不清空，保留上次可用结果。
+                # 外部榜单源失败时保留上次内存/持久结果，不误清空首页栏目。
                 continue
             wanted = index.match(result.entries)
-            collection_id, current = self._managed_collection(
-                client, ranking_collections, key, name, create=True, initial_ids=wanted
-            )
-            if not collection_id:
-                ranking_counts[key] = 0
-                continue
-            change = self._reconcile(client, collection_id, wanted, current=current)
-            added += change["added"]
-            removed += change["removed"]
-            ranking_counts[key] = change["count"]
+            ranking_counts[key] = len(wanted)
+            if wanted:
+                next_views[view_key] = self._make_virtual_view(
+                    view_key, name, "ranking", wanted, item_map, now
+                )
 
-        # 取消勾选或关闭榜单功能时，只清空本插件记录的集合成员。
-        for key in sorted(set(ranking_collections) - set(active_rankings)):
-            name = RANK_META.get(key, {}).get("collection", key)
-            collection_id, current = self._managed_collection(
-                client, ranking_collections, key, name, create=False
-            )
-            if collection_id:
-                change = self._reconcile(client, collection_id, set(), current=current)
-                removed += change["removed"]
-            ranking_counts[key] = 0
+        for key in RANK_META:
+            ranking_counts.setdefault(key, 0)
+
+        added = removed = 0
+        for view_key in set(previous_views) | set(next_views):
+            old_ids = {
+                str(value) for value in (previous_views.get(view_key, {}).get("item_ids") or [])
+            }
+            new_ids = {
+                str(value) for value in (next_views.get(view_key, {}).get("item_ids") or [])
+            }
+            added += len(new_ids - old_ids)
+            removed += len(old_ids - new_ids)
 
         state.update({
             "attribute_counts": attribute_counts,
             "ranking_counts": ranking_counts,
-            "last_sync": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "virtual_views": next_views,
+            "last_sync": now,
         })
+        if self._is_proxy_origin(client.api_root):
+            with self._proxy_lock:
+                self._virtual_views = {
+                    str(value["id"]): dict(value) for value in next_views.values()
+                    if value.get("id") and value.get("item_ids")
+                }
+                self._proxy_item_index = {key: dict(value) for key, value in item_map.items()}
         attribute_hits = sum(attribute_counts.values())
         ranking_hits = sum(ranking_counts.values())
         self._record(
             "INFO",
             f"{server_name}：扫描 {len(items)} 项，属性命中 {attribute_hits}，"
-            f"榜单命中 {ranking_hits}，新增 {added}，移除 {removed}",
+            f"榜单命中 {ranking_hits}，首页虚拟库 {len(next_views)} 个，"
+            f"新增 {added}，移除 {removed}",
         )
         return {
             "scanned": len(items), "added": added, "removed": removed,
@@ -1887,52 +2590,45 @@ class MediaArchiver(_PluginBase):
             "ranking_failed": ranking_failed,
         }
 
-    @staticmethod
-    def _reconcile(
-        client: EmbyClient,
-        collection_id: str,
-        wanted: Set[str],
-        current: Optional[Set[str]] = None,
-    ) -> Dict[str, int]:
-        current = set(current if current is not None else client.collection_members(collection_id))
-        wanted = {str(item_id) for item_id in wanted if item_id}
-        to_add = wanted - current
-        to_remove = current - wanted
-        if to_add:
-            client.add_items(collection_id, to_add)
-        if to_remove:
-            client.remove_items(collection_id, to_remove)
-        return {"added": len(to_add), "removed": len(to_remove), "count": len(wanted)}
-
-    @staticmethod
-    def _managed_collection(
-        client: EmbyClient,
-        mapping: Dict[str, str],
+    def _make_virtual_view(
+        self,
         key: str,
         name: str,
-        create: bool,
-        initial_ids: Iterable[str] = (),
-    ) -> Tuple[str, Set[str]]:
-        collection_id = str(mapping.get(key) or "")
-        if collection_id:
-            try:
-                return collection_id, client.collection_members(collection_id)
-            except EmbyHttpError as err:
-                if err.status != 404:
-                    raise
-                mapping.pop(key, None)
-                client._collection_cache = None
-            except KeyError:
-                # 测试替身与某些封装用 KeyError 表示集合已删除。
-                mapping.pop(key, None)
-                client._collection_cache = None
-        if not create:
-            return "", set()
-        collection_id = client.ensure_collection(name, initial_ids)
-        if not collection_id:
-            return "", set()
-        mapping[key] = collection_id
-        return collection_id, client.collection_members(collection_id)
+        kind: str,
+        item_ids: Iterable[str],
+        item_map: Mapping[str, Mapping[str, Any]],
+        updated: str,
+    ) -> Dict[str, Any]:
+        ids = sorted({str(value) for value in item_ids if str(value)})
+        types = {
+            str(item_map.get(item_id, {}).get("Type") or "").casefold() for item_id in ids
+        }
+        if types and types <= {"movie"}:
+            collection_type = "movies"
+        elif types and types <= {"series"}:
+            collection_type = "tvshows"
+        else:
+            collection_type = "mixed"
+        server_id = next(
+            (str(item_map[item_id].get("ServerId")) for item_id in ids
+             if item_id in item_map and item_map[item_id].get("ServerId")),
+            "",
+        )
+        return {
+            "id": self._view_id(key), "key": key, "name": name, "kind": kind,
+            "collection_type": collection_type, "item_ids": ids,
+            "server_id": server_id, "updated": updated,
+        }
+
+    def _is_proxy_origin(self, api_root: str) -> bool:
+        if not self._manual_url:
+            return False
+        try:
+            return urllib.parse.urlsplit(api_root).netloc.casefold() == urllib.parse.urlsplit(
+                self._manual_url
+            ).netloc.casefold()
+        except Exception:
+            return False
 
     @eventmanager.register(EventType.WebhookMessage)
     def on_webhook(self, event: Event) -> None:
@@ -2294,5 +2990,6 @@ class MediaArchiver(_PluginBase):
     def stop_service(self) -> None:
         self._stopping = True
         self._cancel_timers()
+        self._stop_proxy()
         with self._event_lock:
             self._pending_ids.clear()
