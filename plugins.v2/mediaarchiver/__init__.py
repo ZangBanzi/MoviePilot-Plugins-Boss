@@ -10,17 +10,20 @@ import html
 import hashlib
 import http.client
 import http.server
+import io
 import json
 import math
 import re
 import select
 import socket
 import ssl
+import struct
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from collections import deque
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -110,7 +113,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.0.0",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.2.0",
             },
             method=method.upper(),
         )
@@ -383,14 +386,21 @@ class RankingFetcher:
 
     PLATFORM_PROVIDERS: Dict[str, Tuple[str, ...]] = {
         "netflix": ("Netflix",),
-        "hbo": ("Max", "HBO Max", "HBO"),
-        "apple_tv": ("Apple TV Plus", "Apple TV+"),
-        "disney_plus": ("Disney Plus", "Disney+"),
+        "hbo": ("Max", "HBO Max", "HBO", "Max Amazon Channel"),
+        "apple_tv": ("Apple TV Plus", "Apple TV+", "Apple TV"),
+        "disney_plus": ("Disney Plus", "Disney+", "Disney Plus Basic"),
         "crunchyroll": ("Crunchyroll",),
         "amazon_prime": ("Amazon Prime Video",),
         "amazon": ("Amazon Video",),
         "hulu": ("Hulu",),
         "tencent": ("Tencent Video", "WeTV"),
+    }
+    # Provider 名称会因 TMDB 语言和地区出现差异，使用官方稳定 ID 作为兜底。
+    # 只有该 ID 确实存在于本次 Provider 列表时才采用，避免误匹配。
+    PLATFORM_PROVIDER_IDS: Dict[str, Tuple[int, ...]] = {
+        "netflix": (8,), "hbo": (1899, 384, 118), "apple_tv": (350,),
+        "disney_plus": (337,), "crunchyroll": (283,),
+        "amazon_prime": (9,), "amazon": (10,), "hulu": (15,),
     }
     DOUBAN_COLLECTIONS = {
         "douban_soon": ("movie_soon", "Movie"),
@@ -531,22 +541,36 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.0.0",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.2.0",
         }
         merged.update(headers or {})
         body = None
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             merged["Content-Type"] = "application/json"
-        request = urllib.request.Request(url, data=body, headers=merged, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.read()
-        except urllib.error.HTTPError as err:
-            detail = err.read(240).decode("utf-8", "replace")
-            raise RuntimeError(f"HTTP {err.code} {detail}") from err
-        except urllib.error.URLError as err:
-            raise RuntimeError(str(err.reason)) from err
+        last_error: Optional[BaseException] = None
+        for attempt in range(3):
+            request = urllib.request.Request(url, data=body, headers=merged, method=method)
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return response.read()
+            except urllib.error.HTTPError as err:
+                detail = err.read(240).decode("utf-8", "replace")
+                last_error = RuntimeError(f"HTTP {err.code} {detail}")
+                if err.code != 429 and err.code < 500:
+                    raise last_error from err
+                retry_after = str(err.headers.get("Retry-After") or "").strip()
+                delay = min(5.0, float(retry_after)) if retry_after.isdigit() else 0.8 * (2 ** attempt)
+            except (
+                urllib.error.URLError, TimeoutError, ConnectionError, OSError,
+                http.client.HTTPException,
+            ) as err:
+                last_error = err
+                delay = 0.8 * (2 ** attempt)
+            if attempt < 2:
+                self.log("WARNING", f"榜单请求暂时失败，{delay:.1f}秒后重试（{attempt + 1}/2）：{last_error}")
+                time.sleep(delay)
+        raise RuntimeError(str(last_error or "网络请求失败"))
 
     def _json(
         self,
@@ -664,6 +688,8 @@ class RankingFetcher:
         providers = self._provider_catalog[catalog_key]
         wanted = self.PLATFORM_PROVIDERS.get(platform, ())
         found = None
+        normalize = lambda value: re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
+        wanted_normalized = {normalize(value) for value in wanted}
         for exact in wanted:
             for provider in providers:
                 if str(provider.get("provider_name") or "").casefold() == exact.casefold():
@@ -671,6 +697,22 @@ class RankingFetcher:
                     break
             if found is not None:
                 break
+        if found is None:
+            # 兼容 Apple TV+ / Apple TV Plus 等标点与本地化差异。
+            for provider in providers:
+                if normalize(provider.get("provider_name")) in wanted_normalized:
+                    found = int(provider["provider_id"])
+                    break
+        if found is None:
+            provider_ids = {
+                int(provider.get("provider_id")) for provider in providers
+                if str(provider.get("provider_id") or "").isdigit()
+            }
+            found = next(
+                (provider_id for provider_id in self.PLATFORM_PROVIDER_IDS.get(platform, ())
+                 if provider_id in provider_ids),
+                None,
+            )
         self._provider_ids[cache_key] = found
         if found is None:
             raise RuntimeError(f"TMDB 未找到 {platform} 的 Watch Provider")
@@ -754,7 +796,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.0.0 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.2.0 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -961,14 +1003,17 @@ class MediaArchiver(_PluginBase):
     """媒体属性专区与独立榜单首页虚拟库。"""
 
     plugin_name = "媒体虚拟库"
-    plugin_desc = "把媒体属性和热门榜单注入 Emby 首页一级虚拟库，不创建合集。"
+    plugin_desc = "通过现有8098反代输出媒体属性与平台榜单一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.0.0"
+    plugin_version = "4.2.0"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
     plugin_order = 50
     auth_level = 1
+    PUBLIC_GATEWAY_PORT = 8098
+    # 仅供现有 8098 反代调用，不作为客户端入口，也无需对公网开放。
+    INTERNAL_INJECT_PORT = 8097
 
     ATTRIBUTE_RULES: Dict[str, Dict[str, str]] = {
         "remux": {"name": "Remux专区", "icon": "mdi-disc", "hint": "路径、文件名或媒体源信息包含 Remux"},
@@ -976,6 +1021,28 @@ class MediaArchiver(_PluginBase):
         "dolby_vision": {"name": "Dolby Vision专区", "icon": "mdi-eye-circle", "hint": "视频流 DV/Dolby Vision 信息"},
         "hdr": {"name": "HDR专区", "icon": "mdi-brightness-7", "hint": "HDR10/HDR10+/HLG/PQ/DV"},
         "atmos": {"name": "Atmos专区", "icon": "mdi-surround-sound", "hint": "音频流 Atmos/JOC 信息"},
+    }
+    # 一级虚拟库封面模板。只保存品牌识别色与文字标志，不在线下载图片；
+    # 这样断网也能生成封面，同时避免把外部图片地址写入 Emby。
+    COVER_THEMES: Dict[str, Dict[str, str]] = {
+        "remux": {"logo": "REMUX", "bg": "#090B10", "bg2": "#242A35", "accent": "#D4AF37", "fg": "#FFFFFF"},
+        "4k": {"logo": "4K UHD", "bg": "#07131C", "bg2": "#123C52", "accent": "#00C8FF", "fg": "#FFFFFF"},
+        "dolby_vision": {"logo": "DOLBY VISION", "bg": "#050505", "bg2": "#262626", "accent": "#FFFFFF", "fg": "#FFFFFF"},
+        "hdr": {"logo": "HDR", "bg": "#180A25", "bg2": "#5B1B72", "accent": "#FFB000", "fg": "#FFFFFF"},
+        "atmos": {"logo": "DOLBY ATMOS", "bg": "#07121A", "bg2": "#173A4E", "accent": "#7BD8FF", "fg": "#FFFFFF"},
+        "popular": {"logo": "HOT", "bg": "#2A0B24", "bg2": "#6E1933", "accent": "#FF7139", "fg": "#FFFFFF"},
+        "netflix": {"logo": "N", "bg": "#050505", "bg2": "#1A0507", "accent": "#E50914", "fg": "#FFFFFF"},
+        "hbo": {"logo": "HBO", "bg": "#050505", "bg2": "#242424", "accent": "#F2F2F2", "fg": "#FFFFFF"},
+        "apple_tv": {"logo": "tv+", "bg": "#050505", "bg2": "#252525", "accent": "#FFFFFF", "fg": "#FFFFFF"},
+        "disney_plus": {"logo": "Disney+", "bg": "#06143F", "bg2": "#123F95", "accent": "#55B7FF", "fg": "#FFFFFF"},
+        "crunchyroll": {"logo": "CRUNCHYROLL", "bg": "#2B160A", "bg2": "#6A2A0B", "accent": "#F47521", "fg": "#FFFFFF"},
+        "amazon_prime": {"logo": "prime video", "bg": "#061D2A", "bg2": "#063E59", "accent": "#00A8E1", "fg": "#FFFFFF"},
+        "amazon": {"logo": "amazon", "bg": "#101820", "bg2": "#273746", "accent": "#FF9900", "fg": "#FFFFFF"},
+        "hulu": {"logo": "hulu", "bg": "#041F16", "bg2": "#07452E", "accent": "#1CE783", "fg": "#FFFFFF"},
+        "maoyan": {"logo": "MAOYAN", "bg": "#2D070A", "bg2": "#83151E", "accent": "#F03D37", "fg": "#FFFFFF"},
+        "douban": {"logo": "DOUBAN", "bg": "#062116", "bg2": "#0B5D37", "accent": "#00B51D", "fg": "#FFFFFF"},
+        "tencent": {"logo": "TENCENT VIDEO", "bg": "#07172C", "bg2": "#0C4165", "accent": "#20D36B", "fg": "#FFFFFF"},
+        "default": {"logo": "VIRTUAL", "bg": "#111827", "bg2": "#3730A3", "accent": "#818CF8", "fg": "#FFFFFF"},
     }
     # 向后兼容 v3.0.0 测试和外部调用。
     RULES = ATTRIBUTE_RULES
@@ -993,14 +1060,14 @@ class MediaArchiver(_PluginBase):
         self._emby_servers: List[str] = []
         self._manual_url = ""
         self._manual_key = ""
-        self._home_view_enabled = True
         self._proxy_bind = "0.0.0.0"
-        self._proxy_port = 8099
+        self._proxy_port = self.INTERNAL_INJECT_PORT
         self._proxy_server: Optional[VirtualProxyServer] = None
         self._proxy_thread: Optional[threading.Thread] = None
         self._proxy_lock = threading.RLock()
         self._virtual_views: Dict[str, Dict[str, Any]] = {}
         self._proxy_item_index: Dict[str, Dict[str, Any]] = {}
+        self._cover_cache: Dict[str, Tuple[str, bytes]] = {}
         self._proxy_status: Dict[str, Any] = {
             "running": False, "message": "反代未启动", "requests": 0,
         }
@@ -1065,9 +1132,10 @@ class MediaArchiver(_PluginBase):
             except Exception as err:
                 logger.warning("[媒体虚拟库] 保存 Emby API Key 失败：%s", err)
         self._manual_key = incoming_key
-        self._home_view_enabled = bool(cfg.get("home_view_enabled", True))
-        self._proxy_bind = str(cfg.get("proxy_bind") or "0.0.0.0").strip()
-        self._proxy_port = self._bounded_int(cfg.get("proxy_port"), 8099, 1024, 65535)
+        # v4.2 起一级虚拟库与品牌封面是插件固定能力，不再提供重复开关。
+        # 8097 只作为 8098 反代的容器内网后端，客户端始终继续使用 8098。
+        self._proxy_bind = "0.0.0.0"
+        self._proxy_port = self.INTERNAL_INJECT_PORT
         self._use_moviepilot_servers = bool(cfg.get("use_moviepilot_servers", False))
         self._timeout = self._bounded_int(cfg.get("timeout"), 30, 5, 120)
         self._sync_interval = self._bounded_int(cfg.get("sync_interval"), 60, 10, 1440)
@@ -1091,7 +1159,7 @@ class MediaArchiver(_PluginBase):
         self._load_state()
         self._restore_proxy_cache()
 
-        if self.get_state() and self._home_view_enabled:
+        if self.get_state():
             self._start_proxy()
 
         if bool(cfg.get("rebuild_once", False)):
@@ -1175,14 +1243,16 @@ class MediaArchiver(_PluginBase):
                 if not isinstance(view, Mapping):
                     continue
                 item_ids = [str(x) for x in (view.get("item_ids") or []) if str(x)]
-                if not item_ids:
-                    continue
                 normalized = dict(view)
                 normalized.update({
                     "key": str(view.get("key") or key),
                     "id": str(view.get("id") or self._view_id(str(key))),
                     "item_ids": list(dict.fromkeys(item_ids)),
                 })
+                normalized["cover_tag"] = str(
+                    view.get("cover_tag")
+                    or self._cover_tag(str(normalized["key"]), normalized["item_ids"])
+                )
                 restored[str(normalized["id"])] = normalized
         with self._proxy_lock:
             self._virtual_views = restored
@@ -1193,16 +1263,24 @@ class MediaArchiver(_PluginBase):
             return
         if not self._manual_url:
             self._proxy_status = {
-                "running": False, "message": "请先填写 Emby/302 上游地址", "requests": 0,
+                "running": False, "message": "请先填写原生 Emby 内网地址", "requests": 0,
             }
             return
         parsed = urllib.parse.urlsplit(self._manual_url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             self._proxy_status = {
-                "running": False, "message": "Emby/302 上游地址无效", "requests": 0,
+                "running": False, "message": "原生 Emby 内网地址无效", "requests": 0,
             }
             return
         upstream_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if upstream_port == self.PUBLIC_GATEWAY_PORT:
+            self._proxy_status = {
+                "running": False,
+                "message": "上游不能填写8098；请填写8098背后的原生Emby地址（通常8096）",
+                "requests": 0,
+            }
+            self._record("ERROR", str(self._proxy_status["message"]))
+            return
         if upstream_port == self._proxy_port and parsed.hostname in {
             "127.0.0.1", "localhost", "0.0.0.0", self._proxy_bind,
         }:
@@ -1221,12 +1299,17 @@ class MediaArchiver(_PluginBase):
             thread.start()
             self._proxy_status = {
                 "running": True,
-                "message": f"已监听 {self._proxy_bind}:{self._proxy_port}",
+                "message": (
+                    f"8098输出模式就绪（内部注入 {self._proxy_bind}:{self._proxy_port}）"
+                ),
                 "requests": 0,
                 "upstream": self._manual_url,
+                "public_port": self.PUBLIC_GATEWAY_PORT,
             }
             self._record(
-                "INFO", f"首页虚拟库反代已启动：{self._proxy_bind}:{self._proxy_port} -> {self._manual_url}",
+                "INFO",
+                f"8098一级虚拟库链路已就绪：8098反代 -> 内部注入"
+                f" {self._proxy_bind}:{self._proxy_port} -> {self._manual_url}",
             )
         except OSError as err:
             self._proxy_server = None
@@ -1468,18 +1551,7 @@ class MediaArchiver(_PluginBase):
             with self._proxy_lock:
                 image_view = dict(self._virtual_views.get(image_match.group(1)) or {})
             if image_view:
-                item_ids = list(image_view.get("item_ids") or [])
-                if not item_ids:
-                    self._send_json(handler, 404, {"error": "virtual library is empty"})
-                    return
-                prefix = "/emby" if parsed.path.casefold().startswith("/emby/") else ""
-                target = (
-                    f"{prefix}/Items/{urllib.parse.quote(str(item_ids[0]), safe='')}"
-                    "/Images/Primary"
-                )
-                if parsed.query:
-                    target += "?" + parsed.query
-                self._proxy_forward(handler, target_path=target)
+                self._send_virtual_cover(handler, image_view)
                 return
 
         if (items_match or latest_match) and view:
@@ -1499,15 +1571,23 @@ class MediaArchiver(_PluginBase):
         view_id = str(view.get("id") or self._view_id(str(view.get("key") or view.get("name"))))
         name = str(view.get("name") or "虚拟媒体库")
         count = len(view.get("item_ids") or [])
+        cover_tag = str(
+            view.get("cover_tag")
+            or self._cover_tag(str(view.get("key") or name), view.get("item_ids") or [])
+        )
         return {
             "Name": name,
             "ServerId": str(template.get("ServerId") or view.get("server_id") or ""),
             "Id": view_id,
             "Guid": view_id,
-            "Etag": view_id,
+            "Etag": cover_tag,
+            "DisplayPreferencesId": view_id,
+            "PresentationUniqueKey": view_id,
             "DateCreated": str(view.get("updated") or "2000-01-01T00:00:00.0000000Z"),
             "CanDelete": False,
             "CanDownload": False,
+            "LockData": False,
+            "LockedFields": [],
             "SortName": name,
             "ForcedSortName": name,
             "ExternalUrls": [],
@@ -1520,6 +1600,9 @@ class MediaArchiver(_PluginBase):
             "CollectionType": str(view.get("collection_type") or "movies"),
             "ChildCount": count,
             "RecursiveItemCount": count,
+            "ImageTags": {"Primary": cover_tag},
+            "BackdropImageTags": [],
+            "PrimaryImageAspectRatio": 1.7777777777777777,
             "SupportsSync": True,
             "UserData": {
                 "PlaybackPositionTicks": 0, "IsFavorite": False, "Played": False,
@@ -1543,7 +1626,7 @@ class MediaArchiver(_PluginBase):
         with self._proxy_lock:
             views = [dict(value) for value in self._virtual_views.values()]
         for view in views:
-            if view.get("item_ids") and str(view.get("id")) not in existing:
+            if str(view.get("id")) not in existing:
                 items.append(self._synthetic_view(view, template))
         payload["TotalRecordCount"] = len(items)
         return status, headers, json.dumps(
@@ -1679,6 +1762,262 @@ class MediaArchiver(_PluginBase):
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(payload)))
         handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        if handler.command != "HEAD":
+            handler.wfile.write(payload)
+
+    @staticmethod
+    def _cover_tag(key: str, item_ids: Iterable[str]) -> str:
+        """成员未变化时保持稳定；成员变化后让 Emby 客户端自动刷新封面。"""
+        members = ",".join(sorted({str(value) for value in item_ids if str(value)}))
+        # Emby Web 的部分版本按 32 位 ImageTag 处理，使用完整 MD5 避免不发起图片请求。
+        return hashlib.md5(f"cover-v2|{key}|{members}".encode("utf-8")).hexdigest()
+
+    def _cover_theme(self, view: Mapping[str, Any]) -> Dict[str, str]:
+        key = str(view.get("key") or "")
+        theme_key = "default"
+        if key.startswith("attribute:"):
+            theme_key = key.split(":", 1)[1]
+        elif key.startswith("ranking:"):
+            rank_key = key.split(":", 1)[1]
+            theme_key = str((RANK_META.get(rank_key) or {}).get("group") or "default")
+        return dict(self.COVER_THEMES.get(theme_key) or self.COVER_THEMES["default"])
+
+    @staticmethod
+    def _hex_rgb(value: str) -> Tuple[int, int, int]:
+        text = str(value or "#000000").lstrip("#")
+        if len(text) == 3:
+            text = "".join(char * 2 for char in text)
+        try:
+            return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+        except (TypeError, ValueError):
+            return 0, 0, 0
+
+    @staticmethod
+    def _pillow_font(image_font: Any, size: int, bold: bool = True) -> Any:
+        candidates = (
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        )
+        for path in candidates:
+            try:
+                return image_font.truetype(path, size=size)
+            except Exception:
+                continue
+        return image_font.load_default()
+
+    def _render_cover_pillow(self, view: Mapping[str, Any]) -> Optional[bytes]:
+        """有 Pillow 和可用字体时生成包含中文专区名的高清 PNG。"""
+        try:
+            from PIL import Image, ImageDraw, ImageFont  # type: ignore
+        except Exception:
+            return None
+        width, height = 960, 540
+        theme = self._cover_theme(view)
+        start = self._hex_rgb(theme["bg"])
+        end = self._hex_rgb(theme["bg2"])
+        accent = self._hex_rgb(theme["accent"])
+        foreground = self._hex_rgb(theme["fg"])
+        image = Image.new("RGB", (width, height), start)
+        draw = ImageDraw.Draw(image)
+        for y in range(height):
+            factor = y / max(1, height - 1)
+            color = tuple(round(start[i] * (1 - factor) + end[i] * factor) for i in range(3))
+            draw.line((0, y, width, y), fill=color)
+        # 背景光晕、品牌色竖线与左下角状态胶囊均为矢量绘制，不依赖网络素材。
+        draw.ellipse((660, -180, 1120, 280), fill=tuple(min(255, int(v * 0.34 + 16)) for v in accent))
+        draw.rounded_rectangle((54, 62, 70, 478), radius=8, fill=accent)
+        logo = str(theme.get("logo") or "VIRTUAL")
+        name = str(view.get("name") or "虚拟媒体库")
+        count = len(view.get("item_ids") or [])
+        logo_size = 142 if len(logo) <= 4 else 96 if len(logo) <= 10 else 66
+        logo_font = self._pillow_font(ImageFont, logo_size)
+        while logo_size > 40:
+            box = draw.textbbox((0, 0), logo, font=logo_font)
+            if box[2] - box[0] <= 760:
+                break
+            logo_size -= 6
+            logo_font = self._pillow_font(ImageFont, logo_size)
+        draw.text((108, 122), logo, font=logo_font, fill=accent)
+        name_font = self._pillow_font(ImageFont, 48)
+        while True:
+            box = draw.textbbox((0, 0), name, font=name_font)
+            if box[2] - box[0] <= 790 or getattr(name_font, "size", 32) <= 28:
+                break
+            name_font = self._pillow_font(ImageFont, int(getattr(name_font, "size", 34)) - 3)
+        draw.text((110, 302), name, font=name_font, fill=foreground)
+        meta_font = self._pillow_font(ImageFont, 27, bold=False)
+        meta = f"{count} ITEMS   •   LIVE VIRTUAL LIBRARY"
+        meta_box = draw.textbbox((0, 0), meta, font=meta_font)
+        chip_width = min(780, meta_box[2] - meta_box[0] + 54)
+        draw.rounded_rectangle((108, 397, 108 + chip_width, 455), radius=29, outline=accent, width=2)
+        draw.text((135, 410), meta, font=meta_font, fill=foreground)
+        output = io.BytesIO()
+        image.save(output, format="PNG", optimize=True)
+        return output.getvalue()
+
+    _BITMAP_FONT: Dict[str, Tuple[str, ...]] = {
+        "A": ("01110","10001","10001","11111","10001","10001","10001"),
+        "B": ("11110","10001","10001","11110","10001","10001","11110"),
+        "C": ("01111","10000","10000","10000","10000","10000","01111"),
+        "D": ("11110","10001","10001","10001","10001","10001","11110"),
+        "E": ("11111","10000","10000","11110","10000","10000","11111"),
+        "F": ("11111","10000","10000","11110","10000","10000","10000"),
+        "G": ("01111","10000","10000","10111","10001","10001","01111"),
+        "H": ("10001","10001","10001","11111","10001","10001","10001"),
+        "I": ("11111","00100","00100","00100","00100","00100","11111"),
+        "J": ("00111","00010","00010","00010","10010","10010","01100"),
+        "K": ("10001","10010","10100","11000","10100","10010","10001"),
+        "L": ("10000","10000","10000","10000","10000","10000","11111"),
+        "M": ("10001","11011","10101","10101","10001","10001","10001"),
+        "N": ("10001","11001","10101","10011","10001","10001","10001"),
+        "O": ("01110","10001","10001","10001","10001","10001","01110"),
+        "P": ("11110","10001","10001","11110","10000","10000","10000"),
+        "Q": ("01110","10001","10001","10001","10101","10010","01101"),
+        "R": ("11110","10001","10001","11110","10100","10010","10001"),
+        "S": ("01111","10000","10000","01110","00001","00001","11110"),
+        "T": ("11111","00100","00100","00100","00100","00100","00100"),
+        "U": ("10001","10001","10001","10001","10001","10001","01110"),
+        "V": ("10001","10001","10001","10001","10001","01010","00100"),
+        "W": ("10001","10001","10001","10101","10101","10101","01010"),
+        "X": ("10001","10001","01010","00100","01010","10001","10001"),
+        "Y": ("10001","10001","01010","00100","00100","00100","00100"),
+        "Z": ("11111","00001","00010","00100","01000","10000","11111"),
+        "0": ("01110","10001","10011","10101","11001","10001","01110"),
+        "1": ("00100","01100","00100","00100","00100","00100","01110"),
+        "2": ("01110","10001","00001","00010","00100","01000","11111"),
+        "3": ("11110","00001","00001","01110","00001","00001","11110"),
+        "4": ("00010","00110","01010","10010","11111","00010","00010"),
+        "5": ("11111","10000","10000","11110","00001","00001","11110"),
+        "6": ("01110","10000","10000","11110","10001","10001","01110"),
+        "7": ("11111","00001","00010","00100","01000","01000","01000"),
+        "8": ("01110","10001","10001","01110","10001","10001","01110"),
+        "9": ("01110","10001","10001","01111","00001","00001","01110"),
+        "+": ("00000","00100","00100","11111","00100","00100","00000"),
+        "-": ("00000","00000","00000","11111","00000","00000","00000"),
+        " ": ("00000","00000","00000","00000","00000","00000","00000"),
+    }
+
+    @staticmethod
+    def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload)) + chunk_type + payload
+            + struct.pack(">I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
+        )
+
+    def _render_cover_basic_png(self, view: Mapping[str, Any]) -> bytes:
+        """纯标准库 PNG，确保精简容器无 Pillow/中文字体时封面仍可显示。"""
+        width, height = 960, 540
+        theme = self._cover_theme(view)
+        start, end = self._hex_rgb(theme["bg"]), self._hex_rgb(theme["bg2"])
+        accent, foreground = self._hex_rgb(theme["accent"]), self._hex_rgb(theme["fg"])
+        pixels = bytearray(width * height * 3)
+        for y in range(height):
+            factor = y / max(1, height - 1)
+            color = bytes(round(start[i] * (1 - factor) + end[i] * factor) for i in range(3))
+            offset = y * width * 3
+            pixels[offset:offset + width * 3] = color * width
+
+        def rectangle(x1: int, y1: int, x2: int, y2: int, color: Tuple[int, int, int]) -> None:
+            left, right = max(0, x1), min(width, x2)
+            row = bytes(color) * max(0, right - left)
+            for y in range(max(0, y1), min(height, y2)):
+                offset = (y * width + left) * 3
+                pixels[offset:offset + len(row)] = row
+
+        def draw_text(text: str, center_y: int, scale: int, color: Tuple[int, int, int]) -> None:
+            text = "".join(char for char in text.upper() if char in self._BITMAP_FONT)
+            if not text:
+                return
+            character_width = 6 * scale
+            total_width = max(0, len(text) * character_width - scale)
+            x_start = max(88, (width - total_width) // 2)
+            y_start = center_y - (7 * scale) // 2
+            for index, char in enumerate(text):
+                glyph = self._BITMAP_FONT[char]
+                for row_index, row_bits in enumerate(glyph):
+                    for column_index, bit in enumerate(row_bits):
+                        if bit == "1":
+                            x = x_start + index * character_width + column_index * scale
+                            y = y_start + row_index * scale
+                            rectangle(x, y, x + scale, y + scale, color)
+
+        rectangle(54, 62, 70, 478, accent)
+        logo = str(theme.get("logo") or "VIRTUAL")
+        scale = 24 if len(logo) <= 2 else 17 if len(logo) <= 5 else 10 if len(logo) <= 11 else 7
+        draw_text(logo, 225, scale, accent)
+        draw_text("VIRTUAL LIBRARY", 355, 8, foreground)
+        draw_text(f"{len(view.get('item_ids') or [])} ITEMS - LIVE", 435, 5, foreground)
+        raw = b"".join(
+            b"\x00" + bytes(pixels[y * width * 3:(y + 1) * width * 3])
+            for y in range(height)
+        )
+        signature = b"\x89PNG\r\n\x1a\n"
+        return (
+            signature
+            + self._png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + self._png_chunk(b"IDAT", zlib.compress(raw, 6))
+            + self._png_chunk(b"IEND", b"")
+        )
+
+    def _render_cover_png(self, view: Mapping[str, Any]) -> bytes:
+        try:
+            payload = self._render_cover_pillow(view)
+            if payload:
+                return payload
+        except Exception as err:
+            logger.warning("[媒体虚拟库] Pillow封面生成失败，已切换无依赖PNG：%s", err)
+        return self._render_cover_basic_png(view)
+
+    def _render_cover_svg(self, view: Mapping[str, Any]) -> bytes:
+        theme = self._cover_theme(view)
+        logo = html.escape(str(theme.get("logo") or "VIRTUAL"))
+        name = html.escape(str(view.get("name") or "虚拟媒体库"))
+        count = len(view.get("item_ids") or [])
+        logo_size = 142 if len(logo) <= 4 else 92 if len(logo) <= 10 else 64
+        svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="{theme['bg']}"/><stop offset="1" stop-color="{theme['bg2']}"/></linearGradient></defs>
+<rect width="960" height="540" fill="url(#g)"/><circle cx="890" cy="20" r="230" fill="{theme['accent']}" opacity=".14"/>
+<rect x="54" y="62" width="16" height="416" rx="8" fill="{theme['accent']}"/>
+<text x="108" y="245" fill="{theme['accent']}" font-family="Arial,Noto Sans,sans-serif" font-size="{logo_size}" font-weight="800">{logo}</text>
+<text x="110" y="356" fill="{theme['fg']}" font-family="Noto Sans CJK SC,Arial,sans-serif" font-size="48" font-weight="700">{name}</text>
+<rect x="108" y="397" width="510" height="58" rx="29" fill="none" stroke="{theme['accent']}" stroke-width="2"/>
+<text x="135" y="435" fill="{theme['fg']}" font-family="Arial,sans-serif" font-size="27">{count} ITEMS   •   LIVE VIRTUAL LIBRARY</text>
+</svg>'''
+        return svg.encode("utf-8")
+
+    def _send_virtual_cover(
+        self, handler: VirtualProxyHandler, view: Mapping[str, Any],
+    ) -> None:
+        tag = str(
+            view.get("cover_tag")
+            or self._cover_tag(str(view.get("key") or view.get("name")), view.get("item_ids") or [])
+        )
+        etag = f'"{tag}"'
+        if str(handler.headers.get("If-None-Match") or "").strip() == etag:
+            handler.send_response(304)
+            handler.send_header("ETag", etag)
+            handler.end_headers()
+            return
+        with self._proxy_lock:
+            cached = self._cover_cache.get(tag)
+        if cached:
+            mime_type, payload = cached
+        else:
+            mime_type, payload = "image/png", self._render_cover_png(view)
+            with self._proxy_lock:
+                if len(self._cover_cache) >= 96:
+                    self._cover_cache.pop(next(iter(self._cover_cache)), None)
+                self._cover_cache[tag] = (mime_type, payload)
+        handler.send_response(200)
+        handler.send_header("Content-Type", mime_type)
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.send_header("Cache-Control", "public, max-age=86400")
+        handler.send_header("ETag", etag)
+        handler.send_header("X-Content-Type-Options", "nosniff")
         handler.end_headers()
         if handler.command != "HEAD":
             handler.wfile.write(payload)
@@ -1857,7 +2196,7 @@ class MediaArchiver(_PluginBase):
         return attributes, rankings
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """TgtoDrive 风格的直连配置：普通用户只需填写地址、Key 和功能开关。"""
+        """精简配置：只保留原生 Emby、专区选择和必要维护选项。"""
         attribute_counts, ranking_counts = self._aggregate_counts()
         active_server_count = sum(
             1 for state in (self._state.get("servers") or {}).values()
@@ -1874,8 +2213,8 @@ class MediaArchiver(_PluginBase):
             connection_text = "尚未测试。填写地址和 API Key 后先保存，再点击“测试连接”。"
         proxy_type = "success" if self._proxy_status.get("running") else "warning"
         proxy_text = (
-            f"{self._proxy_status.get('message') or '反代未启动'}；"
-            f"客户端应连接 http://NAS-IP:{self._proxy_port}"
+            f"{self._proxy_status.get('message') or '内部注入服务未启动'}；"
+            f"客户端地址固定为 http://NAS-IP:{self.PUBLIC_GATEWAY_PORT}"
         )
 
         attribute_cards: List[dict] = []
@@ -1927,24 +2266,25 @@ class MediaArchiver(_PluginBase):
 
         token = self._secret(getattr(settings, "API_TOKEN", ""))
         form = {"component": "VForm", "content": [
-            {"component": "VCard", "props": {"variant": "outlined", "class": "mb-4"}, "content": [
+            {"component": "VCard", "props": {"variant": "tonal", "color": "primary", "class": "mb-4"}, "content": [
                 {"component": "VCardText", "content": [
                     {"component": "div", "props": {"class": "text-overline text-primary"},
                      "text": "EMBY VIRTUAL LIBRARY"},
                     {"component": "div", "props": {"class": "text-h4 font-weight-bold mb-2"},
                      "text": "Emby 媒体虚拟库"},
                     {"component": "div", "props": {"class": "text-body-1 mb-4"},
-                     "text": "填写你的 Emby 302 服务器地址和 API Key，勾选需要的虚拟库即可。"},
+                     "text": "填写原生 Emby 内网地址和 API Key，勾选专区；客户端始终继续使用 8098。"},
                     {"component": "VAlert", "props": {
-                        "type": "info", "variant": "tonal", "class": "mb-4",
-                        "text": "不创建、不写入 Emby 合集。专区作为首页一级虚拟媒体库；播放仍使用原 ItemId、MediaSource 与 302 直链。",
+                        "type": "success", "variant": "tonal", "class": "mb-4",
+                        "title": "固定 8098 单入口",
+                        "text": "客户端仍访问 8098；现有302反代把普通Emby请求交给本插件的内部注入通道，播放仍由原8098返回302。内部通道不对公网开放。",
                     }},
                     {"component": "VRow", "content": [
                         {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextField", "props": {
-                                "model": "manual_url", "label": "Emby 302 服务器地址",
+                                "model": "manual_url", "label": "原生 Emby 内网地址",
                                 "placeholder": "http://emby:8096", "prepend-inner-icon": "mdi-server-network",
-                                "hint": "填写打开 Emby 的根地址，不是某个影片的 302 播放链接。",
+                                "hint": "填写8098背后的原生Emby地址，例如 http://emby:8096；不要填写8098，防止请求循环。",
                                 "persistent-hint": True, "clearable": True,
                             }},
                         ]},
@@ -1958,29 +2298,13 @@ class MediaArchiver(_PluginBase):
                             }},
                         ]},
                     ]},
-                    {"component": "VRow", "content": [
-                        {"component": "VCol", "props": {"cols": 12, "md": 8}, "content": [
-                            {"component": "VSwitch", "props": {
-                                "model": "home_view_enabled",
-                                "label": "启用首页一级虚拟库（不放入合集）",
-                                "color": "primary", "hide-details": True,
-                            }},
-                        ]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 4}, "content": [
-                            {"component": "VTextField", "props": {
-                                "model": "proxy_port", "label": "虚拟库客户端端口",
-                                "type": "number", "prepend-inner-icon": "mdi-lan",
-                                "hint": "Docker 默认需映射 8099:8099", "persistent-hint": True,
-                            }},
-                        ]},
-                    ]},
                     {"component": "VAlert", "props": {
                         "type": connection_type, "variant": "tonal", "class": "my-3",
                         "title": "Emby 连接状态", "text": connection_text,
                     }},
                     {"component": "VAlert", "props": {
                         "type": proxy_type, "variant": "tonal", "class": "my-3",
-                        "title": "首页虚拟库反代", "text": proxy_text,
+                        "title": "8098 虚拟库链路", "text": proxy_text,
                     }},
                     {"component": "div", "props": {"class": "d-flex flex-wrap ga-3"}, "content": [
                         {"component": "VBtn", "props": {
@@ -2100,12 +2424,6 @@ class MediaArchiver(_PluginBase):
                         {"component": "VRow", "content": [
                             {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
                                 {"component": "VTextField", "props": {
-                                    "model": "proxy_bind", "label": "反代监听地址",
-                                    "hint": "Docker 内通常保持 0.0.0.0", "persistent-hint": True,
-                                }},
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {
                                     "model": "sync_interval", "label": "校准间隔（分钟）", "type": "number",
                                 }},
                             ]},
@@ -2162,13 +2480,12 @@ class MediaArchiver(_PluginBase):
             {"component": "VAlert", "props": {
                 "type": "success", "variant": "tonal", "class": "mt-5",
                 "title": "最简单的使用方法",
-                "text": "填写上游地址和 Key → 保存 → 一键重建 → Docker 映射 8099 端口 → Emby 客户端改连 NAS-IP:8099。",
+                "text": "填写原生Emby地址和Key → 保存 → 一键重建 → 让现有8098反代的Emby上游指向内部注入地址 → 客户端继续使用NAS-IP:8098。",
             }},
         ]}
         defaults: Dict[str, Any] = {
             "enabled": True, "virtual_enabled": True, "ranking_enabled": False,
-            "auto_sync": True, "home_view_enabled": True,
-            "proxy_bind": "0.0.0.0", "proxy_port": 8099,
+            "auto_sync": True,
             "use_moviepilot_servers": False,
             "emby_servers": [], "emby_server": "", "manual_url": "", "manual_api_key": "",
             "sync_interval": 60, "timeout": 30, "tmdb_api_key": "", "tmdb_domain": "",
@@ -2264,10 +2581,10 @@ class MediaArchiver(_PluginBase):
             {"component": "VAlert", "props": {
                 "type": "success" if self._proxy_status.get("running") else "warning",
                 "variant": "tonal", "class": "mb-3",
-                "title": "首页虚拟库入口",
+                "title": "8098 虚拟库入口",
                 "text": (
-                    f"{self._proxy_status.get('message') or '反代未启动'}；"
-                    f"Emby 客户端请连接 http://NAS-IP:{self._proxy_port}"
+                    f"{self._proxy_status.get('message') or '内部注入服务未启动'}；"
+                    f"Emby 客户端固定连接 http://NAS-IP:{self.PUBLIC_GATEWAY_PORT}"
                 ),
             }},
             {"component": "div", "props": {"class": "d-flex flex-wrap ga-3 mb-3"}, "content": [
@@ -2521,10 +2838,10 @@ class MediaArchiver(_PluginBase):
             enabled = self._attribute_enabled and key in self._enabled_rules
             wanted = desired_attributes[key] if enabled else set()
             attribute_counts[key] = len(wanted)
-            if wanted:
+            if enabled:
                 view_key = f"attribute:{key}"
                 next_views[view_key] = self._make_virtual_view(
-                    view_key, rule["name"], "attribute", wanted, item_map, now
+                    view_key, rule["name"], "attribute", wanted, item_map, now, "movies"
                 )
 
         active_rankings = self._selected_rankings if self._ranking_enabled else set()
@@ -2535,19 +2852,23 @@ class MediaArchiver(_PluginBase):
             if not result or not result.ok:
                 ranking_failed += 1
                 old = previous_views.get(view_key)
-                if old and old.get("item_ids"):
+                if old:
                     next_views[view_key] = old
                     ranking_counts[key] = len(old.get("item_ids") or [])
                 else:
                     ranking_counts[key] = 0
+                    next_views[view_key] = self._make_virtual_view(
+                        view_key, name, "ranking", set(), item_map, now,
+                        self._ranking_collection_type(key),
+                    )
                 # 外部榜单源失败时保留上次内存/持久结果，不误清空首页栏目。
                 continue
             wanted = index.match(result.entries)
             ranking_counts[key] = len(wanted)
-            if wanted:
-                next_views[view_key] = self._make_virtual_view(
-                    view_key, name, "ranking", wanted, item_map, now
-                )
+            next_views[view_key] = self._make_virtual_view(
+                view_key, name, "ranking", wanted, item_map, now,
+                self._ranking_collection_type(key),
+            )
 
         for key in RANK_META:
             ranking_counts.setdefault(key, 0)
@@ -2573,7 +2894,7 @@ class MediaArchiver(_PluginBase):
             with self._proxy_lock:
                 self._virtual_views = {
                     str(value["id"]): dict(value) for value in next_views.values()
-                    if value.get("id") and value.get("item_ids")
+                    if value.get("id")
                 }
                 self._proxy_item_index = {key: dict(value) for key, value in item_map.items()}
         attribute_hits = sum(attribute_counts.values())
@@ -2598,6 +2919,7 @@ class MediaArchiver(_PluginBase):
         item_ids: Iterable[str],
         item_map: Mapping[str, Mapping[str, Any]],
         updated: str,
+        collection_type_hint: str = "",
     ) -> Dict[str, Any]:
         ids = sorted({str(value) for value in item_ids if str(value)})
         types = {
@@ -2608,7 +2930,7 @@ class MediaArchiver(_PluginBase):
         elif types and types <= {"series"}:
             collection_type = "tvshows"
         else:
-            collection_type = "mixed"
+            collection_type = collection_type_hint or "mixed"
         server_id = next(
             (str(item_map[item_id].get("ServerId")) for item_id in ids
              if item_id in item_map and item_map[item_id].get("ServerId")),
@@ -2618,7 +2940,19 @@ class MediaArchiver(_PluginBase):
             "id": self._view_id(key), "key": key, "name": name, "kind": kind,
             "collection_type": collection_type, "item_ids": ids,
             "server_id": server_id, "updated": updated,
+            "cover_tag": self._cover_tag(key, ids),
         }
+
+    @staticmethod
+    def _ranking_collection_type(key: str) -> str:
+        folded = str(key or "").casefold()
+        if folded.endswith("_movie") or (
+            folded.startswith("douban_") and "tv_" not in folded
+        ):
+            return "movies"
+        if folded.endswith("_series") or "_tv_" in folded:
+            return "tvshows"
+        return "mixed"
 
     def _is_proxy_origin(self, api_root: str) -> bool:
         if not self._manual_url:
@@ -2836,7 +3170,7 @@ class MediaArchiver(_PluginBase):
                 if not url or not api_key:
                     raise RuntimeError(
                         "当前 MoviePilot 版本未暴露 Emby 地址/API Key，"
-                        "请在插件首页填写‘Emby 302 服务器地址’与 API Key"
+                        "请在插件首页填写‘原生 Emby 内网地址’与 API Key"
                     )
                 client = EmbyClient(url, api_key, self._timeout)
                 if client.api_root not in seen_roots:
