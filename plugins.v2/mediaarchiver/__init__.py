@@ -127,7 +127,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.2",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.3",
             },
             method=method.upper(),
         )
@@ -517,7 +517,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.2",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.3",
         }
         merged.update(headers or {})
         body = None
@@ -772,7 +772,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.2 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.3 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -981,7 +981,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.3.2"
+    plugin_version = "4.3.3"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -1399,8 +1399,12 @@ class MediaArchiver(_PluginBase):
             })
 
         views_match = re.fullmatch(r"/Users/[^/]+/Views/?", route, flags=re.I)
-        items_match = re.fullmatch(r"/Users/[^/]+/Items/?", route, flags=re.I)
-        latest_match = re.fullmatch(r"/Users/[^/]+/Items/Latest/?", route, flags=re.I)
+        # Emby Web 通常使用 /Users/{id}/Items；部分电视端、手机端和第三方
+        # 客户端则使用 /Items?UserId=...。两种入口必须映射同一个虚拟 ParentId。
+        items_match = re.fullmatch(r"/(?:Users/[^/]+/)?Items/?", route, flags=re.I)
+        latest_match = re.fullmatch(
+            r"/(?:Users/[^/]+/)?Items/Latest/?", route, flags=re.I
+        )
         detail_match = re.fullmatch(
             r"/(?:Users/[^/]+/)?Items/([0-9a-f]{32})/?", route, flags=re.I
         )
@@ -1443,6 +1447,13 @@ class MediaArchiver(_PluginBase):
             view.get("cover_tag")
             or self._cover_tag(str(view.get("key") or name), view.get("item_ids") or [])
         )
+        raw_collection_type = str(view.get("collection_type") or "").casefold()
+        # Emby 的混合电影/剧集库不是名为 "mixed" 的 CollectionType；协议要求
+        # 返回 null，让客户端采用通用浏览页面。返回未知字符串会令部分客户端
+        # 无法进入“查看全部”。
+        collection_type: Optional[str] = (
+            None if raw_collection_type in {"", "mixed"} else raw_collection_type
+        )
         return {
             "Name": name,
             "ServerId": str(template.get("ServerId") or view.get("server_id") or ""),
@@ -1465,7 +1476,7 @@ class MediaArchiver(_PluginBase):
             "IsFolder": True,
             "ParentId": str(template.get("ParentId") or "1"),
             "Type": "CollectionFolder",
-            "CollectionType": str(view.get("collection_type") or "movies"),
+            "CollectionType": collection_type,
             "ChildCount": count,
             "RecursiveItemCount": count,
             "ImageTags": {"Primary": cover_tag},
