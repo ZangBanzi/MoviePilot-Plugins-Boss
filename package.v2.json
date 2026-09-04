@@ -3,12 +3,13 @@
     "name": "媒体虚拟库",
     "description": "复用MoviePilot已配置Emby与3334 API端口，经NextEmby现有8098输出属性专区和平台榜单一级虚拟库；不创建合集，保留原ItemId与302播放。",
     "labels": "Emby,首页虚拟库,动态封面,NextEmby,302,榜单,Netflix,Disney+,Remux,4K,HDR,Dolby Vision,Atmos",
-    "version": "4.3.1",
+    "version": "4.3.2",
     "icon": "folder-move.svg",
     "author": "Boss",
     "system_version": ">=2.0.0",
     "level": 1,
     "history": {
+      "v4.3.2": "修复入站Accept-Encoding与identity重复导致Emby仍返回压缩数据、继而误按UTF-8解码的问题；兼容gzip、deflate、Brotli与Zstandard，并清理改写响应中已失效的压缩及校验响应头",
       "v4.3.1": "完成错误与资源占用审计：修复临时断网后旧虚拟库被误标失效；虚拟库浏览不再复制完整索引，常驻索引剔除MediaSources/MediaStreams，属性识别改为单次轻量文本提取；移除未使用的旧兼容API和变量，并增加首次网关并发初始化保护",
       "v4.3.0": "删除插件独立反代监听和重复Emby地址/API Key；复用MoviePilot已配置Emby并将根级Emby网关挂载到现有3334 API端口，NextEmby继续独占8098；保留一级虚拟库、动态封面、原ItemId及302透明转发"
     }
