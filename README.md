@@ -1,6 +1,6 @@
 # 媒体虚拟库（MoviePilot v2）
 
-当前版本：`4.3.3`　作者：`Boss`
+当前版本：`4.3.1`　作者：`Boss`
 
 本插件把 Remux、4K、Dolby Vision、HDR、Atmos 和可选平台榜单显示为 Emby 首页一级媒体库。它不创建 Collection/BoxSet，不移动、不复制、不重命名媒体文件，也不修改 Symedia、115、STRM 或 Emby 的原始 `MediaSource.Path`。
 
@@ -17,7 +17,7 @@ NextEmby 302：8098
 
 插件不再启动任何 HTTP 服务，也不会占用 `8097`、`8098` 或 `8099`。它直接把 Emby 兼容网关注册到 MoviePilot 已经监听的 `3334`：
 
-`4.3.3` 修复部分客户端无法进入虚拟库“查看全部”的问题：混合电影/剧集库按 Emby 协议输出空的 `CollectionType`，并同时兼容用户级和根级 `Items`、`Items/Latest` 浏览接口。4.3.2 的压缩响应修复与 4.3.1 的资源优化均继续保留。
+`4.3.1` 进一步降低资源占用：浏览专区时不再复制全库索引，内存常驻索引不保存体积较大的 `MediaSources/MediaStreams`，属性扫描也不再重复展开同一份媒体流数据；临时断网时会继续保留上次成功生成的虚拟库。
 
 ```mermaid
 flowchart LR
@@ -165,8 +165,6 @@ http://NAS局域网IP:8098
 |---|---|
 | `Address already in use` | 仍在运行 4.2.x 旧代码；升级后重启 MoviePilot。4.3.1 不会绑定 8098/8099 |
 | `3334` 健康检查正常，`8098` 没有虚拟库 | NextEmby 的原 Emby/上游仍指向 8096；改为 NAS 局域网 IP:`3334` |
-| 日志出现 `utf-8 codec can't decode byte` | 升级到 4.3.2；旧版会把上游压缩 JSON 直接按 UTF-8 解码 |
-| 部分虚拟库能显示但“查看全部”打不开 | 升级到 4.3.3；已修正混合库类型并兼容客户端使用的根级 Items 路径 |
 | NextEmby 内访问 `127.0.0.1:3334` 失败 | 它不是 host 网络，改用 NAS 局域网 IP |
 | MoviePilot 自己连接异常或循环 | MoviePilot 的 Emby 必须保持 8096，不能指向 3334/8098 |
 | 一级库无封面 | 确认请求经过 3334 网关，随后清理客户端图片缓存或重新登录；成员变化会生成新的 ImageTag |
