@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import asyncio
-import gzip
 import html
 import hashlib
 import http.client
@@ -127,7 +126,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.3",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.1",
             },
             method=method.upper(),
         )
@@ -517,7 +516,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.3",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.1",
         }
         merged.update(headers or {})
         body = None
@@ -772,7 +771,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.3 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.1 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -981,7 +980,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.3.3"
+    plugin_version = "4.3.1"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -1399,12 +1398,8 @@ class MediaArchiver(_PluginBase):
             })
 
         views_match = re.fullmatch(r"/Users/[^/]+/Views/?", route, flags=re.I)
-        # Emby Web 通常使用 /Users/{id}/Items；部分电视端、手机端和第三方
-        # 客户端则使用 /Items?UserId=...。两种入口必须映射同一个虚拟 ParentId。
-        items_match = re.fullmatch(r"/(?:Users/[^/]+/)?Items/?", route, flags=re.I)
-        latest_match = re.fullmatch(
-            r"/(?:Users/[^/]+/)?Items/Latest/?", route, flags=re.I
-        )
+        items_match = re.fullmatch(r"/Users/[^/]+/Items/?", route, flags=re.I)
+        latest_match = re.fullmatch(r"/Users/[^/]+/Items/Latest/?", route, flags=re.I)
         detail_match = re.fullmatch(
             r"/(?:Users/[^/]+/)?Items/([0-9a-f]{32})/?", route, flags=re.I
         )
@@ -1447,13 +1442,6 @@ class MediaArchiver(_PluginBase):
             view.get("cover_tag")
             or self._cover_tag(str(view.get("key") or name), view.get("item_ids") or [])
         )
-        raw_collection_type = str(view.get("collection_type") or "").casefold()
-        # Emby 的混合电影/剧集库不是名为 "mixed" 的 CollectionType；协议要求
-        # 返回 null，让客户端采用通用浏览页面。返回未知字符串会令部分客户端
-        # 无法进入“查看全部”。
-        collection_type: Optional[str] = (
-            None if raw_collection_type in {"", "mixed"} else raw_collection_type
-        )
         return {
             "Name": name,
             "ServerId": str(template.get("ServerId") or view.get("server_id") or ""),
@@ -1476,7 +1464,7 @@ class MediaArchiver(_PluginBase):
             "IsFolder": True,
             "ParentId": str(template.get("ParentId") or "1"),
             "Type": "CollectionFolder",
-            "CollectionType": collection_type,
+            "CollectionType": str(view.get("collection_type") or "movies"),
             "ChildCount": count,
             "RecursiveItemCount": count,
             "ImageTags": {"Primary": cover_tag},
@@ -1944,12 +1932,6 @@ class MediaArchiver(_PluginBase):
             folded = key.casefold()
             if folded in self._HOP_HEADERS or folded in {"host", "content-length"}:
                 continue
-            # Starlette 通常把入站名称规范成小写。若先保留 ``accept-encoding``
-            # 再添加 ``Accept-Encoding: identity``，普通 dict 会同时保留两项，
-            # http.client 随后发出两个同名头；部分 Emby 会采用前一个并返回
-            # Brotli/gzip。需要转换 JSON 时必须先剔除入站值再写入唯一的 identity。
-            if force_identity and folded == "accept-encoding":
-                continue
             headers[str(key)] = str(value)
         headers["Host"] = target.netloc
         client_host = str(getattr(getattr(request, "client", None), "host", "") or "")
@@ -1983,78 +1965,11 @@ class MediaArchiver(_PluginBase):
         result: Dict[str, str] = {}
         excluded = set(cls._HOP_HEADERS)
         if transformed:
-            # 响应体一旦解压或改写，原长度、压缩标记及校验标签均已失效。
-            excluded.update({
-                "content-length", "content-encoding", "content-md5", "digest", "etag",
-            })
+            excluded.update({"content-length", "content-encoding"})
         for key, value in headers:
             if str(key).casefold() not in excluded:
                 result[str(key)] = str(value)
         return result
-
-    @staticmethod
-    def _content_encodings(headers: Iterable[Tuple[str, str]]) -> List[str]:
-        encodings: List[str] = []
-        for key, value in headers:
-            if str(key).casefold() != "content-encoding":
-                continue
-            encodings.extend(
-                token.strip().casefold()
-                for token in str(value).split(",")
-                if token.strip() and token.strip().casefold() != "identity"
-            )
-        return encodings
-
-    @classmethod
-    def _decode_buffered_body(
-        cls, headers: Iterable[Tuple[str, str]], body: bytes,
-    ) -> bytes:
-        """解开 Emby 忽略 ``Accept-Encoding: identity`` 时返回的压缩 JSON。
-
-        ``http.client`` 只处理分块传输，不会自动解开 Content-Encoding。部分
-        Emby/反代组合仍会返回 gzip、deflate、br 或 zstd；转换响应前必须先
-        解压，否则 ``json.loads`` 会把压缩字节误当 UTF-8。
-        """
-        if not body:
-            return body
-        encodings = cls._content_encodings(headers)
-        # 少数反代会漏掉 Content-Encoding；仅识别有稳定魔数的格式。
-        if not encodings:
-            if body.startswith(b"\x1f\x8b"):
-                encodings = ["gzip"]
-            elif body.startswith(b"\x28\xb5\x2f\xfd"):
-                encodings = ["zstd"]
-        decoded = body
-        for encoding in reversed(encodings):
-            if encoding in {"gzip", "x-gzip"}:
-                decoded = gzip.decompress(decoded)
-            elif encoding == "deflate":
-                try:
-                    decoded = zlib.decompress(decoded)
-                except zlib.error:
-                    decoded = zlib.decompress(decoded, -zlib.MAX_WBITS)
-            elif encoding == "br":
-                try:
-                    import brotli  # type: ignore[import-not-found]
-                except ImportError:
-                    try:
-                        import brotlicffi as brotli  # type: ignore[import-not-found,no-redef]
-                    except ImportError as err:
-                        raise RuntimeError("上游返回 Brotli 压缩，但宿主缺少 brotli 解码器") from err
-                decoded = brotli.decompress(decoded)
-            elif encoding in {"zstd", "x-zstd"}:
-                try:
-                    import zstandard  # type: ignore[import-not-found]
-                    decoded = zstandard.ZstdDecompressor().decompress(decoded)
-                except ImportError:
-                    try:
-                        from compression import zstd  # type: ignore[import-not-found]
-                        decoded = zstd.decompress(decoded)
-                    except ImportError as err:
-                        raise RuntimeError("上游返回 Zstandard 压缩，但宿主缺少 zstd 解码器") from err
-            else:
-                raise RuntimeError(f"上游返回不支持的 Content-Encoding：{encoding}")
-        return decoded
 
     async def _gateway_buffered_response(
         self,
@@ -2083,7 +1998,6 @@ class MediaArchiver(_PluginBase):
 
             status, response_headers, raw = await asyncio.to_thread(fetch)
             if transform:
-                raw = self._decode_buffered_body(response_headers, raw)
                 status, response_headers, raw = transform(status, response_headers, raw)
             clean = self._clean_response_headers(response_headers, transformed=bool(transform))
             if transform:
