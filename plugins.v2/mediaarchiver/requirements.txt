@@ -1,0 +1,4 @@
+# MoviePilot v2 installs this plugin-local file during market installation.
+# Do not pin or replace FastAPI/HTTPX/Starlette provided by MoviePilot.
+Brotli>=1.1.0
+zstandard>=0.22.0

@@ -1,176 +1,136 @@
-# 媒体虚拟库（MoviePilot v2）
+# 媒体虚拟库 · MoviePilot v2
 
-当前版本：`4.3.1`　作者：`Boss`
+版本 **4.3.7** · 作者 **Boss**
 
-本插件把 Remux、4K、Dolby Vision、HDR、Atmos 和可选平台榜单显示为 Emby 首页一级媒体库。它不创建 Collection/BoxSet，不移动、不复制、不重命名媒体文件，也不修改 Symedia、115、STRM 或 Emby 的原始 `MediaSource.Path`。
+在 Emby 首页显示 Remux、4K、Dolby Vision、HDR、Atmos 和已选电影/剧集榜单。每个专区包含现有媒体的原 ItemId；支持动态封面、分页、增量维护和 Cron 定时更新。
 
-## 你的正确链路
+## 本次优化（ponytail）
 
-你当前的 MoviePilot 使用 host 网络：
+4.3.7 在 4.3.6 的基础上做小范围重构：
 
-```text
-MoviePilot 前端端口：3333
-MoviePilot API 端口：3334
-原生 Emby：8096
-NextEmby 302：8098
-```
+- 媒体去重统一在同步入口完成，后续直接复用字典视图，减少整库列表复制。
+- 只在有成功获取的启用榜单需要匹配时构建榜单索引；属性专区全部取消勾选时跳过属性识别。
+- Provider 别名改为固定字典查找，同名标题只建立一次索引记录。
+- 新媒体快照在共享锁外构建，持锁时只交换引用，让同步与浏览减少相互等待。
+- 封面绘图交给后台线程；同一封面的并发请求复用一次绘图。冷封面暂时串行生成以限制 CPU，缓存仍最多保留 96 张。
+- 删除无调用的 SVG 生成器和旧响应头字典转换方法，保留实际使用的 PNG 封面及完整响应头转发。
 
-插件不再启动任何 HTTP 服务，也不会占用 `8097`、`8098` 或 `8099`。它直接把 Emby 兼容网关注册到 MoviePilot 已经监听的 `3334`：
+沿用现有依赖、配置、Cron、原媒体 ID 和 8098 访问链路。24 项协议测试及原有功能回归通过，内存与时间对比见 `TEST_REPORT.md`。
 
-`4.3.1` 进一步降低资源占用：浏览专区时不再复制全库索引，内存常驻索引不保存体积较大的 `MediaSources/MediaStreams`，属性扫描也不再重复展开同一份媒体流数据；临时断网时会继续保留上次成功生成的虚拟库。
+## 保留的 4.3.6 修复
 
-```mermaid
-flowchart LR
-    A["Emby 客户端 :8098"] --> B["NextEmby 302 :8098"]
-    B --> C["MoviePilot 内置网关 :3334"]
-    C --> D["原生 Emby :8096"]
-```
+4.3.5 的测试遗漏了实际代理中的多种异常响应，不能据此保证所有客户端可用。4.3.6 已在真实 HTTPX、FastAPI 和本地 HTTP 上游中复现并修复：
 
-MoviePilot 自己仍连接原生 Emby `8096`；NextEmby 的普通 Emby API 上游改为 MoviePilot `3334`。客户端始终只访问 `8098`，播放请求仍先经过 NextEmby，因此原有 302 规则不变。
+- Brotli/deflate 压缩体丢失 `Content-Encoding` 后被当作 UTF-8 解析。
+- 上游已解压却遗留 gzip 头，以及没有声明原始长度的 Zstd 帧解压失败。
+- 1 MiB 聚合分块等待后续数据，延迟首块交付。现在 HTTPX 按上游到达的块立即转发；标准库回退使用 `read1(64 KiB)`。
+- 多个 `Set-Cookie` 被字典合并。现在保留原始头字节和全部 Cookie；共享连接池不保存用户会话。
+- 客户端断开前后、响应还未开始迭代时的资源释放；WebSocket 转发任务完整取消和回收。
+- 中文设备名等请求头及编码路径的转发；HEAD、304、204、401、Range、302 的协议处理。
 
-## 安装
+只对需要注入/改写的 JSON 进行有上限的缓冲、解码与校验；不使用忽略错误字符的方式掩盖数据损坏。JSON 损坏时最多重试一次只读请求，仍失败就返回可定位的错误。新增运行版本、源码指纹和脱敏诊断，可判断服务器究竟加载了哪份文件。
 
-仓库结构：
+## 端口和访问链路
 
-```text
-MoviePilot-Plugins-Boss/
-├── plugins.v2/mediaarchiver/__init__.py
-├── icons/folder-move.svg
-├── package.v2.json
-└── README.md
-```
-
-第三方仓库地址：
-
-```text
-https://github.com/ZangBanzi/MoviePilot-Plugins-Boss
-```
-
-上传新版 `__init__.py`、`package.v2.json` 和 `README.md` 后，在 MoviePilot 插件市场刷新并升级“媒体虚拟库”。重启 MoviePilot 一次，确保旧版独立端口线程完全退出。
-
-## 配置插件
-
-1. MoviePilot 的“媒体服务器”继续绑定原生 Emby `http://NAS局域网IP:8096`，不要改成 3334 或 8098。
-2. 打开插件，选择 MoviePilot 已配置的 Emby；不再重复填写 Emby 地址和 API Key。
-3. 勾选需要的属性专区和榜单专区。
-4. 建议开启“自动维护新增与删除”。
-5. 保存后点击“一键重建”。
-
-一级虚拟库是插件的固定功能，因此没有“启用一级虚拟库”这种多余开关。属性专区、榜单和自动同步仍可分别控制。
-
-## 配置 NextEmby
-
-NextEmby 已经占用并发布 `8098`，这是正确的。不要让插件或 MoviePilot 再监听它。
-
-在 NextEmby 中只修改“原 Emby / 上游 Emby”地址：
-
-| 项目 | 填写内容 |
+| 组件 | 端口/配置 |
 |---|---|
-| 对外访问端口 | `8098`，保持不变 |
-| 原 Emby / 上游主机 | NAS 的局域网 IP |
-| 原 Emby / 上游端口 | `3334` |
-| MoviePilot 中的 Emby | 仍为 NAS 局域网 IP:`8096` |
+| 原生 Emby `emby-sa` | `8096` |
+| MoviePilot `moviepilot-v2` | host 网络；前端 `3333`，API `3334` |
+| MoviePilot 的媒体服务器配置 | 继续连接原生 Emby `8096` |
+| NextEmby `nextemby` | 普通 API 上游使用 NAS 局域网 IP:`3334` |
+| 所有客户端 | 继续连接 NextEmby `8098` |
 
-NextEmby 在 `ne_default` 网络，而 MoviePilot 使用 host 网络，所以 NextEmby 里不能填 `127.0.0.1:3334`。它只会指向 NextEmby 容器自己；必须填写 NAS 的实际局域网 IP，例如：
+普通 API 经过 **客户端 → NextEmby:8098 → MoviePilot 网关:3334 → Emby:8096**。
 
-```text
-http://192.168.1.10:3334
-```
+插件注册在 MoviePilot 已有 API 端口，不创建任何新监听。NextEmby 继续处理其原有 302 规则。转发响应不跟随或改写 Location；播放器使用原媒体 ItemId 和 MediaSource。本插件不创建 Collection/BoxSet，也不移动、复制、重命名真实媒体文件或改动 115、STRM、Symedia 目录。
 
-不要把 NextEmby 上游再指回 `8098`，否则会形成循环。
+NextEmby 使用容器网络，配置其上游时使用 NAS 局域网 IP，`127.0.0.1` 指向的是 NextEmby 容器自己。已经接通上述链路的用户无需更改地址。
 
-## 验证顺序
+## 上传 GitHub 和升级
 
-### 1. 验证 MoviePilot 内置网关
+解压发布包，将文件按下列位置覆盖上传；不要只把 ZIP 放进仓库。
 
-在 NAS 终端执行：
+| 文件 | GitHub 中的位置 |
+|---|---|
+| 插件代码 | `plugins.v2/mediaarchiver/__init__.py` |
+| **解码依赖** | `plugins.v2/mediaarchiver/requirements.txt` |
+| 插件索引 | 根目录 `package.v2.json` |
+| 说明 | 根目录 `README.md` |
+| 图标 | `icons/folder-move.svg` |
+| 可选测试与验证记录 | 根目录 `tests/`、`TEST_REPORT.md`、`requirements-dev.txt` |
+
+仓库若包含其他插件，保留其索引，只合并 `MediaArchiver` 条目。发布索引的文件名必须是 `package.v2.json`。
+
+MoviePilot v2 支持插件目录的 `requirements.txt`。沿用 Brotli 和 Zstandard 解码依赖，不替换 MoviePilot 自带的 FastAPI/HTTPX。请把依赖文件和代码一并上传，再通过插件市场升级/重新安装，使宿主执行依赖安装。[MoviePilot 官方插件仓库规范](https://github.com/jxxghp/MoviePilot-Plugins)
+
+升级步骤：
+
+1. 在 GitHub 提交新版文件；在 MoviePilot 插件市场刷新并升级至 **4.3.7**。
+2. 重启 MoviePilot，确保旧网关代码退出：`docker restart moviepilot-v2`。
+3. 等待 MoviePilot 启动，执行下方健康检查。确认版本和依赖正确，再点击插件“一键重建”。
+4. 退出并重新打开客户端，继续使用 `8098`。
+
+升级前备份已有插件文件和配置。本包未自动上传你的 GitHub，也未部署到 NAS。
+
+## 确认实际运行版本
+
+在 NAS 上执行：
 
 ```bash
-curl http://127.0.0.1:3334/__mediaarchiver__/health
+curl -s http://127.0.0.1:3334/__mediaarchiver__/health
 ```
 
-正常返回示例：
+检查：
 
-```json
-{"ok":true,"gateway":{"running":true,"api_port":3334,"public_port":8098},"views":5}
-```
+| 字段 | 含义 |
+|---|---|
+| `version` | 必须为 `4.3.7`；缺少此字段不能证明新版已加载 |
+| `code_sha256` | 当前加载代码的指纹，可与发布包 `SHA256SUMS` 对照 |
+| `performance.async_pool` | `true` 表示支持 HTTPX 连接池；这不是 Emby 连通性结论 |
+| `decoders.br` / `decoders.zstd` | 应为 `true`，否则查看 MoviePilot 插件依赖安装日志 |
+| `performance.inflight` / `peak_inflight` | 当前/峰值的请求处理数，统计到响应对象创建完成 |
+| `performance.active_streams` | 尚未发送结束的响应流数量；空闲后应回落 |
+| `performance.failures` | 本次加载后累计网关异常数 |
+| `decode_recoveries` / `decode_retries` | 成功解码/规范化响应次数及 JSON 只读重试次数，位于 `performance` 内 |
+| `last_error` | 最后一次异常的请求方法、无查询串路径、阶段、状态、压缩标记和代码位置 |
 
-MoviePilot 日志也应出现：
+`ok=true` 仅表示健康接口可响应，不能单凭它断言客户端可用。错误阶段可能为 `read_response`、`decode_json`、`transform_json`、`open_stream` 或 `stream_body`。日志和诊断不包含 API Key、Cookie、查询参数及响应正文；错误最多每 30 秒输出一次，累计失败数仍完整记录。
 
-```text
-[媒体虚拟库] 一级虚拟库网关已挂载到 MoviePilot:3334；NextEmby 对外端口保持 8098
-```
+如果 `3334` 已是新版、`8098` 表现仍不同，再检查 `8098/__mediaarchiver__/health` 是否也返回同一版本与指纹；NextEmby 若拦截自定义路径，此项只能作为路由诊断，需同时检查实际 `/Users/{id}/Views` 请求。正常浏览时原始媒体 API 仍由 Emby 按入站用户凭据判断权限，不使用插件的管理 Key 替代客户端 Key。
 
-### 2. 验证 NextEmby 能访问 3334
+## 配置和同步
 
-把示例 IP 换成 NAS 的局域网 IP：
+选择 MoviePilot 已配置的 Emby，勾选属性专区和平台榜单，保存后点击“一键重建”。不需要重新填写 Emby 地址或 Key。
+
+- 实时增量维护：合并新增/更新/删除事件，并按校准间隔扫描。使用缓存的榜单，减少外部请求。
+- 定时更新全部专区：刷新 Emby 条目和启用的榜单，处理新增、删除和版本变化。外部榜单获取失败时保留上次有效结果。
+- Cron 为 APScheduler 五段格式：分钟、小时、日期、月份、星期，按 MoviePilot 时区执行；建议使用 `TZ=Asia/Shanghai`。
+- 星期建议写 `mon` 到 `sun`。APScheduler 的数字 `0` 是星期一，不能套用 Linux crontab 的星期日编号。无效表达式回退为 `0 4 * * *` 并记日志。
+
+| 时间 | Cron |
+|---|---|
+| 每天 04:00 | `0 4 * * *` |
+| 每天 04:00、16:00 | `0 4,16 * * *` |
+| 每六小时 | `0 */6 * * *` |
+| 每周日 03:30 | `30 3 * * sun` |
+
+Remux 检查路径、文件名和媒体源字段；4K、Dolby Vision、HDR、Atmos 优先读取媒体流字段，再使用关键词。多版本电影遍历所有 MediaSources，任一版本符合即可入选，同一 ItemId 只列一次。播放版本仍由客户端和 Emby 决定。
+
+## 性能与测试边界
+
+共享 HTTPX 池上限为 128 条连接、64 条保活连接、保活 30 秒；这些数值是连接数，不代表可承载 128 名用户。连接池不保存任何用户 Cookie，客户端原始鉴权头原样转发。
+
+缓存只保留最多 64 组不包含用户会话的筛选/排序 ID 结果，30 秒过期、索引更换时失效。海报缓存保持 ETag/304，避免每次重新绘图。媒体/普通响应按块转发，后台榜单刷新与浏览数据互不混用。
+
+`TEST_REPORT.md` 记录本次重构的验证与本地性能对比。测试使用真实 HTTPX/FastAPI、回环 HTTP 上游和 WebSocket，并保留媒体识别与定时维护回归；未使用你的实际 NextEmby、Emby、客户端或网盘，不能替代 NAS 实测，也没有保证所有第三方客户端均已兼容。
+
+独立测试环境：
 
 ```bash
-docker exec nextemby sh -c 'wget -qO- http://192.168.1.10:3334/__mediaarchiver__/health'
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python tests/test_virtual_library.py
+.venv/bin/python -m pytest tests/test_gateway_runtime.py -q
 ```
 
-能够返回 JSON，才能把 NextEmby 上游设置为该地址。
-
-### 3. 重建并刷新客户端
-
-插件点击“一键重建”，等待日志显示扫描完成。然后彻底退出并重新打开 Emby 客户端，继续连接：
-
-```text
-http://NAS局域网IP:8098
-```
-
-首页应出现 `Remux专区`、`4K专区` 等一级库，并显示插件动态生成的品牌封面。
-
-## 实现说明
-
-### MoviePilot v2 API
-
-- `_PluginBase`：插件生命周期、配置、数据保存和页面/API 注册。
-- `MediaServerHelper`：读取 MoviePilot 已配置的 Emby 实例、地址和凭据。
-- `EventType.WebhookMessage`：媒体新增、更新和删除事件防抖同步。
-- APScheduler：定时全量校准。
-- MoviePilot 现有 FastAPI 应用：注册 Emby 根路径兼容网关，不创建新监听端口。
-
-### Emby API
-
-- `GET /System/Info`：连接测试。
-- `GET /Items`：扫描电影及媒体源/媒体流属性。
-- `GET /Users/{UserId}/Views`：在响应中追加一级虚拟库入口。
-- `GET /Users/{UserId}/Items`、`/Items/Latest`：返回虚拟库成员，但成员仍是原 ItemId。
-- `GET /Items/{VirtualId}/Images/Primary`：输出动态 PNG 一级库封面。
-- 其他 API、图片、字幕和播放请求透明转发给原生 Emby。
-
-### 为什么不影响原库和 302
-
-- 虚拟库不是 Collection/BoxSet，也没有第二份媒体文件。
-- 同一影片在原媒体库与属性专区共用同一个 Emby ItemId。
-- 插件不写入 Emby 媒体项目，不修改路径或媒体源。
-- NextEmby 仍是客户端最外层的 `8098`；原 ItemId 和播放请求仍经过其既有 302 判断。
-- 多版本电影会检查该 Item 的全部 `MediaSources`；任一版本命中即加入专区，但同一 ItemId 在一个专区只出现一次。
-- 全量重建重新计算全部成员；Webhook 增量事件防抖触发校准；文件删除、版本变化或属性不再命中后会从虚拟视图移除。
-
-## 识别规则
-
-| 专区 | 优先判断 |
-|---|---|
-| Remux | `MediaSources.Path`、文件名及媒体源字段中的 `Remux`，忽略大小写 |
-| 4K | 视频宽度 ≥ 3840 或高度 ≥ 2160，再回退 `2160p/4K/UHD` |
-| Dolby Vision | 视频流中的 DV/Dolby Vision 字段，再回退文件名关键词 |
-| HDR | 视频流 HDR 类型字段，再回退 HDR10/HDR10+/HLG/PQ 等关键词 |
-| Atmos | 音频流 Title/Profile/Codec/JOC 等字段，再回退 Atmos 关键词 |
-
-## 常见问题
-
-| 现象 | 处理方法 |
-|---|---|
-| `Address already in use` | 仍在运行 4.2.x 旧代码；升级后重启 MoviePilot。4.3.1 不会绑定 8098/8099 |
-| `3334` 健康检查正常，`8098` 没有虚拟库 | NextEmby 的原 Emby/上游仍指向 8096；改为 NAS 局域网 IP:`3334` |
-| NextEmby 内访问 `127.0.0.1:3334` 失败 | 它不是 host 网络，改用 NAS 局域网 IP |
-| MoviePilot 自己连接异常或循环 | MoviePilot 的 Emby 必须保持 8096，不能指向 3334/8098 |
-| 一级库无封面 | 确认请求经过 3334 网关，随后清理客户端图片缓存或重新登录；成员变化会生成新的 ImageTag |
-| Apple TV+ Provider 暂时失败 | 4.3.1 会按名称及 Provider ID 350 兜底；外部请求失败会保留上次结果 |
-| Disney+ 等连接被重置 | 插件会重试；当次失败保留上次成员，不会删除现有一级库 |
-
-## 安全边界
-
-本插件只改变经由 3334 网关返回给客户端的逻辑视图。它不删除真实电影、不清理 115、不改 Symedia 目录，不上传资源，也不生成第二份 STRM 或媒体文件。
+连接池与流式关闭设计参照 [HTTPX 异步支持文档](https://www.python-httpx.org/async/)。MoviePilot 的生命周期、配置、事件、定时服务和媒体服务器 Helper 沿用现有插件实现。

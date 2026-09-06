@@ -3,12 +3,18 @@
     "name": "媒体虚拟库",
     "description": "复用MoviePilot已配置Emby与3334 API端口，经NextEmby现有8098输出属性专区和平台榜单一级虚拟库；不创建合集，保留原ItemId与302播放。",
     "labels": "Emby,首页虚拟库,动态封面,NextEmby,302,榜单,Netflix,Disney+,Remux,4K,HDR,Dolby Vision,Atmos",
-    "version": "4.3.1",
+    "version": "4.3.7",
     "icon": "folder-move.svg",
     "author": "Boss",
     "system_version": ">=2.0.0",
     "level": 1,
     "history": {
+      "v4.3.7": "ponytail 精简：同步只去重一次，按需构建榜单索引；缩短共享锁占用，封面后台生成并复用；保留 4.3.6 网关兼容修复。",
+      "v4.3.6": "修复压缩头缺失/错误及未知长度Zstd导致UTF-8或解压错误；转发首块立即发送，修复多Set-Cookie及跨用户Cookie共享，断开可靠释放，添加有限筛选缓存、运行版本/源码指纹与脱敏诊断",
+      "v4.3.5": "修复第三方客户端登录后无法浏览：改为透明放行QuickConnect、Trailers等完整Emby接口；使用共享异步HTTP连接池、Keep-Alive和1MiB流式分块提升多用户并发，并加入错误日志限流与网关性能指标",
+      "v4.3.4": "新增可配置的标准五段Cron定时全量更新；触发时刷新属性专区、电影/剧集榜单并清理失效成员，同时将周期校准改为复用榜单缓存的轻量增量模式",
+      "v4.3.3": "修复部分虚拟库无法进入查看全部：混合电影/剧集虚拟库按Emby协议返回null CollectionType，并同时兼容用户级与根级Items、Items/Latest浏览接口",
+      "v4.3.2": "修复入站Accept-Encoding与identity重复导致Emby仍返回压缩数据、继而误按UTF-8解码的问题；兼容gzip、deflate、Brotli与Zstandard，并清理改写响应中已失效的压缩及校验响应头",
       "v4.3.1": "完成错误与资源占用审计：修复临时断网后旧虚拟库被误标失效；虚拟库浏览不再复制完整索引，常驻索引剔除MediaSources/MediaStreams，属性识别改为单次轻量文本提取；移除未使用的旧兼容API和变量，并增加首次网关并发初始化保护",
       "v4.3.0": "删除插件独立反代监听和重复Emby地址/API Key；复用MoviePilot已配置Emby并将根级Emby网关挂载到现有3334 API端口，NextEmby继续独占8098；保留一级虚拟库、动态封面、原ItemId及302透明转发"
     }
