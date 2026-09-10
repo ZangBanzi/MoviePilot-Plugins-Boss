@@ -171,7 +171,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.9",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.10",
             },
             method=method.upper(),
         )
@@ -505,6 +505,13 @@ class RankingFetcher:
                 ok_sources.append(item.source)
             elif item.error:
                 errors.append(item.error)
+        if errors and entries:
+            self.log(
+                "WARNING",
+                f"混合榜 {RANK_META.get(key, {}).get('collection', key)} 跳过 "
+                f"{len(errors)} 个不可用子源，保留 {len(entries)} 项有效内容",
+            )
+            return RankingResult(True, set(list(entries)[:self.limit]), "+".join(dict.fromkeys(ok_sources)) + "+部分子源失败")
         if errors:
             return RankingResult(
                 False, set(),
@@ -524,7 +531,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.9",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.10",
         }
         merged.update(headers or {})
         body = None
@@ -532,10 +539,12 @@ class RankingFetcher:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             merged["Content-Type"] = "application/json"
         last_error: Optional[BaseException] = None
-        for attempt in range(3):
+        attempts = 3 if url.startswith(self.tmdb_base) or url == self.feed_url else 1
+        timeout = self.timeout if url.startswith(self.tmdb_base) or url == self.feed_url else min(self.timeout, 8)
+        for attempt in range(attempts):
             request = urllib.request.Request(url, data=body, headers=merged, method=method)
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     return response.read()
             except urllib.error.HTTPError as err:
                 detail = err.read(240).decode("utf-8", "replace")
@@ -550,8 +559,8 @@ class RankingFetcher:
             ) as err:
                 last_error = err
                 delay = 0.8 * (2 ** attempt)
-            if attempt < 2:
-                self.log("WARNING", f"榜单请求暂时失败，{delay:.1f}秒后重试（{attempt + 1}/2）：{last_error}")
+            if attempt + 1 < attempts:
+                self.log("WARNING", f"榜单请求暂时失败，{delay:.1f}秒后重试（{attempt + 1}/{attempts - 1}）：{last_error}")
                 time.sleep(delay)
         raise RuntimeError(str(last_error or "网络请求失败"))
 
@@ -654,6 +663,10 @@ class RankingFetcher:
             True, self._tmdb_pages("/trending/all/week", {}, ""), "TMDB官方趋势"
         )
 
+    def _tmdb_popular(self, media_type: str, source: str) -> RankingResult:
+        path = "/movie/popular" if media_type == "Movie" else "/tv/popular"
+        return RankingResult(True, self._tmdb_pages(path, {}, media_type), source)
+
     def _provider_id(self, platform: str, media_type: str) -> int:
         cache_key = (platform, media_type)
         if cache_key in self._provider_ids:
@@ -733,19 +746,25 @@ class RankingFetcher:
 
     def _imdb(self, movie: bool) -> RankingResult:
         path = "moviemeter" if movie else "tvmeter"
-        raw = self._request(f"https://www.imdb.com/chart/{path}/").decode("utf-8", "replace")
-        ids: List[str] = []
-        seen: Set[str] = set()
-        for imdb_id in re.findall(r"tt\d{7,10}", raw):
-            if imdb_id not in seen:
-                seen.add(imdb_id)
-                ids.append(imdb_id)
-            if len(ids) >= self.limit:
-                break
-        if not ids:
-            raise RuntimeError("IMDb 页面未解析到条目")
         media_type = "Movie" if movie else "Series"
-        return RankingResult(True, {RankEntry(media_type=media_type, imdb=x) for x in ids}, "IMDb榜单页")
+        try:
+            raw = self._request(f"https://www.imdb.com/chart/{path}/").decode("utf-8", "replace")
+            ids: List[str] = []
+            seen: Set[str] = set()
+            for imdb_id in re.findall(r"tt\d{7,10}", raw):
+                if imdb_id not in seen:
+                    seen.add(imdb_id)
+                    ids.append(imdb_id)
+                if len(ids) >= self.limit:
+                    break
+            if ids:
+                return RankingResult(
+                    True, {RankEntry(media_type=media_type, imdb=x) for x in ids}, "IMDb榜单页"
+                )
+            raise RuntimeError("IMDb 页面未解析到条目")
+        except Exception as err:
+            self.log("WARNING", f"IMDb 榜单不可用，改用 TMDB 热门兜底：{err}")
+            return self._tmdb_popular(media_type, "TMDB热门兜底")
 
     def _anilist(self) -> RankingResult:
         query = """
@@ -758,10 +777,18 @@ class RankingFetcher:
           }
         }
         """
-        payload = self._json(
-            "https://graphql.anilist.co", "POST",
-            {"query": query, "variables": {"page": 1, "perPage": min(50, self.limit)}},
-        )
+        try:
+            payload = self._json(
+                "https://graphql.anilist.co", "POST",
+                {"query": query, "variables": {"page": 1, "perPage": min(50, self.limit)}},
+            )
+        except Exception as err:
+            self.log("WARNING", f"AniList 不可用，改用 TMDB 动漫兜底：{err}")
+            entries = (
+                self._tmdb_pages("/discover/tv", {"with_genres": "16", "sort_by": "popularity.desc"}, "Series")
+                | self._tmdb_pages("/discover/movie", {"with_genres": "16", "sort_by": "popularity.desc"}, "Movie")
+            )
+            return RankingResult(True, set(list(entries)[:self.limit]), "TMDB动漫热门兜底")
         media = (((payload or {}).get("data") or {}).get("Page") or {}).get("media") or []
         entries: Set[RankEntry] = set()
         for item in media:
@@ -773,13 +800,18 @@ class RankingFetcher:
                 original_title=str(titles.get("romaji") or ""), year=self._year(item.get("seasonYear")),
             ))
         if not entries:
-            raise RuntimeError("AniList 未返回条目")
+            self.log("WARNING", "AniList 未返回条目，改用 TMDB 动漫兜底")
+            entries = (
+                self._tmdb_pages("/discover/tv", {"with_genres": "16", "sort_by": "popularity.desc"}, "Series")
+                | self._tmdb_pages("/discover/movie", {"with_genres": "16", "sort_by": "popularity.desc"}, "Movie")
+            )
+            return RankingResult(True, set(list(entries)[:self.limit]), "TMDB动漫热门兜底")
         return RankingResult(True, entries, "AniList官方GraphQL")
 
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.9 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.10 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -985,7 +1017,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.3.9"
+    plugin_version = "4.3.10"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"

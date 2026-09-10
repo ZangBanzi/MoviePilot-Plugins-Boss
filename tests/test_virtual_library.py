@@ -1,4 +1,4 @@
-"""媒体虚拟库 v4.3.9 离线回归测试。
+"""媒体虚拟库 v4.3.10 离线回归测试。
 
 用本地伪 Emby 验证首页 View 注入、原 ItemId 列表与 302 透传；
 不连接真实 MoviePilot、Emby、TMDB 或榜单站点。
@@ -339,6 +339,24 @@ def main():
     ), "Cron 应压缩多余空格并保留标准五段表达式"
     invalid_cron, cron_error = plugin._normalize_sync_cron("0 4 * *")
     assert invalid_cron == "0 4 * * *" and cron_error
+    fetcher = module.RankingFetcher("tmdb-key", "api.themoviedb.org", "zh-CN", ["US"], 20, 30)
+    fetcher._request = lambda *_args, **_kwargs: b"<html></html>"
+    fetcher._tmdb_pages = lambda _path, _params, media_type="": {
+        module.RankEntry(media_type=media_type, tmdb="fallback")
+    }
+    imdb_fallback = fetcher._imdb(True)
+    assert imdb_fallback.ok and imdb_fallback.source == "TMDB热门兜底"
+    fetcher._json = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("HTTP 403 disabled"))
+    anime_fallback = fetcher._anilist()
+    assert anime_fallback.ok and anime_fallback.source == "TMDB动漫热门兜底"
+    partial_fetcher = module.RankingFetcher("tmdb-key", "api.themoviedb.org", "zh-CN", ["US"], 20, 30)
+    for child in partial_fetcher.DOUBAN_COLLECTIONS:
+        partial_fetcher._results[child] = module.RankingResult(False, set(), error="HTTP 404")
+    partial_fetcher._results["douban_showing"] = module.RankingResult(
+        True, {module.RankEntry(media_type="Movie", title="有效子榜")}, "豆瓣移动端公开集合",
+    )
+    partial_mixed = partial_fetcher._mixed("douban_mixed")
+    assert partial_mixed.ok and partial_mixed.entries and "部分子源失败" in partial_mixed.source
     multi_version = {
         "Id": "multi", "Type": "Movie", "Name": "多版本电影",
         "MediaSources": [
@@ -726,7 +744,7 @@ def main():
     assert fetcher._provider_id("apple_tv", "Movie") == 350
 
     assert module.MediaArchiver.PUBLIC_GATEWAY_PORT == 8098
-    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "4.3.9"
+    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "4.3.10"
     assert module.MediaArchiver.plugin_author == "Boss"
     print("PASS: 定时全量、增量校准、3334网关、首页View、动态封面、原ItemId、分页、Latest与302透传通过")
 
