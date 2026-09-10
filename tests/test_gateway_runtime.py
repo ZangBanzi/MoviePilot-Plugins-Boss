@@ -292,7 +292,7 @@ def test_invalid_json_diagnostics_and_retry(plugin_module, origin):
                 response = await client.get('/Users/u/Views?encoding=broken&api_key=never-log-this')
                 assert response.status_code == 502
             health = (await client.get('/__mediaarchiver__/health')).json()
-            assert health['version'] == '4.3.7'
+            assert health['version'] == '4.3.9'
             assert len(health['code_sha256']) == 64
             assert health['performance']['failures'] == 2
             assert health['performance']['suppressed_errors'] == 1
@@ -452,7 +452,7 @@ def test_json_size_limit_and_selection_cache(plugin_module, origin):
     assert p._select_view_item_ids(view, {'Limit': ['1']}, False) == (['m2'], 2)
     for n in range(100):
         p._select_view_item_ids(view, {'SearchTerm': [str(n)]}, False)
-    assert len(p._selection_cache) <= 64
+    assert len(p._selection_cache) <= p.SELECTION_CACHE_LIMIT
 
 
 def test_websocket_real_upstream(plugin_module):

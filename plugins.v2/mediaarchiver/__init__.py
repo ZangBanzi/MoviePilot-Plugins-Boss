@@ -115,7 +115,7 @@ class EmbyClient:
     ITEM_FIELDS = (
         "Path,FileName,MediaSources,MediaStreams,Width,Height,Container,"
         "ProviderIds,ProductionYear,PremiereDate,DateCreated,DateLastSaved,"
-        "OriginalTitle,SortName,Genres,Studios,CommunityRating,OfficialRating"
+        "OriginalTitle,SortName,Overview,Genres,Studios,Tags,CommunityRating,OfficialRating"
     )
 
     def __init__(self, base_url: str, api_key: str, timeout: int = 30):
@@ -171,7 +171,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.7",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.9",
             },
             method=method.upper(),
         )
@@ -524,7 +524,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.7",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.9",
         }
         merged.update(headers or {})
         body = None
@@ -779,7 +779,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.7 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.9 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -985,7 +985,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.3.7"
+    plugin_version = "4.3.9"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -993,13 +993,16 @@ class MediaArchiver(_PluginBase):
     auth_level = 1
     PUBLIC_GATEWAY_PORT = 8098
     GATEWAY_ROUTE_NAME = "MediaArchiver_emby_gateway"
+    SELECTION_CACHE_LIMIT = 192
 
-    ATTRIBUTE_RULES: Dict[str, Dict[str, str]] = {
-        "remux": {"name": "Remux专区", "icon": "mdi-disc", "hint": "路径、文件名或媒体源信息包含 Remux"},
-        "4k": {"name": "4K专区", "icon": "mdi-video-4k-box", "hint": "视频宽度≥3840或高度≥2160"},
-        "dolby_vision": {"name": "Dolby Vision专区", "icon": "mdi-eye-circle", "hint": "视频流 DV/Dolby Vision 信息"},
-        "hdr": {"name": "HDR专区", "icon": "mdi-brightness-7", "hint": "HDR10/HDR10+/HLG/PQ/DV"},
-        "atmos": {"name": "Atmos专区", "icon": "mdi-surround-sound", "hint": "音频流 Atmos/JOC 信息"},
+    ATTRIBUTE_RULES: Dict[str, Dict[str, Any]] = {
+        "remux": {"name": "Remux专区", "icon": "mdi-disc", "hint": "路径、文件名或媒体源信息包含 Remux", "types": {"movie"}},
+        "4k": {"name": "4K专区", "icon": "mdi-video-4k-box", "hint": "视频宽度≥3840或高度≥2160", "types": {"movie"}},
+        "dolby_vision": {"name": "Dolby Vision专区", "icon": "mdi-eye-circle", "hint": "视频流 DV/Dolby Vision 信息", "types": {"movie"}},
+        "hdr": {"name": "HDR专区", "icon": "mdi-brightness-7", "hint": "HDR10/HDR10+/HLG/PQ/DV", "types": {"movie"}},
+        "atmos": {"name": "Atmos专区", "icon": "mdi-surround-sound", "hint": "音频流 Atmos/JOC 信息", "types": {"movie"}},
+        "tvb": {"name": "TVB港剧专区", "icon": "mdi-television-classic", "hint": "标题、路径、厂牌或简介包含 TVB/无线/翡翠台/港剧/myTV SUPER", "types": {"movie", "series"}},
+        "adult": {"name": "伦理专区", "icon": "mdi-lock-alert", "hint": "分级、标签、类型或标题路径包含伦理/成人/R18/NC-17等信息", "types": {"movie", "series"}},
     }
     # 一级虚拟库封面模板。只保存品牌识别色与文字标志，不在线下载图片；
     # 这样断网也能生成封面，同时避免把外部图片地址写入 Emby。
@@ -1021,8 +1024,24 @@ class MediaArchiver(_PluginBase):
         "maoyan": {"logo": "MAOYAN", "bg": "#2D070A", "bg2": "#83151E", "accent": "#F03D37", "fg": "#FFFFFF"},
         "douban": {"logo": "DOUBAN", "bg": "#062116", "bg2": "#0B5D37", "accent": "#00B51D", "fg": "#FFFFFF"},
         "tencent": {"logo": "TENCENT VIDEO", "bg": "#07172C", "bg2": "#0C4165", "accent": "#20D36B", "fg": "#FFFFFF"},
+        "tvb": {"logo": "TVB", "bg": "#061C3D", "bg2": "#0B55A0", "accent": "#F5C542", "fg": "#FFFFFF"},
+        "adult": {"logo": "18+", "bg": "#1C0B12", "bg2": "#4A1025", "accent": "#FF6B8A", "fg": "#FFFFFF"},
         "default": {"logo": "VIRTUAL", "bg": "#111827", "bg2": "#3730A3", "accent": "#818CF8", "fg": "#FFFFFF"},
     }
+    TVB_KEYWORDS = (
+        "tvb", "television broadcasts", "无线电视", "無綫電視", "翡翠台",
+        "mytv super", "mytvsuper", "埋堆堆", "港剧", "港劇", "香港剧",
+        "香港劇", "翡翠剧场", "翡翠劇場",
+    )
+    ADULT_RATING_KEYWORDS = (
+        "nc-17", "nc17", "r18", "r-18", "18+", "x-rated", "x rated",
+        "category iii", "cat iii", "三级", "三級", "限制级", "限制級",
+    )
+    ADULT_METADATA_KEYWORDS = (
+        "伦理", "倫理", "伦理片", "倫理片", "情色", "成人", "adult",
+        "erotic", "erotica", "softcore", "sexploitation", "pink film",
+        "roman porno", "jav",
+    )
     EVENT_TYPES = {
         "library.new", "itemadded", "library.updated", "library.update", "itemupdated",
         "item.updated", "library.deleted", "itemremoved", "itemdeleted", "item.removed",
@@ -1754,7 +1773,7 @@ class MediaArchiver(_PluginBase):
         with self._proxy_lock:
             if self._selection_index is index:
                 self._selection_cache[cache_key] = (time.monotonic(), tuple(ids))
-                while len(self._selection_cache) > 64:
+                while len(self._selection_cache) > self.SELECTION_CACHE_LIMIT:
                     self._selection_cache.popitem(last=False)
         return ids[start:start + limit], total
 
@@ -3298,11 +3317,11 @@ class MediaArchiver(_PluginBase):
         }
         if self._attribute_enabled and self._enabled_rules:
             for item in items:
-                if str(item.get("Type") or "Movie").casefold() != "movie":
-                    continue
+                item_type = str(item.get("Type") or "Movie").casefold()
                 item_id = str(item["Id"])
                 for key in self._classify(item):
-                    if key in self._enabled_rules:
+                    rule_types = self.ATTRIBUTE_RULES.get(key, {}).get("types") or {"movie"}
+                    if key in self._enabled_rules and item_type in rule_types:
                         desired_attributes[key].add(item_id)
 
         for key, rule in self.ATTRIBUTE_RULES.items():
@@ -3312,7 +3331,8 @@ class MediaArchiver(_PluginBase):
             if enabled:
                 view_key = f"attribute:{key}"
                 next_views[view_key] = self._make_virtual_view(
-                    view_key, rule["name"], "attribute", wanted, item_map, now, "movies"
+                    view_key, rule["name"], "attribute", wanted, item_map, now,
+                    self._attribute_collection_type(key),
                 )
 
         active_rankings = self._selected_rankings if self._ranking_enabled else set()
@@ -3438,6 +3458,15 @@ class MediaArchiver(_PluginBase):
             return "tvshows"
         return "mixed"
 
+    @classmethod
+    def _attribute_collection_type(cls, key: str) -> str:
+        rule_types = cls.ATTRIBUTE_RULES.get(key, {}).get("types") or {"movie"}
+        if rule_types == {"movie"}:
+            return "movies"
+        if rule_types == {"series"}:
+            return "tvshows"
+        return "mixed"
+
     def _is_proxy_origin(self, api_root: str) -> bool:
         return bool(self._gateway_api_root and api_root.rstrip("/") == self._gateway_api_root.rstrip("/"))
 
@@ -3530,7 +3559,8 @@ class MediaArchiver(_PluginBase):
 
         item_text = self._scalar_text({
             key: item.get(key) for key in (
-                "Path", "FileName", "Name", "OriginalTitle", "SortName", "Container"
+                "Path", "FileName", "Name", "OriginalTitle", "SortName", "Container",
+                "Overview", "Genres", "Studios", "Tags", "OfficialRating",
             ) if item.get(key) not in (None, "")
         })
         source_text = self._scalar_text([
@@ -3565,7 +3595,25 @@ class MediaArchiver(_PluginBase):
         atmos_pattern = r"\batmos\b|\bjoc\b|e-?ac-?3[^\n]{0,30}joc|truehd[^\n]{0,30}atmos"
         if re.search(atmos_pattern, all_text, flags=re.I):
             matched.add("atmos")
+        if any(keyword.casefold() in all_text for keyword in self.TVB_KEYWORDS):
+            matched.add("tvb")
+        if self._is_adult_item(item_text, all_text):
+            matched.add("adult")
         return matched
+
+    @classmethod
+    def _is_adult_item(cls, item_text: str, all_text: str) -> bool:
+        if any(keyword in item_text for keyword in cls.ADULT_RATING_KEYWORDS):
+            return True
+        if any(keyword.casefold() in item_text for keyword in cls.ADULT_METADATA_KEYWORDS):
+            return True
+        patterns = (
+            r"(?<![a-z0-9])r-?18(?![a-z0-9])",
+            r"(?<![a-z0-9])nc-?17(?![a-z0-9])",
+            r"(?<![a-z0-9])18\+(?![a-z0-9])",
+            r"(?<![a-z0-9])jav(?![a-z0-9])",
+        )
+        return any(re.search(pattern, all_text, flags=re.I) for pattern in patterns)
 
     @staticmethod
     def _number(value: Any) -> int:

@@ -1,4 +1,4 @@
-"""媒体虚拟库 v4.3.7 离线回归测试。
+"""媒体虚拟库 v4.3.9 离线回归测试。
 
 用本地伪 Emby 验证首页 View 注入、原 ItemId 列表与 302 透传；
 不连接真实 MoviePilot、Emby、TMDB 或榜单站点。
@@ -301,7 +301,27 @@ def main():
         {
             "Id": "s1", "ServerId": "server-1", "Type": "Series", "Name": "甲剧集",
             "SortName": "Series A", "ProductionYear": 2026,
+            "Overview": "TVB 港剧测试条目", "Studios": [{"Name": "无线电视"}],
             "ProviderIds": {"Tvdb": "900"}, "MediaSources": [],
+        },
+        {
+            "Id": "s2", "ServerId": "server-1", "Type": "Series", "Name": "限制级剧集",
+            "SortName": "Series B", "ProductionYear": 2024,
+            "OfficialRating": "R18", "ProviderIds": {"Tvdb": "901"},
+            "MediaSources": [],
+        },
+        {
+            "Id": "m3", "ServerId": "server-1", "Type": "Movie", "Name": "普通AV1测试片",
+            "SortName": "C", "ProductionYear": 2023,
+            "MediaSources": [{"Path": "/电影/C.AV1.mkv", "MediaStreams": [
+                {"Type": "Video", "Codec": "av1", "Width": 1920, "Height": 1080},
+            ]}],
+        },
+        {
+            "Id": "m4", "ServerId": "server-1", "Type": "Movie", "Name": "成人题材电影",
+            "SortName": "D", "ProductionYear": 2022,
+            "Tags": [{"Name": "伦理"}],
+            "MediaSources": [{"Path": "/电影/D.mkv", "MediaStreams": []}],
         },
     ]
     untouched = copy.deepcopy(items)
@@ -333,6 +353,7 @@ def main():
     assert plugin._classify(multi_version) == {
         "remux", "4k", "dolby_vision", "hdr", "atmos",
     }, "多版本电影应遍历全部MediaSources，但最终仍按一个ItemId归类"
+    assert "adult" not in plugin._classify(items[4]), "AV1 编码不能误判为成人内容"
     identity = f"Emby-A|{fake.api_root}"
     old_view_key = "ranking:apple_tv_movie"
     old_view = plugin._make_virtual_view(
@@ -355,7 +376,7 @@ def main():
         "disney_plus_series": module.RankingResult(False, set(), error="connection reset"),
     }
     stats = plugin._sync_server(fake, "Emby-A", results)
-    assert stats["scanned"] == 3, stats
+    assert stats["scanned"] == 6, stats
     state = plugin._state["servers"][identity]
     views = state["virtual_views"]
     assert set(views["attribute:remux"]["item_ids"]) == {"m1"}
@@ -363,6 +384,10 @@ def main():
     assert set(views["attribute:dolby_vision"]["item_ids"]) == {"m2"}
     assert set(views["attribute:hdr"]["item_ids"]) == {"m2"}
     assert set(views["attribute:atmos"]["item_ids"]) == {"m2"}
+    assert set(views["attribute:tvb"]["item_ids"]) == {"s1"}
+    assert views["attribute:tvb"]["collection_type"] == "tvshows"
+    assert set(views["attribute:adult"]["item_ids"]) == {"m4", "s2"}
+    assert views["attribute:adult"]["collection_type"] == "mixed"
     assert set(views["ranking:netflix_movie"]["item_ids"]) == {"m1", "m2"}
     assert set(views["ranking:netflix_series"]["item_ids"]) == {"s1"}
     assert views[old_view_key]["item_ids"] == ["m1"], "榜单源失败应保留上次结果"
@@ -384,6 +409,8 @@ def main():
     assert changed["removed"] >= 5, changed
     empty_remux = plugin._state["servers"][identity]["virtual_views"]["attribute:remux"]
     assert empty_remux["item_ids"] == [], "已启用但零命中的专区仍须保留在首页"
+    assert plugin._state["servers"][identity]["virtual_views"]["attribute:tvb"]["item_ids"] == ["s1"]
+    assert set(plugin._state["servers"][identity]["virtual_views"]["attribute:adult"]["item_ids"]) == {"m4", "s2"}
 
     # 临时连接失败不得把上次成功状态标记为失效，否则重启后一级库会消失。
     plugin._state["servers"][identity]["active"] = True
@@ -699,7 +726,7 @@ def main():
     assert fetcher._provider_id("apple_tv", "Movie") == 350
 
     assert module.MediaArchiver.PUBLIC_GATEWAY_PORT == 8098
-    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "4.3.7"
+    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "4.3.9"
     assert module.MediaArchiver.plugin_author == "Boss"
     print("PASS: 定时全量、增量校准、3334网关、首页View、动态封面、原ItemId、分页、Latest与302透传通过")
 

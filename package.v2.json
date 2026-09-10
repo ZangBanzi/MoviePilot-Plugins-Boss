@@ -2,13 +2,15 @@
   "MediaArchiver": {
     "name": "媒体虚拟库",
     "description": "复用MoviePilot已配置Emby与3334 API端口，经NextEmby现有8098输出属性专区和平台榜单一级虚拟库；不创建合集，保留原ItemId与302播放。",
-    "labels": "Emby,首页虚拟库,动态封面,NextEmby,302,榜单,Netflix,Disney+,Remux,4K,HDR,Dolby Vision,Atmos",
-    "version": "4.3.7",
+    "labels": "Emby,首页虚拟库,动态封面,NextEmby,302,榜单,Netflix,Disney+,TVB,港剧,伦理,Remux,4K,HDR,Dolby Vision,Atmos",
+    "version": "4.3.9",
     "icon": "folder-move.svg",
     "author": "Boss",
     "system_version": ">=2.0.0",
     "level": 1,
     "history": {
+      "v4.3.9": "新增 伦理专区：基于 Emby 分级、类型、标签、标题、路径和简介识别成人/伦理内容；支持电影与剧集一级虚拟库，不移动真实文件。",
+      "v4.3.8": "新增 TVB港剧专区：基于 Emby 本地标题、路径、厂牌、简介和标签识别 TVB/无线/翡翠台/港剧；属性专区支持剧集型虚拟库，并提升多用户翻页缓存容量。",
       "v4.3.7": "ponytail 精简：同步只去重一次，按需构建榜单索引；缩短共享锁占用，封面后台生成并复用；保留 4.3.6 网关兼容修复。",
       "v4.3.6": "修复压缩头缺失/错误及未知长度Zstd导致UTF-8或解压错误；转发首块立即发送，修复多Set-Cookie及跨用户Cookie共享，断开可靠释放，添加有限筛选缓存、运行版本/源码指纹与脱敏诊断",
       "v4.3.5": "修复第三方客户端登录后无法浏览：改为透明放行QuickConnect、Trailers等完整Emby接口；使用共享异步HTTP连接池、Keep-Alive和1MiB流式分块提升多用户并发，并加入错误日志限流与网关性能指标",
