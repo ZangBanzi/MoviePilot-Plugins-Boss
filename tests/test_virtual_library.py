@@ -215,6 +215,7 @@ class _FakeScanEmby:
 class _FakeOriginHandler(http.server.BaseHTTPRequestHandler):
     items = {}
     views_encoding = ""
+    overreturn_items = False
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -250,6 +251,8 @@ class _FakeOriginHandler(http.server.BaseHTTPRequestHandler):
             return
         if route in {"/Users/u/Items", "/Items"}:
             ids = (query.get("Ids") or [""])[0].split(",")
+            if type(self).overreturn_items:
+                ids = list(self.items)
             values = [copy.deepcopy(self.items[item_id]) for item_id in ids if item_id in self.items]
             self._json({"Items": values, "TotalRecordCount": len(values)})
             return
@@ -272,11 +275,70 @@ class _FakeOriginHandler(http.server.BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
 
+def check_ethics_rules(module):
+    """截图提供误收反例；以下字段为构造数据，不冒充用户 Emby 元数据。"""
+    cases = [
+        ({"Name": "宝贝老板2", "Overview": "兄弟长大成人，重拾亲情。", "Genres": ["动画", "家庭"]}, False),
+        ({"Name": "宝可梦", "Overview": "儿童与成人共同观看的冒险故事。"}, False),
+        ({"Name": "阿旺新传", "Genres": ["家庭伦理"], "Tags": ["家庭伦理剧"]}, False),
+        ({"Name": "成人礼", "Genres": ["Drama"]}, False),
+        ({"Name": "动画测试", "Studios": [{"Name": "Adult Swim"}]}, False),
+        ({"Name": "惊悚测试", "OfficialRating": "NC-17"}, False),
+        ({"Name": "分级测试", "OfficialRating": "R18", "Tags": ["18+", "限制级"]}, False),
+        ({"Name": "伦理困境", "Genres": ["伦理"], "Path": "/伦理专区/普通电影.mkv"}, False),
+        ({"Name": "普通电影", "MediaSources": [{"Path": "/adult/JAV/example.mkv"}]}, False),
+        ({"Name": "普通电影", "Tags": [{"Name": "家庭", "Id": "情色"}, 42, None]}, False),
+        ({"Name": "明确题材", "Genres": ["情色"]}, True),
+        ({"Name": "明确题材英文", "Genres": " EROTICA "}, True),
+        ({"Name": "明确标签", "Tags": [{"Name": "情色"}]}, True),
+        ({"Name": "人工确认", "Tags": [{"Name": "  虚拟库：伦理  "}]}, True),
+        ({"Name": "伦理动画测试", "Genres": ["Animation", "Erotic"]}, True),
+        ({"Name": "人工排除", "Genres": ["情色"], "Tags": ["伦理", "排除伦理"]}, False),
+        ({"Name": "人工排除繁体", "Genres": ["情色"], "Tags": [{"Name": "排除倫理"}]}, False),
+        # 标题不是黑名单：用户明确归类时仍应生效。
+        ({"Name": "宝贝老板2", "Tags": ["伦理"]}, True),
+    ]
+    plugin = module.MediaArchiver()
+    items = []
+    expected = set()
+    for number, (metadata, wanted) in enumerate(cases):
+        item = {"Id": f"case-{number}", "Type": "Series" if number % 2 else "Movie", **metadata}
+        original = copy.deepcopy(item)
+        actual = "adult" in plugin._classify(item)
+        assert actual == wanted, (metadata, actual, wanted)
+        assert item == original, "识别不得修改原条目"
+        items.append(item)
+        if wanted:
+            expected.add(item["Id"])
+
+    plugin._attribute_enabled = True
+    plugin._enabled_rules = {"adult"}
+    plugin._ranking_enabled = False
+    client = _FakeScanEmby(items)
+    identity = f"Ethics|{client.api_root}"
+    # 模拟旧规则已误收全部条目；重建必须清除旧成员而非合并旧缓存。
+    old_view = plugin._make_virtual_view(
+        "attribute:adult", "伦理专区", "attribute", client._items, client._items, "old", "mixed",
+    )
+    plugin._state = {"servers": {identity: {"virtual_views": {"attribute:adult": old_view}}}}
+    stats = plugin._sync_server(client, "Ethics", {})
+    view = plugin._state["servers"][identity]["virtual_views"]["attribute:adult"]
+    assert set(view["item_ids"]) == expected
+    assert view["collection_type"] == "mixed"
+    assert stats["removed"] == len(items) - len(expected)
+    assert plugin._sync_server(client, "Ethics", {})["removed"] == 0
+    client._items["case-0"]["Tags"] = ["伦理"]
+    assert plugin._sync_server(client, "Ethics", {})["added"] == 1
+    client._items["case-0"]["Tags"].append("排除伦理")
+    assert plugin._sync_server(client, "Ethics", {})["removed"] == 1
+
+
 def main():
     root = Path(__file__).resolve().parent
     if root.name == "tests":
         root = root.parent
     module = _load_module(root)
+    check_ethics_rules(module)
     items = [
         {
             "Id": "m1", "ServerId": "server-1", "Type": "Movie", "Name": "甲电影",
@@ -307,7 +369,7 @@ def main():
         {
             "Id": "s2", "ServerId": "server-1", "Type": "Series", "Name": "限制级剧集",
             "SortName": "Series B", "ProductionYear": 2024,
-            "OfficialRating": "R18", "ProviderIds": {"Tvdb": "901"},
+            "OfficialRating": "R18", "Genres": ["情色"], "ProviderIds": {"Tvdb": "901"},
             "MediaSources": [],
         },
         {
@@ -454,12 +516,16 @@ def main():
         "ranking:test_mixed", "测试混合榜", "ranking", {"m1", "s1"},
         proxy._proxy_item_index, "2026-08-31T10:00:00Z", "mixed",
     )
+    adult_view = proxy._make_virtual_view(
+        "attribute:adult", "伦理专区", "attribute", {"m4", "s2"},
+        proxy._proxy_item_index, "2026-08-31T10:00:00Z", "mixed",
+    )
     remux_single = proxy._make_virtual_view(
         "attribute:remux", "REMUX", "attribute", {"m1"},
         proxy._proxy_item_index, "2026-08-31T10:00:00Z",
     )
     assert remux_single["cover_tag"] != remux["cover_tag"], "成员变化后封面标签必须刷新"
-    proxy._virtual_views = {remux["id"]: remux, mixed["id"]: mixed}
+    proxy._virtual_views = {view["id"]: view for view in (remux, mixed, adult_view)}
     proxy._gateway_client_cache = module.EmbyClient(
         f"http://127.0.0.1:{origin.server_port}", "key"
     )
@@ -518,6 +584,32 @@ def main():
         _FakeRequest("/Items", root_query), "/Items"
     )).body)
     assert [item["Id"] for item in root_listing["Items"]] == ["m1", "m2"]
+    # 模拟“文件夹”浏览，并让上游故意返回额外条目：每页仍必须严格限制在专区内。
+    _FakeOriginHandler.overreturn_items = True
+    try:
+        for route in ("/Items", "/Users/u/Items", "/emby/Items"):
+            for offset, expected_page in ((0, ["m4"]), (1, ["s2"]), (2, [])):
+                query = urllib.parse.urlencode({
+                    "UserId": "u", "ParentId": adult_view["id"], "Recursive": "false",
+                    "StartIndex": offset, "Limit": 1, "SortBy": "SortName",
+                })
+                page = json.loads(asyncio.run(proxy._emby_gateway(
+                    _FakeRequest(route, query), route,
+                )).body)
+                assert [item["Id"] for item in page["Items"]] == expected_page, page
+                assert page["TotalRecordCount"] == 2
+            for item_type, expected_id in (("Movie", "m4"), ("Series", "s2")):
+                query = urllib.parse.urlencode({
+                    "UserId": "u", "ParentId": adult_view["id"],
+                    "IncludeItemTypes": item_type, "Limit": 100,
+                })
+                page = json.loads(asyncio.run(proxy._emby_gateway(
+                    _FakeRequest(route, query), route,
+                )).body)
+                assert [item["Id"] for item in page["Items"]] == [expected_id]
+                assert page["TotalRecordCount"] == 1
+    finally:
+        _FakeOriginHandler.overreturn_items = False
     query = f"ParentId={remux['id']}&Limit=1"
     prefixed_listing = json.loads(asyncio.run(proxy._emby_gateway(
         _FakeRequest("/emby/Users/u/Items", query), "/emby/Users/u/Items"

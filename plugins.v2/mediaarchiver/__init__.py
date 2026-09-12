@@ -1034,7 +1034,7 @@ class MediaArchiver(_PluginBase):
         "hdr": {"name": "HDR专区", "icon": "mdi-brightness-7", "hint": "HDR10/HDR10+/HLG/PQ/DV", "types": {"movie"}},
         "atmos": {"name": "Atmos专区", "icon": "mdi-surround-sound", "hint": "音频流 Atmos/JOC 信息", "types": {"movie"}},
         "tvb": {"name": "TVB港剧专区", "icon": "mdi-television-classic", "hint": "标题、路径、厂牌或简介包含 TVB/无线/翡翠台/港剧/myTV SUPER", "types": {"movie", "series"}},
-        "adult": {"name": "伦理专区", "icon": "mdi-lock-alert", "hint": "分级、标签、类型或标题路径包含伦理/成人/R18/NC-17等信息", "types": {"movie", "series"}},
+        "adult": {"name": "伦理专区", "icon": "mdi-lock-alert", "hint": "明确情色类型/标签；Emby标签“伦理”加入，“排除伦理”排除", "types": {"movie", "series"}},
     }
     # 一级虚拟库封面模板。只保存品牌识别色与文字标志，不在线下载图片；
     # 这样断网也能生成封面，同时避免把外部图片地址写入 Emby。
@@ -1065,15 +1065,16 @@ class MediaArchiver(_PluginBase):
         "mytv super", "mytvsuper", "埋堆堆", "港剧", "港劇", "香港剧",
         "香港劇", "翡翠剧场", "翡翠劇場",
     )
-    ADULT_RATING_KEYWORDS = (
-        "nc-17", "nc17", "r18", "r-18", "18+", "x-rated", "x rated",
-        "category iii", "cat iii", "三级", "三級", "限制级", "限制級",
-    )
-    ADULT_METADATA_KEYWORDS = (
-        "伦理", "倫理", "伦理片", "倫理片", "情色", "成人", "adult",
-        "erotic", "erotica", "softcore", "sexploitation", "pink film",
-        "roman porno", "jav",
-    )
+    # 只匹配完整类型/标签，不把剧情、厂牌、路径或年龄分级当作情色题材。
+    ADULT_CONTENT_LABELS = frozenset({
+        "情色", "情色片", "情色电影", "情色電影", "erotic", "erotica",
+        "softcore", "sexploitation", "pink film", "roman porno", "jav",
+    })
+    ADULT_INCLUDE_TAGS = frozenset({
+        "伦理", "倫理", "伦理专区", "倫理專區", "伦理片", "倫理片",
+        "虚拟库:伦理", "虛擬庫:倫理",
+    })
+    ADULT_EXCLUDE_TAGS = frozenset({"排除伦理", "排除倫理"})
     EVENT_TYPES = {
         "library.new", "itemadded", "library.updated", "library.update", "itemupdated",
         "item.updated", "library.deleted", "itemremoved", "itemdeleted", "item.removed",
@@ -3629,23 +3630,30 @@ class MediaArchiver(_PluginBase):
             matched.add("atmos")
         if any(keyword.casefold() in all_text for keyword in self.TVB_KEYWORDS):
             matched.add("tvb")
-        if self._is_adult_item(item_text, all_text):
+        if self._is_adult_item(item):
             matched.add("adult")
         return matched
 
     @classmethod
-    def _is_adult_item(cls, item_text: str, all_text: str) -> bool:
-        if any(keyword in item_text for keyword in cls.ADULT_RATING_KEYWORDS):
-            return True
-        if any(keyword.casefold() in item_text for keyword in cls.ADULT_METADATA_KEYWORDS):
-            return True
-        patterns = (
-            r"(?<![a-z0-9])r-?18(?![a-z0-9])",
-            r"(?<![a-z0-9])nc-?17(?![a-z0-9])",
-            r"(?<![a-z0-9])18\+(?![a-z0-9])",
-            r"(?<![a-z0-9])jav(?![a-z0-9])",
+    def _is_adult_item(cls, item: Mapping[str, Any]) -> bool:
+        """明确标签或情色类型才入选；排除标签优先，无证据时不猜测。"""
+        labels: Dict[str, Set[str]] = {}
+        for field in ("Tags", "Genres"):
+            values = item.get(field) or []
+            if not isinstance(values, (list, tuple, set)):
+                values = [values]
+            names = (value.get("Name") if isinstance(value, Mapping) else value for value in values)
+            labels[field] = {
+                " ".join(value.split()).casefold().replace("：", ":")
+                for value in names if isinstance(value, str) and value.strip()
+            }
+        tags = labels["Tags"]
+        if tags & cls.ADULT_EXCLUDE_TAGS:
+            return False
+        return bool(
+            tags & cls.ADULT_INCLUDE_TAGS
+            or (tags | labels["Genres"]) & cls.ADULT_CONTENT_LABELS
         )
-        return any(re.search(pattern, all_text, flags=re.I) for pattern in patterns)
 
     @staticmethod
     def _number(value: Any) -> int:
