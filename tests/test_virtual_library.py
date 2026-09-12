@@ -418,7 +418,7 @@ def main():
         True, {module.RankEntry(media_type="Movie", title="有效子榜")}, "豆瓣移动端公开集合",
     )
     partial_mixed = partial_fetcher._mixed("douban_mixed")
-    assert not partial_mixed.ok, "不完整混合榜不能被当作完整快照清理成员"
+    assert partial_mixed.ok and not partial_mixed.complete, "部分榜单允许新增，但不能当作完整快照清理成员"
     multi_version = {
         "Id": "multi", "Type": "Movie", "Name": "多版本电影",
         "MediaSources": [
@@ -836,7 +836,7 @@ def main():
     assert fetcher._provider_id("apple_tv", "Movie") == 350
 
     assert module.MediaArchiver.PUBLIC_GATEWAY_PORT == 8098
-    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "4.3.10"
+    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "4.3.11"
     assert module.MediaArchiver.plugin_author == "Boss"
     print("PASS: 定时全量、增量校准、3334网关、首页View、动态封面、原ItemId、分页、Latest与302透传通过")
 

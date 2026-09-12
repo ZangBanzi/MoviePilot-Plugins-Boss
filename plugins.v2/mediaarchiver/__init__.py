@@ -269,6 +269,8 @@ class RankingResult:
     entries: Set[RankEntry]
     source: str = ""
     error: str = ""
+    complete: bool = True
+    empty_valid: bool = False
 
 
 RANK_GROUPS: Tuple[Dict[str, Any], ...] = (
@@ -473,12 +475,14 @@ class RankingFetcher:
                 value = self._platform(key)
         except Exception as err:
             value = RankingResult(False, set(), error=str(err))
-        if value.ok and not value.entries:
+        if value.ok and not value.entries and not value.empty_valid:
             value = RankingResult(
                 False, set(), source=value.source,
                 error="榜单源返回 0 项，为防止误清空已保留旧集合",
             )
         self._results[key] = value
+        if value.ok and not value.complete:
+            self.log("WARNING", f"榜单源 {RANK_META[key]['collection']} 部分更新：{value.error}")
         if value.ok:
             self.log("INFO", f"榜单源 {RANK_META[key]['collection']}：取得 {len(value.entries)} 项（{value.source}）")
         else:
@@ -511,15 +515,13 @@ class RankingFetcher:
                 ok_sources.append(item.source)
             elif item.error:
                 errors.append(item.error)
-        if errors:
-            return RankingResult(
-                False, set(),
-                error="混合榜子源不完整，为防止移除旧成员已放弃本次更新："
-                      + "；".join(errors),
-            )
         if not ok_sources:
             return RankingResult(False, set(), error="；".join(errors) or "所有子榜单均不可用")
-        return RankingResult(True, entries, "+".join(dict.fromkeys(ok_sources)))
+        return RankingResult(
+            True, entries, "+".join(dict.fromkeys(ok_sources)),
+            error=("有效子源可新增；暂缓旧成员清理：" + "；".join(dict.fromkeys(errors))) if errors else "",
+            complete=not errors, empty_valid=True,
+        )
 
     def _request(
         self,
@@ -546,8 +548,10 @@ class RankingFetcher:
                 with urllib.request.urlopen(request, timeout=timeout) as response:
                     return response.read()
             except urllib.error.HTTPError as err:
-                detail = err.read(240).decode("utf-8", "replace")
-                last_error = RuntimeError(f"HTTP {err.code} {detail}")
+                err.close()
+                explanation = {404: "来源接口或榜单不存在", 403: "来源拒绝访问或暂时停服",
+                               429: "来源限流"}.get(err.code, "来源HTTP请求失败")
+                last_error = RuntimeError(f"HTTP {err.code}：{explanation}")
                 if err.code != 429 and err.code < 500:
                     raise last_error from err
                 retry_after = str(err.headers.get("Retry-After") or "").strip()
@@ -709,6 +713,20 @@ class RankingFetcher:
             raise RuntimeError(f"TMDB 未找到 {platform} 的 Watch Provider")
         return found
 
+    @staticmethod
+    def _discover_items(payload: Any) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+            raise RuntimeError("TMDB Discover 响应缺少有效 results，不清空旧结果")
+        rows = payload["results"]
+        if any(not isinstance(row, dict) or not row.get("id") for row in rows):
+            raise RuntimeError("TMDB Discover 条目格式异常，不清空旧结果")
+        if not rows and payload.get("total_results") != 0:
+            # 后续空分页可以 total_pages 验证；当前最多2页，不能据此清空整个地区结果。
+            if not (isinstance(payload.get("page"), int) and isinstance(payload.get("total_pages"), int)
+                    and payload["page"] > payload["total_pages"] > 0):
+                raise RuntimeError("TMDB 空列表未确认 total_results=0，不清空旧结果")
+        return rows
+
     def _platform(self, key: str) -> RankingResult:
         suffix = "movie" if key.endswith("_movie") else "series" if key.endswith("_series") else ""
         if not suffix:
@@ -729,11 +747,11 @@ class RankingFetcher:
                         "sort_by": "popularity.desc", "page": page,
                     },
                 )
-                for item in payload.get("results") or []:
+                for item in self._discover_items(payload):
                     entry = self._from_tmdb(item, media_type)
                     if entry:
                         entries[entry] = max(entries.get(entry, 0.0), float(item.get("popularity") or 0))
-        return RankingResult(True, set(sorted(entries, key=lambda x: (-entries[x], x.media_type, x.tmdb))[:self.limit]), "TMDB所选地区可播精选（非平台官方榜单）")
+        return RankingResult(True, set(sorted(entries, key=lambda x: (-entries[x], x.media_type, x.tmdb))[:self.limit]), "TMDB所选地区可播精选（非平台官方榜单）", empty_valid=True)
 
     def _imdb(self, movie: bool) -> RankingResult:
         path = "moviemeter" if movie else "tvmeter"
@@ -759,7 +777,8 @@ class RankingFetcher:
                     for edge in chart.get("edges") or []:
                         node = edge.get("node") if isinstance(edge, dict) else None
                         if isinstance(node, dict):
-                            add(node.get("id"))
+                            title = node.get("title")
+                            add(node.get("id") or (title.get("id") if isinstance(title, dict) else ""))
                 for child in value.values():
                     if isinstance(child, (dict, list)):
                         walk(child)
@@ -832,7 +851,51 @@ class RankingFetcher:
         }
         return RankingResult(True, entries, "Bangumi每日放送API")
 
+    def _douban_north_america(self) -> RankingResult:
+        """从同源排行榜的北美区块取ID，不能混入新片榜、口碑榜或Top250。"""
+        from html.parser import HTMLParser
+        class ChartParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.heading = None
+                self.active = False
+                self.subject = ""
+                self.title = []
+                self.entries = set()
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "h2":
+                    self.active = False
+                    self.heading = []
+                if tag == "a" and self.active:
+                    href = urllib.parse.urljoin("https://movie.douban.com/", attrs.get("href", ""))
+                    parts = urllib.parse.urlsplit(href)
+                    match = re.fullmatch(r"/subject/(\d+)/?", parts.path)
+                    self.subject = match.group(1) if parts.hostname == "movie.douban.com" and match else ""
+                    self.title = []
+            def handle_data(self, data):
+                if self.heading is not None:
+                    self.heading.append(data)
+                if self.subject:
+                    self.title.append(data)
+            def handle_endtag(self, tag):
+                if tag == "h2" and self.heading is not None:
+                    self.active = "北美票房榜" in "".join(self.heading)
+                    self.heading = None
+                if tag == "a" and self.subject:
+                    self.entries.add(RankEntry(media_type="Movie", douban=self.subject,
+                                               title="".join(self.title).strip()))
+                    self.subject = ""
+        raw = self._request("https://movie.douban.com/chart").decode("utf-8", "strict")
+        parser = ChartParser()
+        parser.feed(raw)
+        if not parser.entries:
+            raise RuntimeError("豆瓣北美票房区块不可用，保留可信旧数据")
+        return RankingResult(True, parser.entries, "豆瓣电影排行榜·北美票房区块")
+
     def _douban(self, key: str) -> RankingResult:
+        if key == "douban_north_america":
+            return self._douban_north_america()
         if key not in self.DOUBAN_COLLECTIONS:
             raise RuntimeError("未配置该豆瓣动态榜单")
         collection, default_type = self.DOUBAN_COLLECTIONS[key]
@@ -840,7 +903,12 @@ class RankingFetcher:
             f"https://m.douban.com/rexxar/api/v2/subject_collection/{collection}/items?"
             + urllib.parse.urlencode({"start": 0, "count": self.limit, "items_only": 1})
         )
-        payload = self._json(url, headers={"Referer": "https://m.douban.com/"})
+        try:
+            payload = self._json(url, headers={"Referer": "https://m.douban.com/"})
+        except RuntimeError as err:
+            if "HTTP 404" in str(err):
+                raise RuntimeError(f"豆瓣集合 {collection} 已失效；需同榜单Feed覆盖，不使用其他剧集榜替代") from err
+            raise
         items = payload.get("subject_collection_items") or payload.get("items") or []
         entries: Set[RankEntry] = set()
         for row in items:
@@ -866,13 +934,15 @@ class RankingFetcher:
         entries = self._html_title_entries(raw, media_type)
         if not entries:
             raise RuntimeError("猫眼页面未解析到榜单条目；可用自定义Feed覆盖此榜单")
-        return RankingResult(True, entries, "猫眼榜单页兼容解析（标题待身份核实）")
+        if not any(entry.year or entry.tmdb or entry.imdb or entry.douban for entry in entries):
+            raise RuntimeError("猫眼页面仅有标题，缺少可校验ID/年份；需带类型与ID的Feed，保留可信旧数据")
+        return RankingResult(True, entries, "猫眼榜单页兼容解析")
 
     def _tencent(self, key: str) -> RankingResult:
         if key in ("tencent_hot", "tencent_mixed"):
             movie = self._tencent_discover("Movie", "")
             series = self._tencent_discover("Series", "")
-            return RankingResult(True, movie | series, "TMDB腾讯视频多地区汇总")
+            return RankingResult(True, movie | series, "TMDB腾讯视频多地区汇总", empty_valid=True)
         mapping = {
             "tencent_series": ("Series", ""), "tencent_kids": ("Series", "10762"),
             "tencent_movie": ("Movie", ""), "tencent_anime": ("Series", "16"),
@@ -885,7 +955,7 @@ class RankingFetcher:
             entries = self._tencent_discover(media_type, genre)
         else:
             raise RuntimeError("无法识别腾讯榜单")
-        return RankingResult(True, entries, "TMDB腾讯视频多地区汇总")
+        return RankingResult(True, entries, "TMDB腾讯视频多地区汇总", empty_valid=True)
 
     def _tencent_discover(self, media_type: str, genre: str) -> Set[RankEntry]:
         provider_id = self._provider_id("tencent", media_type)
@@ -898,7 +968,7 @@ class RankingFetcher:
             if genre:
                 params["with_genres"] = genre
             payload = self._tmdb(f"/discover/{'movie' if media_type == 'Movie' else 'tv'}", params)
-            for item in payload.get("results") or []:
+            for item in self._discover_items(payload):
                 entry = self._from_tmdb(item, media_type)
                 if entry:
                     entries[entry] = max(entries.get(entry, 0.0), float(item.get("popularity") or 0))
@@ -3305,6 +3375,7 @@ class MediaArchiver(_PluginBase):
                 key: {
                     "ok": result.ok, "source": result.source,
                     "error": result.error, "items": len(result.entries),
+                    "complete": result.complete,
                 }
                 for key, result in ranking_results.items()
             }
@@ -3453,6 +3524,10 @@ class MediaArchiver(_PluginBase):
             wanted = index.match(result.entries)
             if result.entries and not wanted:
                 self._record("WARNING", f"{name}：没有通过身份校验的本库匹配；缺少ID/年份或身份冲突的条目不自动加入")
+            if not result.complete:
+                old = previous_views.get(view_key) or {}
+                if old.get("recognition_policy") == "strict-v1":
+                    wanted |= set(old.get("item_ids") or []) & item_map.keys()
             ranking_counts[key] = len(wanted)
             next_views[view_key] = self._make_virtual_view(
                 view_key, name, "ranking", wanted, item_map, now,

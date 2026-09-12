@@ -61,7 +61,7 @@
 - IMDb/AniList 获取失败时，不再用 TMDB 热门冒充原榜单。
 - Netflix、Apple TV+ 等 TMDB Watch Provider 数据属于所选地区的可播精选，不代表平台官方热度榜或原创出品。显示名称注明“TMDB可播”，先合并各地区候选，再按热度统一截取；不代表完整平台片库。
 - Apple TV+ 不再以泛指 Apple TV 的商店名称匹配。
-- 混合榜任一子源失败时，不提交残缺的新快照。已有严格规则生成的结果可保留，并移除 Emby 中已经删除的条目。
+- 混合榜部分子源失败时，成功子源可新增成员，并保留严格规则生成的旧成员；仍清理 Emby 已删除的条目。所有子源恢复后才按完整榜单移除过时成员。全部失败则仅保留可信旧结果。
 - 旧版本快照没有严格规则标记，不继续信任。升级后如来源失败，对应专区可能暂时为空；待来源恢复后重新同步。
 - 猫眼等网页数据缺少可靠 ID、年份时可能无法匹配。可通过既有自定义 Feed 补充媒体类型、Provider ID 等信息，不按相似标题猜测。
 
@@ -193,7 +193,24 @@ python3 -m venv .venv
 .venv/bin/python tests/test_virtual_library.py
 .venv/bin/python tests/test_accuracy.py
 .venv/bin/python tests/test_animated_cover.py
+.venv/bin/python tests/test_ranking_failures.py
 .venv/bin/python -m pytest tests/test_gateway_runtime.py -q
 ```
 
 连接池与流式关闭设计参照 [HTTPX 异步支持文档](https://www.python-httpx.org/async/)。MoviePilot 的生命周期、配置、事件、定时服务和媒体服务器 Helper 沿用现有插件实现。
+
+
+## 4.3.11 同版本榜单故障修复
+
+- 腾讯/平台 Discover 只有结构有效、明确 total_results=0 的空结果才视为正常空榜；缺字段、异常条目或无总数的空结果仍按失败保护旧成员。正常空子榜不再阻塞综合精选。
+- 混合榜支持“部分更新”：成功子源新增，旧成员暂缓清理。来源恢复完整时自动清理。部分更新并非完整实时榜单，source_status 的 complete=false 和警告会明确说明。
+- 豆瓣北美票房改读 [豆瓣电影排行榜](https://movie.douban.com/chart) 的北美票房区块，只使用该区块的豆瓣 ID。页面不可达或结构变更仍保留可信旧数据。
+- tv_global 集合的 404 没有查到可信的同义替代入口；保留该选项和 Feed 覆盖能力，明确报告失效。不会用 [近期值得看的英美剧](https://m.douban.com/tv/) 冒充全球口碑。
+- IMDb 增加 chartTitles.edges.node.title.id 的结构兼容。源站不返回榜单主体时仍失败，未绕过源站访问限制。
+- AniList TLS 握手超时、Bangumi 请求超时属于网络/源站访问问题。本次不声称已修复外部网络；不无限重试，也不改用其他榜单假装成功。
+- 猫眼只解析出标题时报告证据不足，保留可信旧数据；可通过已有 Feed 提供 media_type、tmdb/imdb/douban 等可靠字段，不按模糊同名入库。
+- HTTP 错误不再整段输出返回正文，改为状态码和简短原因。
+
+版本保持4.3.11：同版本可能不出现升级按钮，需重新安装/覆盖插件代码后重启 MoviePilot，对照 SHA256SUMS 和健康接口 code_sha256，再一键重建。无需改动8098、封面配置或原媒体路径。
+
+已完成构造榜单故障与26项网关协议回归；豆瓣官方页面的区块存在性已核对，但没有在用户 NAS 上成功抓取或实测外部源可用率。
