@@ -634,7 +634,7 @@ def main():
         f"/Items/{remux['id']}/Images/Primary",
     ))
     assert cover_response.headers.get("ETag") == f'"{remux["cover_tag"]}"'
-    assert cover_response.body.startswith(b"\x89PNG")
+    assert cover_response.body.startswith((b"\x89PNG", b"GIF89a"))
     original_pillow_renderer = proxy._render_cover_pillow
     proxy._render_cover_pillow = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         RuntimeError("Pillow unavailable")

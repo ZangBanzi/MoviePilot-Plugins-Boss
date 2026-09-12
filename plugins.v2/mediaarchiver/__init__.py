@@ -171,7 +171,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.10",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.11",
             },
             method=method.upper(),
         )
@@ -530,7 +530,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.10",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.11",
         }
         merged.update(headers or {})
         body = None
@@ -812,7 +812,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.10 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.11 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -1021,7 +1021,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.3.10"
+    plugin_version = "4.3.11"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -1313,8 +1313,7 @@ class MediaArchiver(_PluginBase):
                     "item_ids": list(dict.fromkeys(item_ids)),
                 })
                 normalized["cover_tag"] = str(
-                    view.get("cover_tag")
-                    or self._cover_tag(str(normalized["key"]), normalized["item_ids"])
+                    self._cover_tag(str(normalized["key"]), normalized["item_ids"])
                 )
                 restored[str(normalized["id"])] = normalized
         with self._proxy_lock:
@@ -1833,7 +1832,7 @@ class MediaArchiver(_PluginBase):
         """成员未变化时保持稳定；成员变化后让 Emby 客户端自动刷新封面。"""
         members = ",".join(sorted({str(value) for value in item_ids if str(value)}))
         # Emby Web 的部分版本按 32 位 ImageTag 处理，使用完整 MD5 避免不发起图片请求。
-        return hashlib.md5(f"cover-v2|{key}|{members}".encode("utf-8")).hexdigest()
+        return hashlib.md5(f"cover-gif-v1|{key}|{members}".encode("utf-8")).hexdigest()
 
     def _cover_theme(self, view: Mapping[str, Any]) -> Dict[str, str]:
         key = str(view.get("key") or "")
@@ -1905,6 +1904,10 @@ class MediaArchiver(_PluginBase):
             logo_font = self._pillow_font(ImageFont, logo_size)
         draw.text((108, 122), logo, font=logo_font, fill=accent)
         name_font = self._pillow_font(ImageFont, 48)
+        if any(ord(char) > 127 for char in name) and not any(
+            mark in str(getattr(name_font, "path", "")).lower() for mark in ("cjk", "wqy")
+        ):
+            name = logo + " COLLECTION"
         while True:
             box = draw.textbbox((0, 0), name, font=name_font)
             if box[2] - box[0] <= 790 or getattr(name_font, "size", 32) <= 28:
@@ -2034,6 +2037,48 @@ class MediaArchiver(_PluginBase):
             logger.warning("[媒体虚拟库] Pillow封面生成失败，已切换无依赖PNG：%s", err)
         return self._render_cover_basic_png(view)
 
+    def _render_cover_animated(self, view: Mapping[str, Any]) -> Tuple[str, bytes]:
+        """复用品牌封面；12帧循环光点，640x360，冷缓存仅生成一次。"""
+        png = self._render_cover_png(view)
+        try:
+            import math
+            from PIL import Image, ImageDraw
+            with Image.open(io.BytesIO(png)) as source:
+                base = source.convert("RGB").resize((640, 360))
+            accent = self._hex_rgb(self._cover_theme(view)["accent"])
+            palette = base.quantize(colors=96)
+            frames = []
+            for step in range(12):
+                frame = base.copy()
+                draw = ImageDraw.Draw(frame)
+                for trail in range(5):
+                    angle = (step - trail) * math.tau / 12
+                    x, y = 563 + 38 * math.cos(angle), 70 + 38 * math.sin(angle)
+                    radius = max(2, 6 - trail)
+                    color = tuple(int(v * (1 - trail * 0.14)) for v in accent)
+                    draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=color)
+                frames.append(frame.quantize(palette=palette, dither=Image.Dither.NONE))
+            output = io.BytesIO()
+            frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:],
+                           duration=120, loop=0, disposal=2, optimize=False)
+            return "image/gif", output.getvalue()
+        except Exception:
+            # 缺少 Pillow 或动画编码失败时保留可显示的静态封面。
+            return "image/png", png
+
+    def _render_cover_static(self, view: Mapping[str, Any], image_format: str) -> Tuple[str, bytes]:
+        png = self._render_cover_png(view)
+        if image_format == "png":
+            return "image/png", png
+        try:
+            from PIL import Image
+            with Image.open(io.BytesIO(png)) as source:
+                output = io.BytesIO()
+                source.convert("RGB").save(output, format=image_format.upper(), quality=85)
+                return "image/" + image_format, output.getvalue()
+        except Exception:
+            return "image/png", png
+
     def _virtual_cover_response(
         self, request: Request, view: Mapping[str, Any],
     ) -> Response:
@@ -2041,6 +2086,15 @@ class MediaArchiver(_PluginBase):
             view.get("cover_tag")
             or self._cover_tag(str(view.get("key") or view.get("name")), view.get("item_ids") or [])
         )
+        # 客户端明确要求静态格式时尊重其能力；缓存与 ETag 按格式隔离。
+        query = getattr(request, "query_params", {})
+        image_format = str(next((value for key, value in query.items()
+                                 if str(key).casefold() == "format"), "gif")).casefold()
+        image_format = {"jpg": "jpeg"}.get(image_format, image_format)
+        if image_format not in {"png", "jpeg", "webp"}:
+            image_format = "gif"
+        if image_format != "gif":
+            tag = hashlib.md5(f"{tag}|{image_format}".encode("utf-8")).hexdigest()
         etag = f'"{tag}"'
         if str(request.headers.get("If-None-Match") or "").strip() == etag:
             return Response(status_code=304, headers={"ETag": etag})
@@ -2050,7 +2104,8 @@ class MediaArchiver(_PluginBase):
             if cached:
                 mime_type, payload = cached
             else:
-                mime_type, payload = "image/png", self._render_cover_png(view)
+                mime_type, payload = (self._render_cover_animated(view) if image_format == "gif"
+                                      else self._render_cover_static(view, image_format))
                 if len(self._cover_cache) >= 96:
                     self._cover_cache.pop(next(iter(self._cover_cache)), None)
                 self._cover_cache[tag] = (mime_type, payload)

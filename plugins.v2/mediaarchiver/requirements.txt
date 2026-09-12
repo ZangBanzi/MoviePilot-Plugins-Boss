@@ -2,3 +2,4 @@
 # Do not pin or replace FastAPI/HTTPX/Starlette provided by MoviePilot.
 Brotli>=1.1.0
 zstandard>=0.22.0
+Pillow>=10.0.0

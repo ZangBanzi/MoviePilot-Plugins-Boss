@@ -486,3 +486,58 @@ def test_websocket_real_upstream(plugin_module):
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
     asyncio.run(check())
+
+
+def test_real_animated_cover_and_static_client_formats(plugin_module, origin):
+    """用实际 Pillow 编码经过 FastAPI 路由，验证封面不会污染播放或缓存格式。"""
+    import io
+    from PIL import Image
+
+    async def check():
+        p, app, view_id = setup_gateway(plugin_module, origin)
+        p._virtual_views[view_id]['key'] = 'attribute:remux'
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://gateway') as client:
+                url = f'/Items/{view_id}/Images/Primary'
+                gif = await client.get(url)
+                assert gif.status_code == 200 and gif.headers['content-type'] == 'image/gif'
+                with Image.open(io.BytesIO(gif.content)) as image:
+                    assert image.n_frames == 12 and image.info['loop'] == 0
+                tags = {gif.headers['etag']}
+                for requested, expected in [('png', 'PNG'), ('jpg', 'JPEG'), ('webp', 'WEBP')]:
+                    response = await client.get(url, params={'Format': requested})
+                    assert response.status_code == 200
+                    with Image.open(io.BytesIO(response.content)) as image:
+                        assert image.format == expected and not getattr(image, 'is_animated', False)
+                    assert response.headers['etag'] not in tags
+                    tags.add(response.headers['etag'])
+                    cached = await client.get(url, params={'Format': requested},
+                                              headers={'If-None-Match': response.headers['etag']})
+                    assert cached.status_code == 304
+                head = await client.head(url)
+                assert head.status_code == 200 and not head.content
+                assert int(head.headers['content-length']) == len(gif.content)
+                assert (await client.get('/__mediaarchiver__/health')).status_code == 200
+                assert (await client.get(url)).content == gif.content
+        finally:
+            await close_pool(p)
+    asyncio.run(check())
+
+
+def test_gif_encoding_failure_preserves_valid_png(plugin_module, monkeypatch):
+    import io
+    from PIL import Image
+    original = Image.Image.save
+
+    def fail_gif(self, fp, format=None, **kwargs):
+        if format == 'GIF':
+            raise OSError('simulated GIF encoder failure')
+        return original(self, fp, format=format, **kwargs)
+
+    monkeypatch.setattr(Image.Image, 'save', fail_gif)
+    p = plugin_module.MediaArchiver()
+    mime, data = p._render_cover_animated({'key': 'attribute:remux', 'item_ids': []})
+    assert mime == 'image/png'
+    with Image.open(io.BytesIO(data)) as image:
+        image.load()
+        assert image.format == 'PNG'

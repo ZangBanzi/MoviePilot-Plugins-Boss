@@ -1,12 +1,27 @@
 # 媒体虚拟库 · MoviePilot v2
 
-版本 **4.3.10** · 作者 **Boss**
+版本 **4.3.11** · 作者 **Boss**
 
 在 Emby 首页显示 Remux、4K、Dolby Vision、HDR、Atmos、TVB港剧、伦理和已选电影/剧集榜单。每个专区包含现有媒体的原 ItemId；支持动态封面、分页、增量维护和 Cron 定时更新。
 
+## 4.3.11 新增 GIF 一级库动态封面
+
+参考项目：[zkl2333/Cover-Maker](https://github.com/zkl2333/Cover-Maker)。其 README 描述了为 Emby 生成动画 GIF 的方案；仓库已归档。本插件没有复制其 React/Pixi.js/Gif.js 源码，而是复用现有 Python 封面绘制，实现品牌色循环光点。
+
+- 默认直接通过现有一级库 Primary 图片接口输出 GIF，无须新增开关、端口或外部服务。
+- 640×360、12 帧、每帧 120ms、无限循环；首帧保留完整标题、品牌字样和数量。
+- 客户端请求 Format=png/jpg/jpeg/webp 时返回对应静态格式；各格式独立缓存和 ETag，避免 GIF 与静态图片串用。
+- 本地品牌字样与配色，不下载官方 Logo 素材；未添加影片海报轮播。
+- 成员变化时更换 ImageTag；不变时复用缓存与 304。首次生成在后台工作线程运行，冷缓存串行绘制，最多缓存 96 个封面。
+- 新增 Pillow 依赖；依赖缺失或 GIF 编码失败时回退静态 PNG。中文字体缺失时改用英文标题，避免方框。
+- 部分播放器可能只显示 GIF 首帧或自行转换成静态缩略图，插件无法强制客户端播放动画。自动随内容更新与 GIF 播放是两件不同的事。
+- 升级至 4.3.11、重启 MoviePilot 后刷新媒体库即可；必要时一键重建并刷新客户端图片缓存。播放仍走 8098，原媒体不修改。
+
+包内 cover-preview.gif 是 115 项 Remux 的构造演示，不是实际 NAS 截图。GIF 编码、帧变化、循环、缓存及失败回退已测试；未在实际手机/TV 客户端验证动画支持。
+
 ## 4.3.10 整体识别优化
 
-本次仍使用 **4.3.10**。主要目标是减少误收，不把“命中数量增加”当作识别准确。
+继承 **4.3.10** 的识别策略。主要目标是减少误收，不把“命中数量增加”当作识别准确。
 
 | 专区 | 新的判断依据 | 不再作为自动入选证据 |
 |---|---|---|
@@ -105,18 +120,18 @@ NextEmby 使用容器网络，配置其上游时使用 NAS 局域网 IP，`127.0
 
 仓库若包含其他插件，保留其索引，只合并 `MediaArchiver` 条目。发布索引的文件名必须是 `package.v2.json`。
 
-MoviePilot v2 支持插件目录的 `requirements.txt`。沿用 Brotli 和 Zstandard 解码依赖，不替换 MoviePilot 自带的 FastAPI/HTTPX。请把依赖文件和代码一并上传，再通过插件市场升级/重新安装，使宿主执行依赖安装。[MoviePilot 官方插件仓库规范](https://github.com/jxxghp/MoviePilot-Plugins)
+MoviePilot v2 支持插件目录的 `requirements.txt`。使用 Brotli、Zstandard 解码依赖与新增 Pillow 绘图依赖，不替换 MoviePilot 自带的 FastAPI/HTTPX。请把依赖文件和代码一并上传，再通过插件市场升级/重新安装，使宿主执行依赖安装。[MoviePilot 官方插件仓库规范](https://github.com/jxxghp/MoviePilot-Plugins)
 
 升级步骤：
 
-1. 在 GitHub 提交新版文件；在 MoviePilot 插件市场刷新并升级至 **4.3.10**。
+1. 在 GitHub 提交新版文件；在 MoviePilot 插件市场刷新并升级至 **4.3.11**。
 2. 重启 MoviePilot，确保旧网关代码退出：`docker restart moviepilot-v2`。
 3. 等待 MoviePilot 启动，执行下方健康检查。确认版本和依赖正确，再点击插件“一键重建”。
 4. 退出并重新打开客户端，继续使用 `8098`。
 
 升级前备份已有插件文件和配置。本包未自动上传你的 GitHub，也未部署到 NAS。
 
-本次仍叫 **4.3.10**。若已安装同版本，仅刷新市场不一定加载新代码，需要重新安装该版本或覆盖已安装的插件文件后重启。用健康接口的 `code_sha256` 对照包内 `SHA256SUMS`，不能只看版本号；加载成功后执行一次“一键重建”，再刷新播放器的媒体库列表。
+本次版本为 **4.3.11**，从 4.3.10 可通过插件市场升级。用健康接口的 `code_sha256` 对照包内 `SHA256SUMS`，不能只看版本号；加载成功后执行一次“一键重建”，再刷新播放器的媒体库列表。
 
 ## 确认实际运行版本
 
@@ -130,7 +145,7 @@ curl -s http://127.0.0.1:3334/__mediaarchiver__/health
 
 | 字段 | 含义 |
 |---|---|
-| `version` | 必须为 `4.3.10`；缺少此字段不能证明新版已加载 |
+| `version` | 必须为 `4.3.11`；缺少此字段不能证明新版已加载 |
 | `code_sha256` | 当前加载代码的指纹，可与发布包 `SHA256SUMS` 对照 |
 | `performance.async_pool` | `true` 表示支持 HTTPX 连接池；这不是 Emby 连通性结论 |
 | `decoders.br` / `decoders.zstd` | 应为 `true`，否则查看 MoviePilot 插件依赖安装日志 |
@@ -177,6 +192,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python tests/test_virtual_library.py
 .venv/bin/python tests/test_accuracy.py
+.venv/bin/python tests/test_animated_cover.py
 .venv/bin/python -m pytest tests/test_gateway_runtime.py -q
 ```
 
