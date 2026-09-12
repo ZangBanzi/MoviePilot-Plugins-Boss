@@ -1,0 +1,19 @@
+{
+  "name": "mediaarchiver-cover-studio",
+  "version": "4.4.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "build:preview": "vite build --mode preview"
+  },
+  "dependencies": {
+    "vue": "^3.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.0",
+    "@originjs/vite-plugin-federation": "^1.3.0",
+    "vite": "^5.4.0",
+    "playwright": "^1.56.0"
+  }
+}

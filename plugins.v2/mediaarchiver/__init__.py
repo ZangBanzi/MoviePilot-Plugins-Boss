@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+from .coverstudio import CoverStudio, DEFAULTS as COVER_DEFAULTS, normalize_options, decode_image
+
 from app import schemas
 from app.core.config import settings
 from app.core.event import Event, eventmanager
@@ -171,7 +173,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.11",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.4.1",
             },
             method=method.upper(),
         )
@@ -532,7 +534,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.3.11",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.4.1",
         }
         merged.update(headers or {})
         body = None
@@ -831,7 +833,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.3.11 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.4.1 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -1091,7 +1093,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.3.11"
+    plugin_version = "4.4.1"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -1155,6 +1157,8 @@ class MediaArchiver(_PluginBase):
 
     def __init__(self) -> None:
         super().__init__()
+        self._saved_config: Dict[str, Any] = {}
+        self._cover_studio = CoverStudio(self)
         self._enabled = False
         self._attribute_enabled = False
         self._ranking_enabled = False
@@ -1225,6 +1229,7 @@ class MediaArchiver(_PluginBase):
         self._cancel_timers()
         self._stopping = False
         cfg = dict(config or {})
+        self._saved_config = cfg
         # v3.2 起主页面只保留功能开关：任一虚拟库开启即视为插件启用。
         # 仍读取旧 enabled 字段，保证从 v3.1 及更早版本无损升级。
         self._enabled = bool(
@@ -1507,7 +1512,7 @@ class MediaArchiver(_PluginBase):
         return services
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return [
+        apis = [
             {"path": "/test_connection", "endpoint": self.test_connection, "methods": ["POST"],
              "auth": "bear", "summary": "测试 MoviePilot 已配置的 Emby"},
             {"path": "/rebuild", "endpoint": self.rebuild, "methods": ["POST"],
@@ -1515,6 +1520,101 @@ class MediaArchiver(_PluginBase):
             {"path": "/status", "endpoint": self.status, "methods": ["GET"],
              "auth": "bear", "summary": "查询同步状态"},
         ]
+        studio_apis = [
+            {"path": "/studio", "endpoint": self.studio_state, "methods": ["GET"],
+             "auth": "bear", "summary": "封面工坊状态"},
+            {"path": "/studio/action", "endpoint": self.studio_action, "methods": ["POST"],
+             "auth": "bear", "summary": "封面预览、方案、字体及历史操作"},
+        ]
+        try:
+            from fastapi import Depends
+            from app.db.user_oper import get_current_active_superuser
+            for api in studio_apis:
+                api["dependencies"] = [Depends(get_current_active_superuser)]
+        except ImportError:
+            # Fail closed on hosts without the administrator dependency; legacy APIs remain.
+            studio_apis = []
+        return apis + studio_apis
+
+    def get_render_mode(self) -> Tuple[str, str]:
+        return "vue", "dist/assets"
+
+    def studio_state(self, light: bool = False) -> schemas.Response:
+        try:
+            if light:
+                return schemas.Response(success=True, data={
+                    "job": dict(self._cover_studio.job), "runtime": self.status().data})
+            data = self._cover_studio.state()
+            data["ranking_groups"] = [dict(group) for group in RANK_GROUPS]
+            data["rankings"] = RANK_META
+            data["runtime"] = self.status().data
+            return schemas.Response(success=True, data=data)
+        except Exception as err:
+            logger.error("[媒体虚拟库] 读取封面工坊失败：%s", type(err).__name__)
+            return schemas.Response(success=False, message="封面工坊数据读取失败，请检查插件数据目录与依赖")
+
+    async def studio_action(self, request: Request) -> Response:
+        try:
+            # Base64 font upload is bounded even if Content-Length is absent or forged.
+            body = bytearray()
+            async for chunk in request.stream():
+                body.extend(chunk)
+                if len(body) > 33 * 1024 * 1024:
+                    return self._json_response(413, {"success": False, "message": "请求超过大小限制"})
+            data = json.loads(body)
+            if not isinstance(data, dict):
+                raise ValueError("请求必须是 JSON 对象")
+            if data.get("action") == "validate_config":
+                cfg = await asyncio.to_thread(self._validate_studio_config, data.get("config"))
+                return self._json_response(200, {"success": True, "data": {"config": cfg}})
+            result = await asyncio.to_thread(self._cover_studio.action, data)
+            return self._json_response(200, {"success": True, "data": result})
+        except (ValueError, TypeError, KeyError) as err:
+            return self._json_response(400, {"success": False, "message": str(err)[:180]})
+        except Exception as err:
+            logger.error("[媒体虚拟库] 封面工坊操作失败：%s", type(err).__name__)
+            return self._json_response(500, {"success": False, "message": "操作失败，请检查插件依赖和数据目录"})
+
+    def _validate_studio_config(self, value: Any) -> dict:
+        if self._cover_studio.job_lock.locked():
+            raise ValueError("封面正在生成，完成或停止后再保存配置")
+        if not isinstance(value, dict):
+            raise ValueError("配置格式无效")
+        cfg = dict(self._saved_config)
+        defaults = self.get_form()[1]
+        cfg.update({key: val for key, val in value.items() if key in defaults})
+        for key, default in defaults.items():
+            if isinstance(default, bool) and key in cfg and not isinstance(cfg[key], bool):
+                raise ValueError(f"{key} 必须是开关值")
+        if cfg.get("daily_sync_enabled", True):
+            _, error = self._normalize_sync_cron(cfg.get("sync_cron", "0 4 * * *"))
+            if error:
+                raise ValueError("Cron 无效："+error)
+        studio = cfg.get("cover_studio") or {}
+        if not isinstance(studio, dict):
+            raise ValueError("封面配置格式无效")
+        clean = {"defaults": normalize_options(studio.get("defaults") or {}),
+                 "history_enabled": studio.get("history_enabled", True) is True,
+                 "history_limit": self._bounded_int(studio.get("history_limit"), 30, 1, 100)}
+        overrides = studio.get("overrides") or {}
+        if not isinstance(overrides, dict) or len(overrides) > 256:
+            raise ValueError("独立封面配置过多或格式无效")
+        clean["overrides"] = {str(key)[:120]: normalize_options(opts) for key, opts in overrides.items()}
+        presets = studio.get("presets") or []
+        if not isinstance(presets, list) or len(presets) > 20:
+            raise ValueError("自定义方案最多 20 个")
+        clean["presets"] = [{"id": str(p["id"])[:40], "name": str(p["name"])[:40],
+                             "options": normalize_options(p["options"])} for p in presets]
+        cfg["cover_studio"] = clean
+        return cfg
+
+    def _refresh_cover_tags(self) -> None:
+        with self._proxy_lock:
+            self._virtual_views = {identifier: dict(view, cover_tag=self._cover_tag(
+                str(view.get("key")), view.get("item_ids") or []))
+                for identifier, view in self._virtual_views.items()}
+        # Swap the reference; never acquire the rendering lock while holding the studio lock.
+        self._cover_cache = {}
 
     def rebuild(self) -> schemas.Response:
         return self._start_sync("rebuild")
@@ -1655,7 +1755,7 @@ class MediaArchiver(_PluginBase):
             with self._proxy_lock:
                 image_view = dict(self._virtual_views.get(image_match.group(1)) or {})
             if image_view:
-                return await asyncio.to_thread(self._virtual_cover_response, request, image_view)
+                return await self._studio_gateway_cover(request, image_view)
 
         if (items_match or latest_match) and view:
             return await self._virtual_items_response(
@@ -1897,12 +1997,12 @@ class MediaArchiver(_PluginBase):
             media_type="application/json; charset=utf-8",
         )
 
-    @staticmethod
-    def _cover_tag(key: str, item_ids: Iterable[str]) -> str:
+    def _cover_tag(self, key: str, item_ids: Iterable[str], options: Optional[dict] = None) -> str:
         """成员未变化时保持稳定；成员变化后让 Emby 客户端自动刷新封面。"""
         members = ",".join(sorted({str(value) for value in item_ids if str(value)}))
         # Emby Web 的部分版本按 32 位 ImageTag 处理，使用完整 MD5 避免不发起图片请求。
-        return hashlib.md5(f"cover-gif-v1|{key}|{members}".encode("utf-8")).hexdigest()
+        style = self._cover_studio.fingerprint(key, options)
+        return hashlib.md5(f"cover-studio-v1|{style}|{key}|{members}".encode("utf-8")).hexdigest()
 
     def _cover_theme(self, view: Mapping[str, Any]) -> Dict[str, str]:
         key = str(view.get("key") or "")
@@ -1927,6 +2027,7 @@ class MediaArchiver(_PluginBase):
     @staticmethod
     def _pillow_font(image_font: Any, size: int, bold: bool = True) -> Any:
         candidates = (
+            os.path.join(os.path.dirname(__file__), "fonts", "NotoSansSC.ttf"),
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
@@ -1941,58 +2042,14 @@ class MediaArchiver(_PluginBase):
         return image_font.load_default()
 
     def _render_cover_pillow(self, view: Mapping[str, Any]) -> Optional[bytes]:
-        """有 Pillow 和可用字体时生成包含中文专区名的高清 PNG。"""
         try:
-            from PIL import Image, ImageDraw, ImageFont  # type: ignore
-        except Exception:
+            options = view.get('_cover_options') or self._cover_studio.options(view)
+            image = self._cover_studio.render_frame(view, options, view.get('_cover_artwork'))
+            output = io.BytesIO()
+            image.save(output, format='PNG', optimize=True)
+            return output.getvalue()
+        except ImportError:
             return None
-        width, height = 960, 540
-        theme = self._cover_theme(view)
-        start = self._hex_rgb(theme["bg"])
-        end = self._hex_rgb(theme["bg2"])
-        accent = self._hex_rgb(theme["accent"])
-        foreground = self._hex_rgb(theme["fg"])
-        image = Image.new("RGB", (width, height), start)
-        draw = ImageDraw.Draw(image)
-        for y in range(height):
-            factor = y / max(1, height - 1)
-            color = tuple(round(start[i] * (1 - factor) + end[i] * factor) for i in range(3))
-            draw.line((0, y, width, y), fill=color)
-        # 背景光晕、品牌色竖线与左下角状态胶囊均为矢量绘制，不依赖网络素材。
-        draw.ellipse((660, -180, 1120, 280), fill=tuple(min(255, int(v * 0.34 + 16)) for v in accent))
-        draw.rounded_rectangle((54, 62, 70, 478), radius=8, fill=accent)
-        logo = str(theme.get("logo") or "VIRTUAL")
-        name = str(view.get("name") or "虚拟媒体库")
-        count = len(view.get("item_ids") or [])
-        logo_size = 142 if len(logo) <= 4 else 96 if len(logo) <= 10 else 66
-        logo_font = self._pillow_font(ImageFont, logo_size)
-        while logo_size > 40:
-            box = draw.textbbox((0, 0), logo, font=logo_font)
-            if box[2] - box[0] <= 760:
-                break
-            logo_size -= 6
-            logo_font = self._pillow_font(ImageFont, logo_size)
-        draw.text((108, 122), logo, font=logo_font, fill=accent)
-        name_font = self._pillow_font(ImageFont, 48)
-        if any(ord(char) > 127 for char in name) and not any(
-            mark in str(getattr(name_font, "path", "")).lower() for mark in ("cjk", "wqy")
-        ):
-            name = logo + " COLLECTION"
-        while True:
-            box = draw.textbbox((0, 0), name, font=name_font)
-            if box[2] - box[0] <= 790 or getattr(name_font, "size", 32) <= 28:
-                break
-            name_font = self._pillow_font(ImageFont, int(getattr(name_font, "size", 34)) - 3)
-        draw.text((110, 302), name, font=name_font, fill=foreground)
-        meta_font = self._pillow_font(ImageFont, 27, bold=False)
-        meta = f"{count} ITEMS   •   LIVE VIRTUAL LIBRARY"
-        meta_box = draw.textbbox((0, 0), meta, font=meta_font)
-        chip_width = min(780, meta_box[2] - meta_box[0] + 54)
-        draw.rounded_rectangle((108, 397, 108 + chip_width, 455), radius=29, outline=accent, width=2)
-        draw.text((135, 410), meta, font=meta_font, fill=foreground)
-        output = io.BytesIO()
-        image.save(output, format="PNG", optimize=True)
-        return output.getvalue()
 
     _BITMAP_FONT: Dict[str, Tuple[str, ...]] = {
         "A": ("01110","10001","10001","11111","10001","10001","10001"),
@@ -2108,33 +2165,15 @@ class MediaArchiver(_PluginBase):
         return self._render_cover_basic_png(view)
 
     def _render_cover_animated(self, view: Mapping[str, Any]) -> Tuple[str, bytes]:
-        """复用品牌封面；12帧循环光点，640x360，冷缓存仅生成一次。"""
         png = self._render_cover_png(view)
         try:
-            import math
-            from PIL import Image, ImageDraw
-            with Image.open(io.BytesIO(png)) as source:
-                base = source.convert("RGB").resize((640, 360))
-            accent = self._hex_rgb(self._cover_theme(view)["accent"])
-            palette = base.quantize(colors=96)
-            frames = []
-            for step in range(12):
-                frame = base.copy()
-                draw = ImageDraw.Draw(frame)
-                for trail in range(5):
-                    angle = (step - trail) * math.tau / 12
-                    x, y = 563 + 38 * math.cos(angle), 70 + 38 * math.sin(angle)
-                    radius = max(2, 6 - trail)
-                    color = tuple(int(v * (1 - trail * 0.14)) for v in accent)
-                    draw.ellipse((x-radius, y-radius, x+radius, y+radius), fill=color)
-                frames.append(frame.quantize(palette=palette, dither=Image.Dither.NONE))
-            output = io.BytesIO()
-            frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:],
-                           duration=120, loop=0, disposal=2, optimize=False)
-            return "image/gif", output.getvalue()
+            from PIL import Image
+            with Image.open(io.BytesIO(png)) as image:
+                image.verify()
+            options = view.get('_cover_options') or self._cover_studio.options(view)
+            return self._cover_studio.encode(view, options, view.get('_cover_artwork'), 'gif')
         except Exception:
-            # 缺少 Pillow 或动画编码失败时保留可显示的静态封面。
-            return "image/png", png
+            return 'image/png', png
 
     def _render_cover_static(self, view: Mapping[str, Any], image_format: str) -> Tuple[str, bytes]:
         png = self._render_cover_png(view)
@@ -2149,20 +2188,131 @@ class MediaArchiver(_PluginBase):
         except Exception:
             return "image/png", png
 
+    async def _studio_gateway_cover(self, request: Request, view: dict) -> Response:
+        """Read poster metadata with the incoming user's credentials, never the MP admin key."""
+        studio = self._cover_studio
+        options = studio.options(view)
+        view = dict(view, _cover_options=options)
+        pairs = urllib.parse.parse_qsl(str(request.url.query or ""), keep_blank_values=True)
+        auth_pairs = [(k, v) for k, v in pairs if k.casefold() in {
+            "api_key", "apikey", "token", "x-emby-token", "x-mediabrowser-token"}]
+        auth_headers = [(str(k).casefold(), str(v)) for k, v in request.headers.items()
+                        if str(k).casefold() in {"authorization", "x-emby-authorization",
+                            "x-emby-token", "x-mediabrowser-token", "cookie"}]
+        if options["source"] == "brand" or not (auth_pairs or auth_headers) or not view.get("item_ids"):
+            # Unauthenticated requests can only see a locally drawn brand graphic.
+            response = await asyncio.to_thread(self._virtual_cover_response, request, view)
+            response.headers["Cache-Control"] = "private, no-cache"
+            response.headers["Vary"] = "Authorization, X-Emby-Token, X-MediaBrowser-Token, X-Emby-Authorization, Cookie"
+            return response
+        try:
+            client = self._gateway_client_cache or await asyncio.to_thread(self._gateway_client)
+            target, _ = self._upstream_target(client, "/Users/Me")
+            headers = self._forward_request_headers(request, target, b"", True)
+
+            async def get_json(path, query):
+                route = path + "?" + urllib.parse.urlencode(auth_pairs + query)
+                status, response_headers, body = await asyncio.wait_for(
+                    self._fetch_gateway_bytes(client, "GET", route, headers, b""), timeout=5)
+                if status != 200:
+                    return status, {}
+                return status, json.loads(self._decode_buffered_body(response_headers, body))
+
+            status, user = await get_json("/Users/Me", [])
+            user_id = str(user.get("Id") or "") if isinstance(user, dict) else ""
+            if status in {401, 403}:
+                return self._json_response(status, {"error": "Emby authentication required"})
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
+                # Unknown identity may use the brand fallback, but must never fetch admin artwork.
+                view["_cover_scope"] = "identity-unavailable"
+            else:
+                ids = studio.select_ids(view, options)
+                status, payload = await get_json(f"/Users/{user_id}/Items", [
+                    ("Ids", ",".join(ids)), ("Recursive", "true"), ("Limit", str(len(ids))),
+                    ("Fields", "DateCreated,SortName"), ("EnableImages", "true"),
+                ])
+                if status in {401, 403}:
+                    return self._json_response(status, {"error": "Emby permission denied"})
+                permitted = {str(item.get("Id")): item for item in payload.get("Items", [])
+                             if isinstance(item, dict) and str(item.get("Id")) in ids} if isinstance(payload, dict) else {}
+                selected = [identifier for identifier in ids if identifier in permitted]
+                selected.sort(key=lambda identifier: studio.image_priority(permitted[identifier], options))
+                revision = [(identifier, permitted[identifier].get("ImageTags"),
+                             permitted[identifier].get("BackdropImageTags")) for identifier in selected]
+                scope = hashlib.sha256(json.dumps([sorted(auth_headers), sorted(auth_pairs), user_id,
+                    revision, studio.fingerprint(str(view.get("key")), options)], sort_keys=True).encode()).hexdigest()
+                view["_cover_scope"] = scope
+                cache_key = ("user", client.api_root, scope)
+                with studio.lock:
+                    cached = studio.art_cache.get(cache_key)
+                if cached and time.monotonic() - cached[0] < 60:
+                    view["_cover_artwork"] = cached[1]
+                elif selected:
+                    async def get_image(identifier):
+                        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier):
+                            return None
+                        for kind in studio.image_kinds(options):
+                            route = f"/Items/{identifier}/Images/{kind}?" + urllib.parse.urlencode(
+                                auth_pairs + [("MaxWidth", "720"), ("MaxHeight", "720"), ("Format", "jpg")])
+                            try:
+                                status, _, body = await asyncio.wait_for(self._fetch_gateway_bytes(
+                                    client, "GET", route, headers, b""), timeout=3)
+                                if status == 200 and len(body) <= 3*1024*1024:
+                                    await asyncio.to_thread(decode_image, body)
+                                    return body
+                            except Exception:
+                                continue
+                        return None
+                    artwork, seen = [], set()
+                    async def collect_artwork():
+                        wanted = studio.artwork_limit(options)
+                        # Three at a time; continue after missing/corrupt/duplicate images.
+                        for offset in range(0, len(selected), 3):
+                            for data in await asyncio.gather(*(get_image(i) for i in selected[offset:offset+3])):
+                                if data and hashlib.sha256(data).digest() not in seen:
+                                    seen.add(hashlib.sha256(data).digest())
+                                    artwork.append(data)
+                            if len(artwork) >= wanted:
+                                break
+                    try:
+                        await asyncio.wait_for(collect_artwork(), timeout=12)
+                    except asyncio.TimeoutError:
+                        pass
+                    artwork = artwork[:studio.artwork_limit(options)]
+                    view["_cover_artwork"] = artwork
+                    with studio.lock:
+                        if len(studio.art_cache) >= 48:
+                            studio.art_cache.pop(next(iter(studio.art_cache)))
+                        studio.art_cache[cache_key] = (time.monotonic(), artwork)
+                # Byte changes and recovered artwork must invalidate a previously cached fallback.
+                art_digest = hashlib.sha256(b"".join(hashlib.sha256(data).digest()
+                    for data in view.get("_cover_artwork", []))).hexdigest()
+                view["_cover_scope"] = scope + ":" + art_digest
+        except Exception:
+            view["_cover_scope"] = "artwork-unavailable"
+        response = await asyncio.to_thread(self._virtual_cover_response, request, view)
+        response.headers["Cache-Control"] = "private, no-cache"
+        response.headers["Vary"] = "Authorization, X-Emby-Token, X-MediaBrowser-Token, X-Emby-Authorization, Cookie"
+        return response
+
     def _virtual_cover_response(
         self, request: Request, view: Mapping[str, Any],
     ) -> Response:
-        tag = str(
-            view.get("cover_tag")
-            or self._cover_tag(str(view.get("key") or view.get("name")), view.get("item_ids") or [])
-        )
+        options = view.get("_cover_options") or self._cover_studio.options(view)
+        view = dict(view, _cover_options=options)
+        tag = self._cover_tag(str(view.get("key") or view.get("name")), view.get("item_ids") or [], options)
+        if view.get("_cover_scope"):
+            tag = hashlib.md5(f"{tag}|{view['_cover_scope']}".encode()).hexdigest()
         # 客户端明确要求静态格式时尊重其能力；缓存与 ETag 按格式隔离。
         query = getattr(request, "query_params", {})
+        default_format = "gif" if options["animated"] else "png"
         image_format = str(next((value for key, value in query.items()
-                                 if str(key).casefold() == "format"), "gif")).casefold()
+                                 if str(key).casefold() == "format"), default_format)).casefold()
         image_format = {"jpg": "jpeg"}.get(image_format, image_format)
-        if image_format not in {"png", "jpeg", "webp"}:
-            image_format = "gif"
+        if image_format not in {"png", "jpeg", "webp", "gif"}:
+            image_format = default_format
+        if image_format == "gif" and not options["animated"]:
+            image_format = "png"
         if image_format != "gif":
             tag = hashlib.md5(f"{tag}|{image_format}".encode("utf-8")).hexdigest()
         etag = f'"{tag}"'
@@ -3136,6 +3286,8 @@ class MediaArchiver(_PluginBase):
         }
         defaults.update({f"zone_{key}": True for key in self.ATTRIBUTE_RULES})
         defaults.update({f"rank_{key}": key in DEFAULT_RANKINGS for key in RANK_META})
+        defaults["cover_studio"] = {"defaults": dict(COVER_DEFAULTS), "overrides": {}, "presets": [],
+                                    "history_enabled": True, "history_limit": 30}
         return [form], defaults
 
     def get_page(self) -> List[dict]:
@@ -3690,7 +3842,7 @@ class MediaArchiver(_PluginBase):
         fields = (
             "Type", "Name", "OriginalTitle", "SortName", "ProductionYear",
             "DateCreated", "DateLastSaved", "PremiereDate", "CommunityRating",
-            "CriticRating",
+            "CriticRating", "ImageTags", "BackdropImageTags",
         )
         return {key: item[key] for key in fields if item.get(key) not in (None, "")}
 
@@ -4005,6 +4157,7 @@ class MediaArchiver(_PluginBase):
 
     def stop_service(self) -> None:
         self._stopping = True
+        self._cover_studio.cancel.set()
         self._cancel_timers()
         self._remove_gateway_routes()
         self._close_httpx_client()
