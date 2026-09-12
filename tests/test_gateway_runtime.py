@@ -199,9 +199,9 @@ def test_ponytail_sync_and_cover_do_not_block_browsing(plugin_module, origin):
         {'Id': 'b', 'Name': '同名', 'Type': 'Movie', 'ProductionYear': 2020},
     ]
     index = module.LibraryIndex(iter(items + [items[0], {'Name': '无Id'}]))
-    assert index.match([module.RankEntry(tmdb='1')]) == {'a'}
-    assert index.match([module.RankEntry(bangumi='2')]) == {'a'}
-    assert index.match([module.RankEntry(title='同名', year=2020)]) == {'b'}
+    assert index.match([module.RankEntry(media_type='Movie', tmdb='1')]) == {'a'}
+    assert index.match([module.RankEntry(media_type='Movie', bangumi='2')]) == {'a'}
+    assert index.match([module.RankEntry(media_type='Movie', title='同名', year=2020)]) == {'b'}
     assert index.match([module.RankEntry(title='同名')]) == set()
 
     # 同步生成新快照时，网关仍能取得旧快照；发布后才整体切换。

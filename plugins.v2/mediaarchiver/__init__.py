@@ -30,7 +30,7 @@ import zlib
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from app import schemas
 from app.core.config import settings
@@ -284,35 +284,35 @@ RANK_GROUPS: Tuple[Dict[str, Any], ...] = (
         ),
     },
     {
-        "key": "netflix", "name": "Netflix", "subtitle": "全部地区汇总", "icon": "mdi-netflix",
+        "key": "netflix", "name": "Netflix", "subtitle": "所选地区可播精选", "icon": "mdi-netflix",
         "items": (("netflix_movie", "电影榜"), ("netflix_series", "剧集榜"), ("netflix_mixed", "混合榜")),
     },
     {
-        "key": "hbo", "name": "HBO", "subtitle": "全部地区汇总", "icon": "mdi-television-classic",
+        "key": "hbo", "name": "HBO", "subtitle": "所选地区可播精选", "icon": "mdi-television-classic",
         "items": (("hbo_movie", "电影榜"), ("hbo_series", "剧集榜"), ("hbo_mixed", "混合榜")),
     },
     {
-        "key": "apple_tv", "name": "Apple TV+", "subtitle": "全部地区汇总", "icon": "mdi-apple",
+        "key": "apple_tv", "name": "Apple TV+", "subtitle": "所选地区可播精选", "icon": "mdi-apple",
         "items": (("apple_tv_movie", "电影榜"), ("apple_tv_series", "剧集榜"), ("apple_tv_mixed", "混合榜")),
     },
     {
-        "key": "disney_plus", "name": "Disney+", "subtitle": "全部地区汇总", "icon": "mdi-movie-open-star",
+        "key": "disney_plus", "name": "Disney+", "subtitle": "所选地区可播精选", "icon": "mdi-movie-open-star",
         "items": (("disney_plus_movie", "电影榜"), ("disney_plus_series", "剧集榜"), ("disney_plus_mixed", "混合榜")),
     },
     {
-        "key": "crunchyroll", "name": "Crunchyroll", "subtitle": "全部地区汇总", "icon": "mdi-animation-play",
+        "key": "crunchyroll", "name": "Crunchyroll", "subtitle": "所选地区可播精选", "icon": "mdi-animation-play",
         "items": (("crunchyroll_movie", "电影榜"), ("crunchyroll_series", "剧集榜"), ("crunchyroll_mixed", "混合榜")),
     },
     {
-        "key": "amazon_prime", "name": "Amazon Prime", "subtitle": "全部地区汇总", "icon": "mdi-amazon",
+        "key": "amazon_prime", "name": "Amazon Prime", "subtitle": "所选地区可播精选", "icon": "mdi-amazon",
         "items": (("amazon_prime_movie", "电影榜"), ("amazon_prime_series", "剧集榜"), ("amazon_prime_mixed", "混合榜")),
     },
     {
-        "key": "amazon", "name": "Amazon", "subtitle": "全部地区汇总", "icon": "mdi-amazon",
+        "key": "amazon", "name": "Amazon", "subtitle": "所选地区可播精选", "icon": "mdi-amazon",
         "items": (("amazon_movie", "电影榜"), ("amazon_series", "剧集榜"), ("amazon_mixed", "混合榜")),
     },
     {
-        "key": "hulu", "name": "Hulu", "subtitle": "全部地区汇总", "icon": "mdi-television-play",
+        "key": "hulu", "name": "Hulu", "subtitle": "所选地区可播精选", "icon": "mdi-television-play",
         "items": (("hulu_movie", "电影榜"), ("hulu_series", "剧集榜"), ("hulu_mixed", "混合榜")),
     },
     {
@@ -351,6 +351,12 @@ for _group in RANK_GROUPS:
         }
 
 
+for _key, _meta in RANK_META.items():
+    if _meta["group"] in {"netflix", "hbo", "apple_tv", "disney_plus", "crunchyroll", "amazon_prime", "amazon", "hulu", "tencent"}:
+        _meta["label"] = _meta["label"].replace("电影榜", "电影精选").replace("剧集榜", "剧集精选").replace("混合榜", "综合精选")
+        _meta["collection"] = _meta["collection"].replace("电影榜", "电影精选").replace("剧集榜", "剧集精选").replace("混合榜", "综合精选") + "（TMDB可播）"
+
+
 # 截图中保存状态为 13 个：Netflix、Apple TV+、Disney+ 各三项，猫眼四项。
 DEFAULT_RANKINGS: Set[str] = {
     "netflix_movie", "netflix_series", "netflix_mixed",
@@ -370,7 +376,7 @@ class RankingFetcher:
     PLATFORM_PROVIDERS: Dict[str, Tuple[str, ...]] = {
         "netflix": ("Netflix",),
         "hbo": ("Max", "HBO Max", "HBO", "Max Amazon Channel"),
-        "apple_tv": ("Apple TV Plus", "Apple TV+", "Apple TV"),
+        "apple_tv": ("Apple TV Plus", "Apple TV+"),
         "disney_plus": ("Disney Plus", "Disney+", "Disney Plus Basic"),
         "crunchyroll": ("Crunchyroll",),
         "amazon_prime": ("Amazon Prime Video",),
@@ -505,13 +511,6 @@ class RankingFetcher:
                 ok_sources.append(item.source)
             elif item.error:
                 errors.append(item.error)
-        if errors and entries:
-            self.log(
-                "WARNING",
-                f"混合榜 {RANK_META.get(key, {}).get('collection', key)} 跳过 "
-                f"{len(errors)} 个不可用子源，保留 {len(entries)} 项有效内容",
-            )
-            return RankingResult(True, set(list(entries)[:self.limit]), "+".join(dict.fromkeys(ok_sources)) + "+部分子源失败")
         if errors:
             return RankingResult(
                 False, set(),
@@ -645,7 +644,7 @@ class RankingFetcher:
 
     def _tmdb_pages(self, path: str, params: Mapping[str, Any], media_type: str = "") -> Set[RankEntry]:
         entries: Set[RankEntry] = set()
-        pages = min(5, max(1, math.ceil(self.limit / 20)))
+        pages = max(1, math.ceil(self.limit / 20))
         for page in range(1, pages + 1):
             payload = self._tmdb(path, {**params, "page": page})
             for item in payload.get("results") or []:
@@ -662,10 +661,6 @@ class RankingFetcher:
         return RankingResult(
             True, self._tmdb_pages("/trending/all/week", {}, ""), "TMDB官方趋势"
         )
-
-    def _tmdb_popular(self, media_type: str, source: str) -> RankingResult:
-        path = "/movie/popular" if media_type == "Movie" else "/tv/popular"
-        return RankingResult(True, self._tmdb_pages(path, {}, media_type), source)
 
     def _provider_id(self, platform: str, media_type: str) -> int:
         cache_key = (platform, media_type)
@@ -721,7 +716,7 @@ class RankingFetcher:
         platform = key[:-(len(suffix) + 1)]
         media_type = "Movie" if suffix == "movie" else "Series"
         provider_id = self._provider_id(platform, media_type)
-        entries: Set[RankEntry] = set()
+        entries: Dict[RankEntry, float] = {}
         # 每个地区只取前一页热门项，再合并去重，避免“全部地区”造成过多请求。
         per_region = max(20, min(40, math.ceil(self.limit / max(1, len(self.regions)))))
         pages = max(1, math.ceil(per_region / 20))
@@ -737,34 +732,51 @@ class RankingFetcher:
                 for item in payload.get("results") or []:
                     entry = self._from_tmdb(item, media_type)
                     if entry:
-                        entries.add(entry)
-                if len(entries) >= self.limit:
-                    break
-            if len(entries) >= self.limit:
-                break
-        return RankingResult(True, set(list(entries)[:self.limit]), "TMDB Watch Provider多地区汇总")
+                        entries[entry] = max(entries.get(entry, 0.0), float(item.get("popularity") or 0))
+        return RankingResult(True, set(sorted(entries, key=lambda x: (-entries[x], x.media_type, x.tmdb))[:self.limit]), "TMDB所选地区可播精选（非平台官方榜单）")
 
     def _imdb(self, movie: bool) -> RankingResult:
         path = "moviemeter" if movie else "tvmeter"
-        media_type = "Movie" if movie else "Series"
-        try:
-            raw = self._request(f"https://www.imdb.com/chart/{path}/").decode("utf-8", "replace")
-            ids: List[str] = []
-            seen: Set[str] = set()
-            for imdb_id in re.findall(r"tt\d{7,10}", raw):
-                if imdb_id not in seen:
-                    seen.add(imdb_id)
-                    ids.append(imdb_id)
-                if len(ids) >= self.limit:
-                    break
-            if ids:
-                return RankingResult(
-                    True, {RankEntry(media_type=media_type, imdb=x) for x in ids}, "IMDb榜单页"
-                )
-            raise RuntimeError("IMDb 页面未解析到条目")
-        except Exception as err:
-            self.log("WARNING", f"IMDb 榜单不可用，改用 TMDB 热门兜底：{err}")
-            return self._tmdb_popular(media_type, "TMDB热门兜底")
+        raw = self._request(f"https://www.imdb.com/chart/{path}/").decode("utf-8", "strict")
+        ids: List[str] = []
+        def add(value: Any) -> None:
+            match = re.search(r"(?:^|/)(tt\d{7,10})(?:/|$)", str(value or ""))
+            if match and match.group(1) not in ids:
+                ids.append(match.group(1))
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                if value.get("@type") == "ItemList":
+                    for row in value.get("itemListElement") or []:
+                        if not isinstance(row, dict):
+                            continue
+                        item = row.get("item") or row
+                        if isinstance(item, dict):
+                            add(item.get("url") or item.get("@id"))
+                        elif isinstance(item, str):
+                            add(item)
+                chart = value.get("chartTitles")
+                if isinstance(chart, dict):
+                    for edge in chart.get("edges") or []:
+                        node = edge.get("node") if isinstance(edge, dict) else None
+                        if isinstance(node, dict):
+                            add(node.get("id"))
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+        for attrs, body in re.findall(r"<script\b([^>]*)>(.*?)</script>", raw, flags=re.I | re.S):
+            if "application/ld+json" not in attrs.casefold() and "__NEXT_DATA__" not in attrs:
+                continue
+            try:
+                walk(json.loads(body))
+            except (ValueError, TypeError):
+                continue
+        if not ids:
+            raise RuntimeError("IMDb 榜单主体不可用；保留可信旧数据，不用其他榜单替代")
+        return RankingResult(True, {RankEntry(media_type="Movie" if movie else "Series", imdb=x)
+                                    for x in ids[:self.limit]}, "IMDb结构化榜单主体")
 
     def _anilist(self) -> RankingResult:
         query = """
@@ -777,18 +789,12 @@ class RankingFetcher:
           }
         }
         """
-        try:
-            payload = self._json(
-                "https://graphql.anilist.co", "POST",
-                {"query": query, "variables": {"page": 1, "perPage": min(50, self.limit)}},
-            )
-        except Exception as err:
-            self.log("WARNING", f"AniList 不可用，改用 TMDB 动漫兜底：{err}")
-            entries = (
-                self._tmdb_pages("/discover/tv", {"with_genres": "16", "sort_by": "popularity.desc"}, "Series")
-                | self._tmdb_pages("/discover/movie", {"with_genres": "16", "sort_by": "popularity.desc"}, "Movie")
-            )
-            return RankingResult(True, set(list(entries)[:self.limit]), "TMDB动漫热门兜底")
+        payload = self._json(
+            "https://graphql.anilist.co", "POST",
+            {"query": query, "variables": {"page": 1, "perPage": min(50, self.limit)}},
+        )
+        if (payload or {}).get("errors"):
+            raise RuntimeError("AniList 返回错误；保留可信旧数据，不替换榜单来源")
         media = (((payload or {}).get("data") or {}).get("Page") or {}).get("media") or []
         entries: Set[RankEntry] = set()
         for item in media:
@@ -800,12 +806,7 @@ class RankingFetcher:
                 original_title=str(titles.get("romaji") or ""), year=self._year(item.get("seasonYear")),
             ))
         if not entries:
-            self.log("WARNING", "AniList 未返回条目，改用 TMDB 动漫兜底")
-            entries = (
-                self._tmdb_pages("/discover/tv", {"with_genres": "16", "sort_by": "popularity.desc"}, "Series")
-                | self._tmdb_pages("/discover/movie", {"with_genres": "16", "sort_by": "popularity.desc"}, "Movie")
-            )
-            return RankingResult(True, set(list(entries)[:self.limit]), "TMDB动漫热门兜底")
+            raise RuntimeError("AniList 未返回榜单条目")
         return RankingResult(True, entries, "AniList官方GraphQL")
 
     def _bangumi(self) -> RankingResult:
@@ -865,7 +866,7 @@ class RankingFetcher:
         entries = self._html_title_entries(raw, media_type)
         if not entries:
             raise RuntimeError("猫眼页面未解析到榜单条目；可用自定义Feed覆盖此榜单")
-        return RankingResult(True, set(list(entries)[:self.limit]), "猫眼榜单页兼容解析")
+        return RankingResult(True, entries, "猫眼榜单页兼容解析（标题待身份核实）")
 
     def _tencent(self, key: str) -> RankingResult:
         if key in ("tencent_hot", "tencent_mixed"):
@@ -888,7 +889,7 @@ class RankingFetcher:
 
     def _tencent_discover(self, media_type: str, genre: str) -> Set[RankEntry]:
         provider_id = self._provider_id("tencent", media_type)
-        entries: Set[RankEntry] = set()
+        entries: Dict[RankEntry, float] = {}
         for region in self.regions:
             params: Dict[str, Any] = {
                 "watch_region": region, "with_watch_providers": provider_id,
@@ -900,10 +901,8 @@ class RankingFetcher:
             for item in payload.get("results") or []:
                 entry = self._from_tmdb(item, media_type)
                 if entry:
-                    entries.add(entry)
-            if len(entries) >= self.limit:
-                break
-        return set(list(entries)[:self.limit])
+                    entries[entry] = max(entries.get(entry, 0.0), float(item.get("popularity") or 0))
+        return set(sorted(entries, key=lambda x: (-entries[x], x.media_type, x.tmdb))[:self.limit])
 
     @classmethod
     def _html_title_entries(cls, raw: str, media_type: str) -> Set[RankEntry]:
@@ -950,50 +949,55 @@ class LibraryIndex:
     def __init__(self, items: Iterable[Mapping[str, Any]]):
         self.provider: Dict[Tuple[str, str, str], Set[str]] = {}
         self.title_year: Dict[Tuple[str, str, int], Set[str]] = {}
-        self.title_only: Dict[Tuple[str, str], Set[str]] = {}
+        self.identities: Dict[str, Dict[str, str]] = {}
         for item in items:
             if not item.get("Id"):
                 continue
             item_id = str(item["Id"])
             kind = self._type(item.get("Type"))
             providers = item.get("ProviderIds") or {}
+            self.identities[item_id] = {}
             if isinstance(providers, Mapping):
                 for raw_key, raw_value in providers.items():
                     provider = self._provider_name(str(raw_key))
                     if provider and raw_value not in (None, ""):
-                        self.provider.setdefault((kind, provider, str(raw_value).casefold()), set()).add(item_id)
+                        value = str(raw_value).strip().casefold()
+                        self.identities[item_id][provider] = value
+                        self.provider.setdefault((kind, provider, value), set()).add(item_id)
             year = RankingFetcher._year(item.get("ProductionYear") or item.get("PremiereDate"))
-            titles = {self._normalize(item.get(field)) for field in ("Name", "OriginalTitle", "SortName")} - {""}
+            titles = {self._normalize(item.get(field)) for field in ("Name", "OriginalTitle")} - {""}
             for title in titles:
-                self.title_only.setdefault((kind, title), set()).add(item_id)
                 if year:
                     self.title_year.setdefault((kind, title, year), set()).add(item_id)
 
     def match(self, entries: Iterable[RankEntry]) -> Set[str]:
         result: Set[str] = set()
         for entry in entries:
-            kinds = [entry.media_type] if entry.media_type in ("Movie", "Series") else ["Movie", "Series"]
-            matched: Set[str] = set()
-            for provider in self.PROVIDERS:
-                value = str(getattr(entry, provider) or "").casefold()
-                if not value:
-                    continue
-                for kind in kinds:
-                    matched.update(self.provider.get((kind, provider, value), set()))
-            if matched:
-                result.update(matched)
+            if entry.media_type not in ("Movie", "Series"):
+                continue  # TMDB 数字 ID 在电影和剧集中不是同一个命名空间。
+            identity = {key: str(getattr(entry, key) or "").strip().casefold()
+                        for key in self.PROVIDERS if getattr(entry, key)}
+            hits = [self.provider[(entry.media_type, key, value)]
+                    for key, value in identity.items()
+                    if (entry.media_type, key, value) in self.provider]
+            def compatible(item_id: str) -> bool:
+                local = self.identities[item_id]
+                return not any(key in local and local[key] != value
+                               for key, value in identity.items())
+            if hits:
+                if len(hits) > 1 and not set.intersection(*hits):
+                    continue  # 多个来源 ID 指向不同作品，不取并集猜测。
+                result.update(item_id for item_id in set.union(*hits) if compatible(item_id))
+                continue
+            if not entry.year:
                 continue
             titles = {self._normalize(entry.title), self._normalize(entry.original_title)} - {""}
-            for kind in kinds:
-                for title in titles:
-                    if entry.year:
-                        matched.update(self.title_year.get((kind, title, entry.year), set()))
-                    else:
-                        candidates = self.title_only.get((kind, title), set())
-                        # 无年份时只有唯一同名项目才允许回退，避免误投射重拍片。
-                        if len(candidates) == 1:
-                            matched.update(candidates)
-            result.update(matched)
+            candidates: Set[str] = set()
+            for title in titles:
+                candidates.update(self.title_year.get((entry.media_type, title, entry.year), set()))
+            candidates = {item_id for item_id in candidates if compatible(item_id)}
+            if len(candidates) == 1:
+                result.update(candidates)
         return result
 
     @staticmethod
@@ -1028,12 +1032,12 @@ class MediaArchiver(_PluginBase):
     SELECTION_CACHE_LIMIT = 192
 
     ATTRIBUTE_RULES: Dict[str, Dict[str, Any]] = {
-        "remux": {"name": "Remux专区", "icon": "mdi-disc", "hint": "路径、文件名或媒体源信息包含 Remux", "types": {"movie"}},
+        "remux": {"name": "Remux专区", "icon": "mdi-disc", "hint": "具体文件名或媒体源名称含独立Remux标记", "types": {"movie"}},
         "4k": {"name": "4K专区", "icon": "mdi-video-4k-box", "hint": "视频宽度≥3840或高度≥2160", "types": {"movie"}},
         "dolby_vision": {"name": "Dolby Vision专区", "icon": "mdi-eye-circle", "hint": "视频流 DV/Dolby Vision 信息", "types": {"movie"}},
         "hdr": {"name": "HDR专区", "icon": "mdi-brightness-7", "hint": "HDR10/HDR10+/HLG/PQ/DV", "types": {"movie"}},
         "atmos": {"name": "Atmos专区", "icon": "mdi-surround-sound", "hint": "音频流 Atmos/JOC 信息", "types": {"movie"}},
-        "tvb": {"name": "TVB港剧专区", "icon": "mdi-television-classic", "hint": "标题、路径、厂牌或简介包含 TVB/无线/翡翠台/港剧/myTV SUPER", "types": {"movie", "series"}},
+        "tvb": {"name": "TVB港剧专区", "icon": "mdi-television-classic", "hint": "明确TVB厂牌或标签；港剧和平台可播不等于TVB出品", "types": {"movie", "series"}},
         "adult": {"name": "伦理专区", "icon": "mdi-lock-alert", "hint": "明确情色类型/标签；Emby标签“伦理”加入，“排除伦理”排除", "types": {"movie", "series"}},
     }
     # 一级虚拟库封面模板。只保存品牌识别色与文字标志，不在线下载图片；
@@ -1060,11 +1064,10 @@ class MediaArchiver(_PluginBase):
         "adult": {"logo": "18+", "bg": "#1C0B12", "bg2": "#4A1025", "accent": "#FF6B8A", "fg": "#FFFFFF"},
         "default": {"logo": "VIRTUAL", "bg": "#111827", "bg2": "#3730A3", "accent": "#818CF8", "fg": "#FFFFFF"},
     }
-    TVB_KEYWORDS = (
-        "tvb", "television broadcasts", "无线电视", "無綫電視", "翡翠台",
-        "mytv super", "mytvsuper", "埋堆堆", "港剧", "港劇", "香港剧",
-        "香港劇", "翡翠剧场", "翡翠劇場",
-    )
+    TVB_LABELS = frozenset({
+        "tvb", "television broadcasts", "television broadcasts limited", "无线电视",
+        "無綫電視", "無線電視", "电视广播有限公司", "電視廣播有限公司",
+    })
     # 只匹配完整类型/标签，不把剧情、厂牌、路径或年龄分级当作情色题材。
     ADULT_CONTENT_LABELS = frozenset({
         "情色", "情色片", "情色电影", "情色電影", "erotic", "erotica",
@@ -2773,7 +2776,7 @@ class MediaArchiver(_PluginBase):
             for key, label in group["items"]:
                 checks.append({"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
                     {"component": "VCheckbox", "props": {
-                        "model": f"rank_{key}", "label": label, "hide-details": True,
+                        "model": f"rank_{key}", "label": RANK_META[key]["label"], "hide-details": True,
                     }},
                 ]})
             selected = sum(1 for key, _ in group["items"] if key in self._selected_rankings)
@@ -3376,9 +3379,12 @@ class MediaArchiver(_PluginBase):
             if not result or not result.ok:
                 ranking_failed += 1
                 old = previous_views.get(view_key)
-                if old:
+                if old and old.get("recognition_policy") == "strict-v1":
+                    old = dict(old)
+                    old["item_ids"] = sorted(set(old.get("item_ids") or []) & item_map.keys())
+                    old["cover_tag"] = self._cover_tag(view_key, old["item_ids"])
                     next_views[view_key] = old
-                    ranking_counts[key] = len(old.get("item_ids") or [])
+                    ranking_counts[key] = len(old["item_ids"])
                 else:
                     ranking_counts[key] = 0
                     next_views[view_key] = self._make_virtual_view(
@@ -3390,6 +3396,8 @@ class MediaArchiver(_PluginBase):
             if index is None:
                 index = LibraryIndex(items)
             wanted = index.match(result.entries)
+            if result.entries and not wanted:
+                self._record("WARNING", f"{name}：没有通过身份校验的本库匹配；缺少ID/年份或身份冲突的条目不自动加入")
             ranking_counts[key] = len(wanted)
             next_views[view_key] = self._make_virtual_view(
                 view_key, name, "ranking", wanted, item_map, now,
@@ -3474,6 +3482,7 @@ class MediaArchiver(_PluginBase):
             "",
         )
         return {
+            "recognition_policy": "strict-v1",
             "id": self._view_id(key), "key": key, "name": name, "kind": kind,
             "collection_type": collection_type, "item_ids": ids,
             "server_id": server_id, "updated": updated,
@@ -3555,98 +3564,94 @@ class MediaArchiver(_PluginBase):
         )
         return {key: item[key] for key in fields if item.get(key) not in (None, "")}
 
-    @classmethod
-    def _iter_scalar_values(cls, value: Any, depth: int = 0) -> Iterator[str]:
-        """逐个产生标量文本，避免递归过程中反复创建列表或拼接字符串。"""
-        if depth > 8 or value is None:
-            return
-        if isinstance(value, Mapping):
-            for key, child in value.items():
-                yield str(key)
-                yield from cls._iter_scalar_values(child, depth + 1)
-            return
-        if isinstance(value, (list, tuple, set)):
-            for child in value:
-                yield from cls._iter_scalar_values(child, depth + 1)
-            return
-        if isinstance(value, (str, int, float, bool)):
-            yield str(value)
+    @staticmethod
+    def _labels(values: Any) -> Set[str]:
+        if not isinstance(values, (list, tuple, set)):
+            values = [values]
+        names = (value.get("Name") if isinstance(value, Mapping) else value for value in values)
+        return {" ".join(value.split()).casefold().replace("：", ":")
+                for value in names if isinstance(value, str) and value.strip()}
 
     @classmethod
-    def _scalar_text(cls, value: Any) -> str:
-        return " ".join(cls._iter_scalar_values(value)).casefold()
+    def _source_attributes(cls, source: Mapping[str, Any]) -> Set[str]:
+        """每个版本独立取证；只读取指定字段的值，不搜索字典键或父目录。"""
+        matched: Set[str] = set()
+        names = [str(source.get(key) or "") for key in ("Name", "Container")]
+        for key in ("Path", "FileName"):
+            path = str(source.get(key) or "")
+            if "://" in path:
+                path = urllib.parse.unquote(urllib.parse.urlsplit(path).path)
+            names.append(re.split(r"[/\\]", path)[-1])
+        filename = " ".join(names).casefold().replace("_", " ")
+        streams = source.get("MediaStreams") or []
+        if not isinstance(streams, list):
+            streams = []
+        videos = [x for x in streams if isinstance(x, Mapping) and str(x.get("Type", "")).casefold() == "video"]
+        audios = [x for x in streams if isinstance(x, Mapping) and str(x.get("Type", "")).casefold() == "audio"]
+        if re.search(r"(?<![a-z0-9])remux(?![a-z0-9])", filename):
+            matched.add("remux")
+        dimensions = [(cls._number(x.get("Width")), cls._number(x.get("Height"))) for x in videos]
+        dimensions = [(w, h) for w, h in dimensions if w > 0 or h > 0]
+        if not dimensions:
+            w, h = cls._number(source.get("Width")), cls._number(source.get("Height"))
+            if w > 0 or h > 0:
+                dimensions = [(w, h)]
+        if (any(w >= 3840 or h >= 2160 for w, h in dimensions) if dimensions
+                else bool(re.search(r"\b(?:2160p|4k|uhd)\b", filename))):
+            matched.add("4k")
+        video_metadata = videos or [source]
+        formats = " ".join(str(x.get(key) or "") for x in video_metadata for key in (
+            "VideoRange", "VideoRangeType", "ColorTransfer", "VideoDoViTitle", "CodecTag",
+        )).casefold()
+        profiles = [cls._number(x.get("DvProfile") or x.get("DVProfile")) for x in video_metadata]
+        dv = any(value > 0 for value in profiles) or bool(re.search(r"dolby[ ._-]*vision|dovi|dvhe|dvav", formats))
+        range_known = bool(re.search(r"sdr|hdr|hlg|pq|smpte2084|dolby|dovi", formats))
+        if dv or (not range_known and re.search(r"\bdv\b|\bdovi\b|dolby[ ._-]*vision", filename)):
+            matched.add("dolby_vision")
+        if "dolby_vision" in matched or re.search(r"hdr|hlg|\bpq\b|smpte2084", formats):
+            matched.add("hdr")
+        elif not range_known and re.search(r"\bhdr(?:10(?:plus|\+)?)?\b|\bhlg\b", filename):
+            matched.add("hdr")
+        audio_info = " ".join(str(x.get(key) or "") for x in audios for key in (
+            "Title", "DisplayTitle", "Profile", "Codec", "CodecTag",
+        )).casefold().replace("_", " ")
+        if re.search(r"\batmos\b|\bjoc\b", audio_info.strip() or filename):
+            matched.add("atmos")
+        return matched
 
     def _classify(self, item: Mapping[str, Any]) -> Set[str]:
-        """先读取结构化媒体流，再用路径/文件名关键字回退。"""
         matched: Set[str] = set()
         sources = item.get("MediaSources") or []
-        if not isinstance(sources, list):
-            sources = []
-        streams: List[Mapping[str, Any]] = []
-        item_streams = item.get("MediaStreams") or []
-        if isinstance(item_streams, list):
-            streams.extend(x for x in item_streams if isinstance(x, Mapping))
-        for source in sources:
-            if isinstance(source, Mapping) and isinstance(source.get("MediaStreams"), list):
-                streams.extend(x for x in source["MediaStreams"] if isinstance(x, Mapping))
-
-        item_text = self._scalar_text({
-            key: item.get(key) for key in (
-                "Path", "FileName", "Name", "OriginalTitle", "SortName", "Container",
-                "Overview", "Genres", "Studios", "Tags", "OfficialRating",
-            ) if item.get(key) not in (None, "")
-        })
-        source_text = self._scalar_text([
-            {key: value for key, value in source.items()
-             if str(key).casefold() != "mediastreams"}
-            for source in sources if isinstance(source, Mapping)
-        ])
-        stream_text = self._scalar_text(streams)
-        all_text = " ".join((item_text, source_text, stream_text))
-        if "remux" in all_text:
-            matched.add("remux")
-
-        candidates: List[Mapping[str, Any]] = [item]
-        candidates.extend(x for x in sources if isinstance(x, Mapping))
-        candidates.extend(streams)
-        if any(
-            self._number(value.get("Width") or value.get("width")) >= 3840
-            or self._number(value.get("Height") or value.get("height")) >= 2160
-            for value in candidates
-        ) or re.search(
-            r"(?<!\w)(?:2160p|4k|uhd)(?!\w)", all_text, flags=re.I
-        ):
-            matched.add("4k")
-
-        dv_pattern = r"dolby[ ._-]*vision|\bdovi\b|\bdv(?:he|av|\d|\b)"
-        hdr_pattern = r"\bhdr10\+?\b|\bhdr\b|\bhlg\b|smpte2084|\bpq\b|dolby[ ._-]*vision|\bdovi\b"
-        if re.search(dv_pattern, all_text, flags=re.I):
-            matched.add("dolby_vision")
-        if re.search(hdr_pattern, all_text, flags=re.I):
-            matched.add("hdr")
-
-        atmos_pattern = r"\batmos\b|\bjoc\b|e-?ac-?3[^\n]{0,30}joc|truehd[^\n]{0,30}atmos"
-        if re.search(atmos_pattern, all_text, flags=re.I):
-            matched.add("atmos")
-        if any(keyword.casefold() in all_text for keyword in self.TVB_KEYWORDS):
+        sources = [x for x in sources if isinstance(x, Mapping)] if isinstance(sources, list) else []
+        if len(sources) == 1:
+            source = {key: item.get(key) for key in ("Path", "FileName", "Width", "Height", "MediaStreams")}
+            source.update({key: value for key, value in sources[0].items() if value not in (None, "", [])})
+            matched.update(self._source_attributes(source))
+        elif sources:
+            for source in sources:
+                matched.update(self._source_attributes(source))
+        else:
+            matched.update(self._source_attributes({key: item.get(key) for key in (
+                "Path", "FileName", "Container", "Width", "Height", "MediaStreams",
+            )}))
+        tags = self._labels(item.get("Tags"))
+        studios = self._labels(item.get("Studios"))
+        if (tags | studios) & self.TVB_LABELS:
             matched.add("tvb")
         if self._is_adult_item(item):
             matched.add("adult")
+        for key, rule in self.ATTRIBUTE_RULES.items():
+            aliases = {key.casefold(), rule["name"].casefold()}
+            if key != "adult" and tags & {"虚拟库:" + alias for alias in aliases}:
+                matched.add(key)
+            if tags & ({"排除" + alias for alias in aliases} | {"虚拟库:排除" + alias for alias in aliases}):
+                matched.discard(key)
         return matched
 
     @classmethod
     def _is_adult_item(cls, item: Mapping[str, Any]) -> bool:
         """明确标签或情色类型才入选；排除标签优先，无证据时不猜测。"""
-        labels: Dict[str, Set[str]] = {}
-        for field in ("Tags", "Genres"):
-            values = item.get(field) or []
-            if not isinstance(values, (list, tuple, set)):
-                values = [values]
-            names = (value.get("Name") if isinstance(value, Mapping) else value for value in values)
-            labels[field] = {
-                " ".join(value.split()).casefold().replace("：", ":")
-                for value in names if isinstance(value, str) and value.strip()
-            }
+        labels = {field: cls._labels(item.get(field)) for field in ("Tags", "Genres")}
         tags = labels["Tags"]
         if tags & cls.ADULT_EXCLUDE_TAGS:
             return False

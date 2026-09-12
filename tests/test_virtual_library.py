@@ -406,11 +406,11 @@ def main():
     fetcher._tmdb_pages = lambda _path, _params, media_type="": {
         module.RankEntry(media_type=media_type, tmdb="fallback")
     }
-    imdb_fallback = fetcher._imdb(True)
-    assert imdb_fallback.ok and imdb_fallback.source == "TMDB热门兜底"
+    imdb_failed = fetcher._get("imdb_popular_movie")
+    assert not imdb_failed.ok and not imdb_failed.entries
     fetcher._json = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("HTTP 403 disabled"))
-    anime_fallback = fetcher._anilist()
-    assert anime_fallback.ok and anime_fallback.source == "TMDB动漫热门兜底"
+    anime_failed = fetcher._get("anilist_popular")
+    assert not anime_failed.ok and not anime_failed.entries
     partial_fetcher = module.RankingFetcher("tmdb-key", "api.themoviedb.org", "zh-CN", ["US"], 20, 30)
     for child in partial_fetcher.DOUBAN_COLLECTIONS:
         partial_fetcher._results[child] = module.RankingResult(False, set(), error="HTTP 404")
@@ -418,7 +418,7 @@ def main():
         True, {module.RankEntry(media_type="Movie", title="有效子榜")}, "豆瓣移动端公开集合",
     )
     partial_mixed = partial_fetcher._mixed("douban_mixed")
-    assert partial_mixed.ok and partial_mixed.entries and "部分子源失败" in partial_mixed.source
+    assert not partial_mixed.ok, "不完整混合榜不能被当作完整快照清理成员"
     multi_version = {
         "Id": "multi", "Type": "Movie", "Name": "多版本电影",
         "MediaSources": [
