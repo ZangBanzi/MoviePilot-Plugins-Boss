@@ -148,7 +148,11 @@ def test_native_and_virtual_match_same_artwork_beyond_missing_prefix(setup):
     virtual_art, notices = s.admin_artwork(view, opts)
     native_view = s.view(native[0]['key'])
     native_art, native_notices = s.admin_artwork(native_view, opts)
-    assert virtual_art == native_art == [source.art['good'], source.art['other']]
+    assert virtual_art == native_art and len(native_art) == 2
+    # Large upstream originals are normalized before caching; source identity remains distinct.
+    decoded = [Image.open(io.BytesIO(data)).convert('RGB') for data in native_art]
+    assert decoded[0].getpixel((0, 0))[0] > decoded[0].getpixel((0, 0))[1]
+    assert decoded[1].getpixel((0, 0))[1] > decoded[1].getpixel((0, 0))[0]
     assert not notices and not native_notices and native_view['total_count'] == 73
     assert 'good' in s.select_ids(view, opts)  # after seventy empty entries
     assert native_view['id'] == 'libA' and p._virtual_views[view['id']]['item_ids'] == membership
@@ -223,7 +227,10 @@ def test_native_generation_and_real_302_playback_permissions_together(setup):
         response = await p._studio_gateway_cover(request, view)
         assert response.status_code == 200 and response.headers['cache-control'] == 'private, no-cache'
         scoped = [v for k, v in s.art_cache.items() if k[0] == 'user']
-        assert any(source.art['good'] in value[1] for value in scoped)
+        # The permitted red source survives normalization in this user's cache.
+        colors = [Image.open(io.BytesIO(data)).convert('RGB').getpixel((0, 0))
+                  for value in scoped for data in value[1]]
+        assert any(red > green for red, green, _ in colors)
         bob = await p._studio_gateway_cover(_FakeRequest('/cover', headers={'X-Emby-Token': 'bob'}), view)
         assert bob.body != response.body and bob.headers['etag'] != response.headers['etag']
         source.revoked.add('alice'); request.headers['If-None-Match'] = response.headers['etag']

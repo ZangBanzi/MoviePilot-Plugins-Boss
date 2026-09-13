@@ -46,7 +46,9 @@ NUMBERS = {
     "text_x": (2, 75), "text_y": (10, 70), "image_x": (5, 70), "image_y": (2, 50),
     "image_scale": (50, 125), "blur": (0, 60), "overlay": (15, 90),
 }
-MAX_IMAGE = 3 * 1024 * 1024
+MAX_IMAGE = 16 * 1024 * 1024
+MAX_JSON = 16 * 1024 * 1024
+MAX_ORIGINAL_IMAGE = 64 * 1024 * 1024
 MAX_FONT = 24 * 1024 * 1024
 
 
@@ -98,7 +100,7 @@ def data_uri(payload: bytes, mime: str) -> str:
 def decode_image(payload: bytes):
     from PIL import Image
     if len(payload) > MAX_IMAGE:
-        raise ValueError("海报超过 3 MiB")
+        raise ValueError(f"海报超过 {MAX_IMAGE // (1024 * 1024)} MiB")
     with Image.open(io.BytesIO(payload)) as source:
         if source.width * source.height > 16_000_000:
             raise ValueError("海报像素过大")
@@ -106,8 +108,17 @@ def decode_image(payload: bytes):
         return source.convert("RGB")
 
 
+def normalize_artwork(payload: bytes) -> bytes:
+    # Cache a bounded still image, not a potentially large upstream GIF/PNG.
+    # Original library backups must never pass through this conversion.
+    picture = decode_image(payload)
+    output = io.BytesIO()
+    picture.save(output, "JPEG", quality=90)
+    return output.getvalue()
+
+
 class CoverStudio:
-    engine_version = "4.5.0"
+    engine_version = "4.5.1"
     def __init__(self, plugin):
         self.plugin = plugin
         self.lock = threading.RLock()
@@ -412,11 +423,39 @@ class CoverStudio:
             result = result.resize((target_width, target_width*9//16), Image.Resampling.LANCZOS)
         return result
 
-    def encode(self, view: Mapping, options: dict, artwork=None, image_format="png") -> tuple[str, bytes]:
+    @staticmethod
+    def output_info(view, options, count, requested, actual, gif_error=False, format_error=False):
+        if actual == "gif":
+            reason, message = "animated", f"使用 {min(count, 6)} 幅不同的本库海报循环播放。"
+        elif gif_error:
+            reason, message = "encoder_error", "GIF 编码未完成，本次已回退 PNG；可降低分辨率后重试。"
+        elif options["source"] == "brand":
+            reason, message = "brand", "已选择品牌画面，输出静态封面；切换为本库海报后可生成轮播。"
+        elif not count and not view.get("total_count", len(view.get("item_ids", []))):
+            reason, message = "empty_library", "当前库 0 部影片，没有本库海报可轮播，已生成静态品牌封面；需先匹配到本库影片。"
+        elif not count:
+            reason, message = "no_artwork", "本库有影片，但未取得可解码海报，已回退静态品牌封面；请检查海报、连接和访问权限后重试。"
+        elif options["animated"] and count == 1:
+            reason, message = "single_artwork", "仅取得 1 幅不同的本库海报，已生成静态封面；GIF 轮播至少需要 2 幅不同海报。"
+        elif format_error:
+            reason, message = "format_fallback", "所选图片格式编码未完成，已回退 PNG。"
+        elif options["animated"]:
+            reason, message = "static_preview", f"已取得 {count} 幅不同的本库海报，当前为静态预览，可播放 GIF。"
+        else:
+            reason, message = "static", "当前方案使用静态模式。"
+        return {"requested_format": requested, "actual_format": actual, "artwork_count": count,
+                "reason": reason, "message": message}
+
+    def encode(self, view: Mapping, options: dict, artwork=None, image_format="png", report=None) -> tuple[str, bytes]:
         from PIL import Image
         # Serialize expensive cold encodes without holding the synchronization or gateway lock.
         with self.render_lock:
             output = io.BytesIO()
+            requested, gif_error, format_error = image_format, False, False
+            def finish(fmt):
+                if report is not None:
+                    report.update(self.output_info(view, options, len(pictures), requested, fmt, gif_error, format_error))
+                return "image/" + fmt, output.getvalue()
             # Only distinct, decodable library pictures count as slides. An empty
             # library or one picture is honestly static, never a synthetic loading bar.
             pictures, seen = [], set()
@@ -452,8 +491,9 @@ class CoverStudio:
                             durations.append(80)
                     frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:],
                                    duration=durations, loop=0, disposal=2, optimize=False)
-                    return "image/gif", output.getvalue()
+                    return finish("gif")
                 except Exception:
+                    gif_error = True
                     output = io.BytesIO()
                     image_format = "png"
             fmt = image_format if image_format in {"png", "jpeg", "webp"} else "png"
@@ -461,10 +501,11 @@ class CoverStudio:
             try:
                 base.save(output, format=fmt.upper(), quality=88, optimize=True)
             except Exception:
+                format_error = True
                 output = io.BytesIO()
                 base.save(output, format="PNG")
                 fmt = "png"
-            return "image/"+fmt, output.getvalue()
+            return finish(fmt)
 
     def select_ids(self, view: Mapping, options: dict) -> list[str]:
         ids = list(dict.fromkeys(str(x) for x in view.get("item_ids", [])))
@@ -491,24 +532,26 @@ class CoverStudio:
     def image_kinds(options: dict) -> list[str]:
         return ["Backdrop", "Primary"] if options["source"] == "Backdrop" else ["Primary"]
 
-    def _admin_request(self, method: str, path: str, query=None, payload=None, mime=None):
+    def _admin_request(self, method: str, path: str, query=None, payload=None, mime=None,
+                       max_bytes=None, purpose="读取 Emby 元数据"):
         import httpx
         client = self.client()
         headers = {"X-Emby-Token": client.api_key}
         if mime:
             headers["Content-Type"] = mime
+        limit = MAX_JSON if max_bytes is None else max_bytes
         try:
             with httpx.Client(timeout=8, follow_redirects=False, trust_env=False) as http:
                 with http.stream(method, client.api_root.rstrip("/")+path, params=query,
                                  content=payload, headers=headers) as response:
                     body = bytearray()
-                    for chunk in response.iter_bytes():
+                    for chunk in response.iter_bytes(chunk_size=64*1024):
+                        if len(body) + len(chunk) > limit:
+                            raise ValueError(f"{purpose}：Emby 返回内容超过 {limit / (1024 * 1024):g} MiB，已停止操作")
                         body.extend(chunk)
-                        if len(body) > MAX_IMAGE:
-                            raise ValueError("Emby 返回内容超过 3 MiB，已停止操作")
-                    return response.status_code, response.headers.get("content-type", "").split(";")[0], bytes(body)
+                    return response.status_code, response.headers.get("content-type", "").split(";")[0].strip().lower(), bytes(body)
         except httpx.HTTPError:
-            raise ValueError("Emby 请求未完成，请检查连接和服务器状态") from None
+            raise ValueError(f"{purpose}：Emby 请求未完成，请检查连接和服务器状态") from None
 
     def _admin_json(self, path: str, query=None):
         status, _, body = self._admin_request("GET", path, query)
@@ -586,18 +629,29 @@ class CoverStudio:
         if target is None:
             raise ValueError("原生媒体库已移除或服务器已变更，未上传")
         path = f"/Items/{target['id']}/Images/Primary"
-        status, old_mime, old = self._admin_request("GET", path)
+        status, old_mime, old = self._admin_request("GET", path, max_bytes=MAX_ORIGINAL_IMAGE,
+                                                  purpose="备份原生库旧封面（失败时不上传）")
         if status == 200:
-            decode_image(old)
-            if old_mime not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
-                raise ValueError("旧封面格式无法安全备份，未上传")
+            # Validate the first frame without resizing/re-encoding the backup.
+            # GIF bytes (including all frames, loop and durations) stay exact.
+            from PIL import Image
+            try:
+                with Image.open(io.BytesIO(old)) as source:
+                    old_mime = {"PNG": "image/png", "JPEG": "image/jpeg", "GIF": "image/gif",
+                                "WEBP": "image/webp"}.get(source.format)
+                    if not old_mime or source.width * source.height > 16_000_000:
+                        raise ValueError()
+                    source.load()
+            except Exception:
+                raise ValueError("备份原生库旧封面：图片格式或像素无效，未上传") from None
             with self.lock:
                 row = self._history_entry(target, self.options(target), old_mime, old, batch or uuid.uuid4().hex)
                 row["purpose"] = "before_native_publish"
                 self._commit_history([row]+self._read_index("history"))
         elif status != 404:
             raise ValueError(f"无法备份原生库旧封面：HTTP {status}，未上传")
-        status, _, _ = self._admin_request("POST", path, payload=base64.b64encode(payload), mime=mime)
+        status, _, _ = self._admin_request("POST", path, payload=base64.b64encode(payload), mime=mime,
+                                          purpose="上传原生库封面")
         if status not in {200, 204}:
             raise ValueError(f"原生库封面上传失败：HTTP {status}；原图备份可从历史下载")
 
@@ -624,7 +678,7 @@ class CoverStudio:
             except ValueError:
                 pass  # Old Emby installations may omit image metadata; image GET remains authoritative.
         ids.sort(key=lambda identifier: self.image_priority(index.get(identifier, {}), options))
-        images, notices, seen = [], [], set()
+        images, notices, seen, failures = [], [], set(), set()
         wanted = self.artwork_limit(options)
         deadline = time.monotonic()+12
         with httpx.Client(timeout=3, follow_redirects=False, trust_env=False,
@@ -639,20 +693,30 @@ class CoverStudio:
                         url = client.api_root.rstrip("/")+f"/Items/{item_id}/Images/{kind}"
                         with http.stream("GET", url, params={"MaxWidth": 720, "MaxHeight": 720, "Format": "jpg"}) as response:
                             if response.status_code != 200:
+                                if response.status_code != 404:
+                                    failures.add(f"海报接口 HTTP {response.status_code}")
                                 continue
                             chunks = bytearray()
-                            for chunk in response.iter_bytes():
+                            for chunk in response.iter_bytes(chunk_size=64*1024):
+                                if len(chunks) + len(chunk) > MAX_IMAGE:
+                                    raise ValueError(f"海报超过 {MAX_IMAGE // (1024 * 1024)} MiB")
+                                if time.monotonic() > deadline:
+                                    raise TimeoutError()
                                 chunks.extend(chunk)
-                                if len(chunks) > MAX_IMAGE or time.monotonic() > deadline:
-                                    raise ValueError("图片太大")
-                        decode_image(bytes(chunks))
-                        digest = hashlib.sha256(chunks).digest()
+                        picture = normalize_artwork(bytes(chunks))
+                        digest = hashlib.sha256(picture).digest()
                         if digest not in seen:
-                            images.append(bytes(chunks))
+                            images.append(picture)
                             seen.add(digest)
                         break
+                    except (TimeoutError, httpx.TimeoutException):
+                        failures.add("海报读取超时")
+                    except ValueError as exc:
+                        failures.add(str(exc))
                     except Exception:
-                        continue
+                        failures.add("海报读取或解码失败")
+        if len(images) < min(2, wanted) and failures:
+            notices.append("部分素材不可用：" + "；".join(sorted(failures)))
         if not images:
             notices.append("未取得可用 Emby 海报，已使用品牌画面。")
         with self.lock:
@@ -689,9 +753,11 @@ class CoverStudio:
         view = self.view(key)
         options = self.options(view, patch)
         art, notices = self.admin_artwork(view, options)
-        mime, payload = self.encode(view, options, art, "gif" if animated and options["animated"] else "png")
+        report = {}
+        mime, payload = self.encode(view, options, art, "gif" if animated and options["animated"] else "png", report)
         return {"image": data_uri(payload, mime), "mime": mime, "notices": notices,
-                "artwork_count": len(art), "options": options, "sample": not bool(key),
+                "artwork_count": report["artwork_count"], "render_info": report,
+                "options": options, "sample": not bool(key),
                 "total_count": view.get("total_count", len(view.get("item_ids", [])))}
 
     def _history_entry(self, view: dict, options: dict, mime: str, payload: bytes, batch: str) -> dict:
@@ -747,7 +813,8 @@ class CoverStudio:
         if not self.job_lock.acquire(blocking=False):
             raise ValueError("封面生成正在进行中")
         self.cancel.clear()
-        self.job = {"running": True, "done": 0, "total": len(views), "failed": 0, "message": "准备生成"}
+        self.job = {"running": True, "done": 0, "total": len(views), "failed": 0,
+                    "animated": 0, "static": 0, "fallback": 0, "message": "准备生成"}
 
         def work():
             self._client_context.client = client
@@ -760,30 +827,39 @@ class CoverStudio:
                     try:
                         options = self.options(view)
                         art, notices = self.admin_artwork(view, options)
-                        mime, payload = self.encode(view, options, art, "gif" if options["animated"] else "png")
+                        report = {}
+                        mime, payload = self.encode(view, options, art, "gif" if options["animated"] else "png", report)
                         if publish and view.get("native"):
                             if options["source"] != "brand" and not art:
                                 raise ValueError("未匹配到海报，保留原生库现有封面；可先预览或选择纯品牌画面")
                             self._upload_native(view, mime, payload, batch)
                         if self.config.get("history_enabled", True):
                             with self.lock:
-                                rows.append(self._history_entry(view, options, mime, payload, batch))
+                                row = self._history_entry(view, options, mime, payload, batch)
+                                row["render_info"] = report
+                                rows.append(row)
+                        self.job["animated" if mime == "image/gif" else "static"] += 1
+                        if report["requested_format"] == "gif" and mime != "image/gif":
+                            self.job["fallback"] += 1
                         self.job.setdefault("results", []).append({"key": view["key"], "name": view["name"],
-                            "native": bool(view.get("native")), "artwork_count": len(art), "mime": mime,
+                            "native": bool(view.get("native")), "artwork_count": report["artwork_count"], "mime": mime,
+                            "render_info": report,
                             "status": "published" if publish and view.get("native") else "generated",
                             "notice": "；".join(notices)})
-                        self.job["message"] = view["name"] + (" · 品牌回退" if notices else " · 已生成")
+                        self.job["message"] = view["name"] + (" · 已生成 GIF" if mime == "image/gif" else " · 已生成静态封面")
                     except Exception as exc:
                         self.job["failed"] += 1
                         detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
                         self.job.setdefault("errors", []).append(f"{view['name']} · {detail}")
+                        self.job.setdefault("results", []).append({"key": view["key"], "name": view["name"],
+                            "native": bool(view.get("native")), "status": "failed", "notice": detail})
                         self.job["message"] = f"{view['name']} · 生成失败"
                     self.job["done"] += 1
                 if rows:
                     with self.lock:
                         self._commit_history(rows + self._read_index("history"))
                 self.job["message"] = ("已停止" if self.cancel.is_set() else
-                    f"{'服务器封面' if server else '原生封面更新' if publish else '生成'}完成：{self.job['done']-self.job['failed']} 成功，{self.job['failed']} 失败")
+                    f"{'服务器封面' if server else '原生封面更新' if publish else '生成'}完成：{self.job['animated']} GIF，{self.job['static']} 静态，{self.job['failed']} 失败")
             except Exception as exc:
                 self.job["message"] = f"保存历史失败（{type(exc).__name__}）"
                 self.job["failed"] = max(1, self.job["failed"])

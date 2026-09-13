@@ -280,7 +280,7 @@ def test_studio_api_admin_auth_and_real_preview(plugin, monkeypatch):
             assert (await http.get(url)).status_code == 403
             http.headers['Authorization'] = 'Bearer admin-fixture'
             data = (await http.get(url)).json()
-            assert data['success'] and data['data']['version'] == '4.5.0'
+            assert data['success'] and data['data']['version'] == '4.5.1'
             response = await http.post(url+'/action', json={'action': 'preview', 'key': view['key'], 'options': {'source': 'brand'}})
             assert response.status_code == 200 and response.json()['success']
             assert response.json()['data']['image'].startswith('data:image/png;')

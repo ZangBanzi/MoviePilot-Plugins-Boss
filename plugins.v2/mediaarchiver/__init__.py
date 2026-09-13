@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from .coverstudio import CoverStudio, DEFAULTS as COVER_DEFAULTS, normalize_options, decode_image
+from .coverstudio import CoverStudio, DEFAULTS as COVER_DEFAULTS, MAX_IMAGE, normalize_options, normalize_artwork
 
 from app import schemas
 from app.core.config import settings
@@ -174,7 +174,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.0",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.1",
             },
             method=method.upper(),
         )
@@ -541,7 +541,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.5.0",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.5.1",
         }
         merged.update(headers or {})
         body = None
@@ -842,7 +842,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.0 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.1 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -1102,7 +1102,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.5.0"
+    plugin_version = "4.5.1"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -2341,18 +2341,18 @@ class MediaArchiver(_PluginBase):
                             try:
                                 status, image_headers, body = await asyncio.wait_for(self._fetch_gateway_bytes(
                                     client, "GET", route, dict(headers, Accept="image/*"), b""), timeout=3)
-                                if status == 200 and len(body) <= 3*1024*1024:
+                                if status == 200 and len(body) <= MAX_IMAGE:
                                     try:
-                                        await asyncio.to_thread(decode_image, body)
+                                        picture = await asyncio.to_thread(normalize_artwork, body)
                                     except Exception:
                                         # A proxy may compress images despite Accept-Encoding: identity.
                                         # Decode transport compression before checking the image itself.
                                         for encoding in reversed(self._content_encodings(image_headers)):
                                             body = self._decode_codec(encoding, body)
-                                        if len(body) > 3*1024*1024:
+                                        if len(body) > MAX_IMAGE:
                                             continue
-                                        await asyncio.to_thread(decode_image, body)
-                                    return body
+                                        picture = await asyncio.to_thread(normalize_artwork, body)
+                                    return picture
                             except Exception:
                                 continue
                         return None

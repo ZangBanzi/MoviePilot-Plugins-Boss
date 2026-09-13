@@ -1,8 +1,9 @@
 {
-  "version": "4.5.0",
+  "version": "4.5.1",
   "date": "2026-09-13",
   "author": "Boss",
-  "pytest_passed": 68,
+  "pytest_passed": 87,
+  "pytest_seconds": 42.35,
   "standalone_passed": 4,
   "browser_scenarios": [
     "Desktop canvas renders real backend PNG",
@@ -23,12 +24,24 @@
     "Whole-server cards and primary batch action remain usable at 390px",
     "Real multi-poster GIF preview starts and pauses back to a static image"
   ],
+  "browser_diagnostic_fixtures": [
+    "Empty-library preview and server card explain static output without duplicated notices",
+    "History and modal explain PNG; old JPEG/WebP labels and unknown legacy reasons remain truthful",
+    "Per-library results separate expected static covers from failed native backup and count actual output",
+    "390px results and history explain long messages without horizontal overflow"
+  ],
   "browser": "153.0.4234.32",
   "browser_errors": [],
   "api_errors": [],
   "deployed": false,
-  "nas_access": "read-only, previous 4.4.1 inspected",
-  "main_sha256": "4fc1b9604502ccece0b806ca2a8b6fbea22b7806be33392a8d70b9ce2fe0787e",
-  "cover_sha256": "c54eeecc52dc0706e0a14432a0d4da8e5b53915bc2cc33b177c4dcf3a228e9e5",
-  "python_ast_files": 11
+  "nas_access": "none in this 4.5.1 repair",
+  "main_sha256": "1c8b1e9454b7ec42bb589062045f6f9cdc820c9a3eef89da21e0b8d077b47d4b",
+  "cover_sha256": "ac794c74e7dbc6d99d61f27b94d5fefd50ad5a86086d98ccd474b218cc05d6fd",
+  "python_ast_files": 13,
+  "budgets_mib": {
+    "poster": 16,
+    "metadata": 16,
+    "native_original": 64,
+    "history_total": 256
+  }
 }
