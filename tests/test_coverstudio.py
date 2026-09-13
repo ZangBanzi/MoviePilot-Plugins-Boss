@@ -62,14 +62,20 @@ def test_real_layouts_and_animation(plugin, style):
     p, _, view = plugin
     studio = p._cover_studio
     options = studio.options(view, {'style': style, 'title': '我的私人影院', 'source': 'brand'})
-    mime, payload = studio.encode(view, options, [poster()], 'gif')
+    mime, payload = studio.encode(view, options, [poster('red'), poster('green'), poster('blue')], 'gif')
     assert mime == 'image/gif'
     with Image.open(io.BytesIO(payload)) as image:
-        assert image.n_frames == 12 and image.size == (640, 360) and image.info['loop'] == 0
+        assert image.n_frames == 15 and image.size == (640, 360) and image.info['loop'] == 0
         image.seek(0)
         first = image.convert('RGB').tobytes()
-        image.seek(6)
-        assert first != image.convert('RGB').tobytes()
+        image.seek(5)
+        second = image.convert('RGB').tobytes()
+        # Large artwork regions change, not just a loading indicator.
+        assert sum(abs(a-b) > 12 for a, b in zip(first, second)) > len(first)*.15
+        durations = []
+        for index in range(image.n_frames):
+            image.seek(index); durations.append(image.info['duration'])
+        assert sum(durations) == 6000 and sum(d >= 1600 for d in durations) == 3
 
 
 def test_layouts_differ_and_exports_honor_resolution(plugin):
@@ -274,7 +280,7 @@ def test_studio_api_admin_auth_and_real_preview(plugin, monkeypatch):
             assert (await http.get(url)).status_code == 403
             http.headers['Authorization'] = 'Bearer admin-fixture'
             data = (await http.get(url)).json()
-            assert data['success'] and data['data']['version'] == '4.4.1'
+            assert data['success'] and data['data']['version'] == '4.5.0'
             response = await http.post(url+'/action', json={'action': 'preview', 'key': view['key'], 'options': {'source': 'brand'}})
             assert response.status_code == 200 and response.json()['success']
             assert response.json()['data']['image'].startswith('data:image/png;')
@@ -323,6 +329,8 @@ def test_gateway_artwork_permissions_revocation_and_cache(plugin):
         assert sum('/Images/' in path for path, _ in calls) == before_images
         revoked.add('alice')
         a.headers['If-None-Match'] = alice.headers['etag']
-        assert (await p._studio_gateway_cover(a, view)).status_code == 401
+        denied = await p._studio_gateway_cover(a, view)
+        assert denied.status_code == 200 and denied.body.startswith(b'\x89PNG')
+        assert denied.body != alice.body and denied.headers['cache-control'] == 'private, no-store'
         assert not any('/Users/alice/Items' in path and token == 'bob' for path, token in calls)
     asyncio.run(check())

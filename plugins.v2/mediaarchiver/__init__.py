@@ -28,6 +28,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from collections import OrderedDict, deque
+from concurrent.futures import CancelledError
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -173,7 +174,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.4.1",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.0",
             },
             method=method.upper(),
         )
@@ -452,6 +453,8 @@ class RankingFetcher:
         return result
 
     def _get(self, key: str) -> RankingResult:
+        if getattr(self, "cancel_event", None) is not None and self.cancel_event.is_set():
+            raise CancelledError()
         if key in self._results:
             return self._results[key]
         try:
@@ -475,8 +478,12 @@ class RankingFetcher:
                 value = self._tencent(key)
             else:
                 value = self._platform(key)
+        except CancelledError:
+            raise
         except Exception as err:
             value = RankingResult(False, set(), error=str(err))
+        if getattr(self, "cancel_event", None) is not None and self.cancel_event.is_set():
+            raise CancelledError()
         if value.ok and not value.entries and not value.empty_valid:
             value = RankingResult(
                 False, set(), source=value.source,
@@ -534,7 +541,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.4.1",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.5.0",
         }
         merged.update(headers or {})
         body = None
@@ -545,6 +552,8 @@ class RankingFetcher:
         attempts = 3 if url.startswith(self.tmdb_base) or url == self.feed_url else 1
         timeout = self.timeout if url.startswith(self.tmdb_base) or url == self.feed_url else min(self.timeout, 8)
         for attempt in range(attempts):
+            if getattr(self, "cancel_event", None) is not None and self.cancel_event.is_set():
+                raise CancelledError()
             request = urllib.request.Request(url, data=body, headers=merged, method=method)
             try:
                 with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -833,7 +842,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.4.1 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.0 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -1093,7 +1102,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.4.1"
+    plugin_version = "4.5.0"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -1194,6 +1203,9 @@ class MediaArchiver(_PluginBase):
         self._gateway_last_error_at = float("-inf")
         self._gateway_suppressed_errors = 0
         self._gateway_last_error: Dict[str, Any] = {}
+        self._cover_users: Dict[str, tuple] = {}
+        self._cover_tickets: Dict[str, dict] = {}
+        self._cover_ticket_secret = os.urandom(32)
         self._decoder_status = {
             "gzip": True, "deflate": True,
             "br": bool(importlib.util.find_spec("brotli") or importlib.util.find_spec("brotlicffi")),
@@ -1216,6 +1228,7 @@ class MediaArchiver(_PluginBase):
         self._event_timer: Optional[threading.Timer] = None
         self._boot_timer: Optional[threading.Timer] = None
         self._stopping = False
+        self._sync_cancel = threading.Event()
         self._logs = deque(maxlen=300)
         self._state: Dict[str, Any] = {"servers": {}, "last_sync": "", "source_status": {}}
         self._runtime: Dict[str, Any] = {
@@ -1224,6 +1237,12 @@ class MediaArchiver(_PluginBase):
         self._ranking_cache: Dict[str, RankingResult] = {}
 
     def init_plugin(self, config: Optional[dict] = None) -> None:
+        self._sync_cancel.set()
+        self._sync_cancel = threading.Event()
+        with self._proxy_lock:
+            self._cover_users.clear()
+            self._cover_tickets.clear()
+            self._cover_ticket_secret = os.urandom(32)
         self._remove_gateway_routes()
         self._close_httpx_client()
         self._cancel_timers()
@@ -1718,6 +1737,8 @@ class MediaArchiver(_PluginBase):
             performance["async_pool"] = bool(httpx is not None)
             return self._json_response(200, {
                 "ok": True, "version": self.plugin_version, "code_sha256": SOURCE_SHA256,
+                "cover_engine": getattr(self._cover_studio, "engine_version", "reload-required"),
+                "sync_state": self._runtime.get("state", "unknown"),
                 "pid": os.getpid(), "gateway": dict(self._proxy_status),
                 "views": len(self._virtual_views), "items": len(self._proxy_item_index),
                 "upstream": self._gateway_server_name or "MoviePilot Emby（首次请求时解析）",
@@ -1762,8 +1783,13 @@ class MediaArchiver(_PluginBase):
                 request, route, view, query, latest=bool(latest_match)
             )
         if views_match:
+            def scoped_views(status, headers, body):
+                status, headers, body = self._inject_views(status, headers, body)
+                if status == 200:
+                    body = self._scope_cover_views(request, route, body)
+                return status, headers, body
             return await self._gateway_buffered_response(
-                request, route, transform=self._inject_views, force_identity=True
+                request, route, transform=scoped_views, force_identity=True
             )
         return await self._gateway_stream_response(request, route)
 
@@ -2002,7 +2028,7 @@ class MediaArchiver(_PluginBase):
         members = ",".join(sorted({str(value) for value in item_ids if str(value)}))
         # Emby Web 的部分版本按 32 位 ImageTag 处理，使用完整 MD5 避免不发起图片请求。
         style = self._cover_studio.fingerprint(key, options)
-        return hashlib.md5(f"cover-studio-v1|{style}|{key}|{members}".encode("utf-8")).hexdigest()
+        return hashlib.md5(f"cover-studio-v2|{style}|{key}|{members}".encode("utf-8")).hexdigest()
 
     def _cover_theme(self, view: Mapping[str, Any]) -> Dict[str, str]:
         key = str(view.get("key") or "")
@@ -2165,15 +2191,61 @@ class MediaArchiver(_PluginBase):
         return self._render_cover_basic_png(view)
 
     def _render_cover_animated(self, view: Mapping[str, Any]) -> Tuple[str, bytes]:
-        png = self._render_cover_png(view)
         try:
-            from PIL import Image
-            with Image.open(io.BytesIO(png)) as image:
-                image.verify()
             options = view.get('_cover_options') or self._cover_studio.options(view)
             return self._cover_studio.encode(view, options, view.get('_cover_artwork'), 'gif')
         except Exception:
-            return 'image/png', png
+            return 'image/png', self._render_cover_png(view)
+
+    @staticmethod
+    def _cover_auth(request):
+        pairs = [(k, v) for k, v in urllib.parse.parse_qsl(str(request.url.query or ""), keep_blank_values=True)
+                 if k.casefold() in {"api_key", "apikey", "token", "x-emby-token", "x-mediabrowser-token"}]
+        headers = [(str(k).casefold(), str(v)) for k, v in request.headers.items()
+                   if str(k).casefold() in {"authorization", "x-emby-authorization", "x-emby-token",
+                                           "x-mediabrowser-token", "cookie"}]
+        tokens = [v for _, v in pairs] + [v for k, v in headers if k in {"x-emby-token", "x-mediabrowser-token"}]
+        for k, v in headers:
+            if k in {"authorization", "x-emby-authorization"}:
+                match = re.search(r'\bToken\s*=\s*"?([^",\s]+)', v, flags=re.I)
+                if match:
+                    tokens.append(match.group(1))
+        identity = sorted(set(tokens)) or sorted(headers)
+        if not tokens and not any(k == "cookie" or (k == "authorization" and v.lower().startswith(("bearer ", "basic ")))
+                                  for k, v in headers):
+            headers = []  # A device-only X-Emby-Authorization header is not a credential.
+        return pairs, headers, hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+
+    def _scope_cover_views(self, request, route, body):
+        """Emby image elements often omit authentication headers. Issue an opaque,
+        short-lived, per-view capability from a successful authenticated Views read.
+        It is only usable for that cover; the upstream user's permissions are still
+        revalidated on every request. It never uses the MoviePilot administrator key.
+        """
+        pairs, headers, identity = self._cover_auth(request)
+        if not (pairs or headers):
+            return body
+        user_id = route.strip('/').split('/')[1]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
+            return body
+        payload = json.loads(body)
+        now = time.monotonic()
+        with self._proxy_lock:
+            if len(self._cover_users) >= 512:
+                self._cover_users.pop(next(iter(self._cover_users)))
+            self._cover_users[identity] = (now, user_id)
+            for item in payload.get("Items", []):
+                if str(item.get("Id")) not in self._virtual_views:
+                    continue
+                revision = (item.get("ImageTags") or {}).get("Primary", "")
+                ticket = hashlib.blake2b(f"{identity}|{user_id}|{item['Id']}|{revision}".encode(),
+                    key=self._cover_ticket_secret, digest_size=16).hexdigest()
+                if len(self._cover_tickets) >= 2048:
+                    self._cover_tickets.pop(next(iter(self._cover_tickets)))
+                self._cover_tickets[ticket] = {"time": now, "view": item["Id"], "user": user_id,
+                                               "pairs": pairs, "headers": headers}
+                item["ImageTags"]["Primary"] = ticket
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
 
     def _render_cover_static(self, view: Mapping[str, Any], image_format: str) -> Tuple[str, bytes]:
         png = self._render_cover_png(view)
@@ -2193,22 +2265,34 @@ class MediaArchiver(_PluginBase):
         studio = self._cover_studio
         options = studio.options(view)
         view = dict(view, _cover_options=options)
-        pairs = urllib.parse.parse_qsl(str(request.url.query or ""), keep_blank_values=True)
-        auth_pairs = [(k, v) for k, v in pairs if k.casefold() in {
-            "api_key", "apikey", "token", "x-emby-token", "x-mediabrowser-token"}]
-        auth_headers = [(str(k).casefold(), str(v)) for k, v in request.headers.items()
-                        if str(k).casefold() in {"authorization", "x-emby-authorization",
-                            "x-emby-token", "x-mediabrowser-token", "cookie"}]
+        auth_pairs, auth_headers, identity = self._cover_auth(request)
+        verified_hint = ""
+        with self._proxy_lock:
+            known = self._cover_users.get(identity)
+            if known and time.monotonic()-known[0] < 3600:
+                verified_hint = known[1]
+            if not (auth_pairs or auth_headers):
+                tag = next((v for k, v in urllib.parse.parse_qsl(str(request.url.query or "")) if k.casefold() == "tag"), "")
+                ticket = self._cover_tickets.get(tag)
+                if ticket and ticket["view"] == view.get("id") and time.monotonic()-ticket["time"] < 3600:
+                    auth_pairs, auth_headers = ticket["pairs"], ticket["headers"]
+                    verified_hint = ticket["user"]
+        outcome = "fallback"
         if options["source"] == "brand" or not (auth_pairs or auth_headers) or not view.get("item_ids"):
             # Unauthenticated requests can only see a locally drawn brand graphic.
             response = await asyncio.to_thread(self._virtual_cover_response, request, view)
-            response.headers["Cache-Control"] = "private, no-cache"
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["X-MediaArchiver-Cover"] = "brand" if options["source"] == "brand" else "fallback"
             response.headers["Vary"] = "Authorization, X-Emby-Token, X-MediaBrowser-Token, X-Emby-Authorization, Cookie"
             return response
         try:
             client = self._gateway_client_cache or await asyncio.to_thread(self._gateway_client)
             target, _ = self._upstream_target(client, "/Users/Me")
             headers = self._forward_request_headers(request, target, b"", True)
+            headers = {k: v for k, v in headers.items() if k.casefold() not in {
+                "if-none-match", "if-modified-since", "range", "accept", "content-type"}}
+            headers.update(dict(auth_headers))
+            headers["Accept"] = "application/json"
 
             async def get_json(path, query):
                 route = path + "?" + urllib.parse.urlencode(auth_pairs + query)
@@ -2218,10 +2302,10 @@ class MediaArchiver(_PluginBase):
                     return status, {}
                 return status, json.loads(self._decode_buffered_body(response_headers, body))
 
-            status, user = await get_json("/Users/Me", [])
+            status, user = await get_json(f"/Users/{verified_hint}" if verified_hint else "/Users/Me", [])
             user_id = str(user.get("Id") or "") if isinstance(user, dict) else ""
             if status in {401, 403}:
-                return self._json_response(status, {"error": "Emby authentication required"})
+                raise ValueError("authentication-unavailable")
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
                 # Unknown identity may use the brand fallback, but must never fetch admin artwork.
                 view["_cover_scope"] = "identity-unavailable"
@@ -2232,7 +2316,7 @@ class MediaArchiver(_PluginBase):
                     ("Fields", "DateCreated,SortName"), ("EnableImages", "true"),
                 ])
                 if status in {401, 403}:
-                    return self._json_response(status, {"error": "Emby permission denied"})
+                    raise ValueError("permission-unavailable")
                 permitted = {str(item.get("Id")): item for item in payload.get("Items", [])
                              if isinstance(item, dict) and str(item.get("Id")) in ids} if isinstance(payload, dict) else {}
                 selected = [identifier for identifier in ids if identifier in permitted]
@@ -2255,10 +2339,19 @@ class MediaArchiver(_PluginBase):
                             route = f"/Items/{identifier}/Images/{kind}?" + urllib.parse.urlencode(
                                 auth_pairs + [("MaxWidth", "720"), ("MaxHeight", "720"), ("Format", "jpg")])
                             try:
-                                status, _, body = await asyncio.wait_for(self._fetch_gateway_bytes(
-                                    client, "GET", route, headers, b""), timeout=3)
+                                status, image_headers, body = await asyncio.wait_for(self._fetch_gateway_bytes(
+                                    client, "GET", route, dict(headers, Accept="image/*"), b""), timeout=3)
                                 if status == 200 and len(body) <= 3*1024*1024:
-                                    await asyncio.to_thread(decode_image, body)
+                                    try:
+                                        await asyncio.to_thread(decode_image, body)
+                                    except Exception:
+                                        # A proxy may compress images despite Accept-Encoding: identity.
+                                        # Decode transport compression before checking the image itself.
+                                        for encoding in reversed(self._content_encodings(image_headers)):
+                                            body = self._decode_codec(encoding, body)
+                                        if len(body) > 3*1024*1024:
+                                            continue
+                                        await asyncio.to_thread(decode_image, body)
                                     return body
                             except Exception:
                                 continue
@@ -2288,10 +2381,12 @@ class MediaArchiver(_PluginBase):
                 art_digest = hashlib.sha256(b"".join(hashlib.sha256(data).digest()
                     for data in view.get("_cover_artwork", []))).hexdigest()
                 view["_cover_scope"] = scope + ":" + art_digest
+                outcome = "artwork" if view.get("_cover_artwork") else "no-artwork"
         except Exception:
             view["_cover_scope"] = "artwork-unavailable"
         response = await asyncio.to_thread(self._virtual_cover_response, request, view)
-        response.headers["Cache-Control"] = "private, no-cache"
+        response.headers["Cache-Control"] = "private, no-cache" if outcome == "artwork" else "private, no-store"
+        response.headers["X-MediaArchiver-Cover"] = outcome
         response.headers["Vary"] = "Authorization, X-Emby-Token, X-MediaBrowser-Token, X-Emby-Authorization, Cookie"
         return response
 
@@ -3478,7 +3573,7 @@ class MediaArchiver(_PluginBase):
         if not self._run_lock.acquire(blocking=False):
             return schemas.Response(success=False, message="已有同步任务运行中，请勿重复点击")
         worker = threading.Thread(
-            target=self._sync_worker, args=(mode,),
+            target=self._sync_worker, args=(mode, self._sync_cancel),
             name="MediaVirtualLibrarySync", daemon=True,
         )
         worker.start()
@@ -3492,7 +3587,8 @@ class MediaArchiver(_PluginBase):
             if not getattr(response, "success", False):
                 logger.debug("[媒体虚拟库] 定时同步未启动：%s", getattr(response, "message", ""))
 
-    def _sync_worker(self, mode: str) -> None:
+    def _sync_worker(self, mode: str, cancel_event=None) -> None:
+        cancel_event = cancel_event or self._sync_cancel
         started = time.monotonic()
         self._runtime = {
             "state": "running", "message": "正在连接 Emby 并计算差异……",
@@ -3518,11 +3614,17 @@ class MediaArchiver(_PluginBase):
                     }
                     self._record("INFO", "增量校准复用榜单缓存，不重复请求外部榜单源")
                 else:
-                    ranking_results = self._make_fetcher().fetch(self._selected_rankings)
+                    fetcher = self._make_fetcher()
+                    fetcher.cancel_event = cancel_event
+                    ranking_results = fetcher.fetch(self._selected_rankings)
+                    if cancel_event.is_set():
+                        raise CancelledError()
                     self._ranking_cache = dict(ranking_results)
             elif not self._ranking_enabled:
                 self._ranking_cache = {}
 
+            if cancel_event.is_set():
+                raise CancelledError()
             self._state["source_status"] = {
                 key: {
                     "ok": result.ok, "source": result.source,
@@ -3538,14 +3640,16 @@ class MediaArchiver(_PluginBase):
             }
             failures: List[str] = []
             for client, server_name in clients:
-                if self._stopping:
-                    raise RuntimeError("插件已停止")
+                if self._stopping or cancel_event.is_set():
+                    raise CancelledError()
                 try:
-                    stats = self._sync_server(client, server_name, ranking_results)
+                    stats = self._sync_server(client, server_name, ranking_results, cancel_event)
                     totals["servers"] += 1
                     for key in ("scanned", "added", "removed", "attribute_hits",
                                 "ranking_hits", "ranking_failed"):
                         totals[key] += int(stats.get(key) or 0)
+                except CancelledError:
+                    raise
                 except Exception as err:
                     message = f"{server_name}：{err}"
                     failures.append(message)
@@ -3574,6 +3678,10 @@ class MediaArchiver(_PluginBase):
                 "message": message, "mode": mode, "stats": totals,
             }
             self._record("WARNING" if failures else "INFO", message)
+        except CancelledError:
+            if cancel_event is self._sync_cancel:
+                self._runtime = {"state": "cancelled", "message": "同步已取消，保留已有虚拟库", "mode": mode, "stats": {}}
+            self._record("INFO", "同步已取消：插件停止或配置重载；保留已有虚拟库")
         except Exception as err:
             message = str(err)
             self._runtime = {"state": "failed", "message": message, "mode": mode, "stats": {}}
@@ -3603,10 +3711,13 @@ class MediaArchiver(_PluginBase):
         client: EmbyClient,
         server_name: str,
         ranking_results: Mapping[str, RankingResult],
+        cancel_event=None,
     ) -> Dict[str, int]:
         """计算首页虚拟库成员；不调用 ``/Collections``。"""
         # 去重集中在此处；后续复用字典视图，不再复制整库列表。
         item_map = {str(item["Id"]): item for item in client.library_items() if item.get("Id")}
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
         items = item_map.values()
         index = None
         identity = f"{server_name}|{client.api_root}"
@@ -3700,6 +3811,8 @@ class MediaArchiver(_PluginBase):
             added += len(new_ids - old_ids)
             removed += len(old_ids - new_ids)
 
+        if cancel_event is not None and cancel_event.is_set():
+            raise CancelledError()
         state.update({
             "attribute_counts": attribute_counts,
             "ranking_counts": ranking_counts,
@@ -4157,6 +4270,7 @@ class MediaArchiver(_PluginBase):
 
     def stop_service(self) -> None:
         self._stopping = True
+        self._sync_cancel.set()
         self._cover_studio.cancel.set()
         self._cancel_timers()
         self._remove_gateway_routes()

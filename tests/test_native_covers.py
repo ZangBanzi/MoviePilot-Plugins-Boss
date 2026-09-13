@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import io
+import gzip
 import json
 import threading
 import time
@@ -29,9 +30,15 @@ def origin():
         art = {'good': poster('red'), 'other': poster('green')}
         current = poster('blue')
         current_mime = 'image/png'
+        current_b = poster('purple')
+        current_b_mime = 'image/png'
         fail_post = 0
         legacy = False
         revoked = set()
+        me_unsupported = False
+        compress_art = False
+        by_parent = {}
+        posted = {}
 
         def log_message(self, *_): pass
 
@@ -56,11 +63,16 @@ def origin():
                 start = int(query.get('StartIndex', ['0'])[0])
                 return self.reply(200, self.libraries if self.legacy else
                     {'Items': self.libraries[start:start+1], 'TotalRecordCount': len(self.libraries)})
-            if path == '/Users/Me': return self.reply(200, {'Id': token})
+            if path == '/Users/Me':
+                return self.reply(500) if self.me_unsupported else self.reply(200, {'Id': token})
+            if path in {'/Users/alice', '/Users/bob'}:
+                return self.reply(200, {'Id': token}) if path.rsplit('/', 1)[1] == token else self.reply(403)
+            if path in {'/Users/alice/Views', '/Users/bob/Views'}:
+                return self.reply(200, {'Items': [], 'TotalRecordCount': 0}) if path.split('/')[2] == token else self.reply(403)
             if path == '/Items' or path.startswith('/Users/') and path.endswith('/Items'):
                 # Emby Fields is an enum: ImageTags / BackdropImageTags are not valid fields.
                 if 'ImageTags' in query.get('Fields', [''])[0]: return self.reply(400)
-                items = self.items
+                items = self.by_parent.get(query.get("ParentId", [""])[0], self.items)
                 if token == 'bob': items = [i for i in items if i['Id'] == 'other']
                 if 'Ids' in query:
                     ids = query['Ids'][0].split(','); items = [i for i in items if i['Id'] in ids]
@@ -71,12 +83,13 @@ def origin():
                 return self.reply(200, {'Items': items[:limit], 'TotalRecordCount': total})
             if path.startswith('/Items/') and '/Images/' in path:
                 identifier, kind = path.split('/')[2], path.split('/')[4]
-                if identifier in {'libA', 'libB'}:
-                    return self.reply(200, self.current, self.current_mime)
+                if identifier == 'libA': return self.reply(200, self.current, self.current_mime)
+                if identifier == 'libB': return self.reply(200, self.current_b, self.current_b_mime)
                 if token == 'bob' and identifier != 'other': return self.reply(403)
                 if kind == 'Backdrop': return self.reply(404)
                 if identifier == 'broken': return self.reply(200, b'<html>bad image</html>', 'text/html')
-                if identifier in self.art: return self.reply(200, self.art[identifier], 'image/png')
+                if identifier in self.art:
+                    return self.reply(200, gzip.compress(self.art[identifier]), 'image/png', {'Content-Encoding':'gzip'}) if self.compress_art else self.reply(200, self.art[identifier], 'image/png')
                 return self.reply(404)
             if path == '/Videos/good/stream':
                 return self.reply(302, headers={'Location': 'https://original-cdn.example/video?sign=keep', 'Accept-Ranges': 'bytes'})
@@ -89,11 +102,13 @@ def origin():
             body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
             token = self.headers.get('X-Emby-Token')
             self.calls.append(('POST', path, body, token))
-            if path != '/Items/libA/Images/Primary' or token != 'admin': return self.reply(403)
+            if path not in {'/Items/libA/Images/Primary', '/Items/libB/Images/Primary'} or token != 'admin': return self.reply(403)
             if self.fail_post: return self.reply(self.fail_post)
             value = base64.b64decode(body, validate=True)
             with Image.open(io.BytesIO(value)) as image: image.load()
-            Origin.current, Origin.current_mime = value, self.headers['Content-Type']
+            if path == '/Items/libA/Images/Primary': Origin.current, Origin.current_mime = value, self.headers['Content-Type']
+            else: Origin.current_b, Origin.current_b_mime = value, self.headers['Content-Type']
+            self.posted[path] = value
             return self.reply(204)
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Origin)
@@ -161,7 +176,7 @@ def test_native_preview_generate_publish_backup_restore(setup, animated):
     assert wait_job(s)['failed'] == 0 and source.current != original
     assert source.current_mime == ('image/gif' if animated else 'image/png')
     with Image.open(io.BytesIO(source.current)) as generated:
-        assert getattr(generated, 'n_frames', 1) == (12 if animated else 1)
+        assert getattr(generated, 'n_frames', 1) == (10 if animated else 1)
     backup = next(row for row in s.state()['history'] if row.get('purpose') == 'before_native_publish')
     assert s._file('history', backup['id'], '.image').read_bytes() == original
     s.action({'action': 'restore_native_image', 'id': backup['id']})
@@ -212,7 +227,9 @@ def test_native_generation_and_real_302_playback_permissions_together(setup):
         bob = await p._studio_gateway_cover(_FakeRequest('/cover', headers={'X-Emby-Token': 'bob'}), view)
         assert bob.body != response.body and bob.headers['etag'] != response.headers['etag']
         source.revoked.add('alice'); request.headers['If-None-Match'] = response.headers['etag']
-        assert (await p._studio_gateway_cover(request, view)).status_code == 401
+        denied = await p._studio_gateway_cover(request, view)
+        assert denied.status_code == 200 and denied.body.startswith(b'\x89PNG')
+        assert denied.body != response.body and denied.headers['cache-control'] == 'private, no-store'
         source.revoked.clear()
         app = FastAPI(); sys.modules['app.factory'].app = app
         p._install_gateway_routes()

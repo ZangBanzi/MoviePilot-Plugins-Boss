@@ -1,19 +1,19 @@
 # 媒体虚拟库 · MoviePilot v2
 
-版本 **4.4.1** · 作者 **Boss**
+版本 **4.5.0** · 作者 **Boss**
 
-在 Emby 首页展示属性专区与平台榜单，继续使用原媒体 ItemId。4.4.1 在 4.3.11 虚拟库基线上加入封面工坊，并补齐原生/虚拟媒体库的共同素材筛选、原生库更新及备份恢复。
+在 Emby 首页展示属性专区与平台榜单，继续使用原媒体 ItemId。4.5.0 把封面生成改为整台 Emby 服务器逐库处理，并用真实海报轮播替代旧版进度条动画。
 
-## 4.4.1 封面工坊
+## 4.5.0 封面工坊
 
 界面参考 [justzerock/MoviePilot-Plugins](https://github.com/justzerock/MoviePilot-Plugins/tree/main) 的呀哈哈封面工坊与用户提供的截图：深色卡片、蓝色分段导航、大画布、四格方案和分组配置。页面与 Python 绘图代码为本项目实现；来源和字体许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-![工坊实际浏览器截图](docs/previews/studio-desktop.png)
+![工坊实际浏览器截图](docs/previews/studio-server.png)
 
 - **四种封面**：叠影（旋转海报）、光幕（斜切画面）、映墙（多图拼排）、留白（居中标题）。方案缩略图和大画布使用同一个真实绘图器。
 - **画布编辑**：主/副标题、自定义文本、独立字体、字号、颜色、位置、海报缩放、模糊与压暗；支持拖动和方向键移动。只显示当前布局适用的控制项。
 - **素材**：Emby 横版 Backdrop、竖版 Primary 或本地品牌画面；按最新入库、名称或固定随机种子排序。素材不可用时显示品牌画面及提示。
-- **输出**：静态 PNG/JPEG/WebP，尺寸可选 640×360、960×540、1280×720、1920×1080；GIF 为 12 帧、120ms、循环，最高 960×540。高分辨率静态输出由统一画布缩放生成。
+- **输出**：静态 PNG/JPEG/WebP，尺寸可选 640×360、960×540、1280×720、1920×1080；GIF 轮播最多 6 幅不同的本库海报，每幅停留 1680ms，再用 4 帧共 320ms 渐变过渡，包含末幅到首幅的过渡；最高 960×540。素材少于两幅时返回静态 PNG。高分辨率静态输出由统一画布缩放生成。
 - **方案管理**：各虚拟库可独立设置，也可跟随默认方案；最多 20 个自定义方案，支持 JSON 导入/分享。
 - **历史封面**：当前库/全部库后台生成、进度、停止、预览、原图下载、恢复方案、删除。默认保留 30 批，可设 1–100 批，图片总量上限 256 MiB；页面展示最近 60 张。
 - **字体库**：内置 Noto Sans SC 中文字体；支持 TTF/TTC/OTF/WOFF/WOFF2 文件和公网 HTTPS 直链导入，单文件最多 24 MiB、最多 20 个上传字体。缺失字形回退到内置字体。
@@ -24,9 +24,9 @@
 | 目标 | 如何生成和应用 |
 |---|---|
 | 本插件虚拟媒体库 | 选择已有专区，“应用封面方案”更新 ImageTag，播放器下次请求按方案取材绘制；“生成当前封面”另保存管理端历史 |
-| Emby 原生媒体库 | 点击“读取原生媒体库”，从独立分组中选库。预览/保存方案/“生成当前封面”不改原库图片；点击“生成并更新原生库封面”才更新所选库的 Primary 图片 |
+| Emby 原生媒体库 | 在“Emby 服务器”中选择服务器，点选对应的媒体库卡片。预览/保存方案/“生成当前封面”不改原库图片；点击“生成并更新原生库封面”才更新所选库的 Primary 图片 |
 
-原生库使用当前网关所连接的已配置 Emby，按服务器地址与库 ID 定位，支持同名库。原生库生成不依赖先创建虚拟专区。顶部“生成全部虚拟库封面”保持原范围，不批量覆盖原生库。
+主选择框以已配置的 Emby 服务器为单位。“预览整台服务器”逐库读取素材但不写入 Emby；“生成并应用整台服务器”逐库生成，先备份再更新该服务器各原生库图片，同时生成当前播放网关服务器的虚拟库历史。点选卡片可调整单库方案，同名库会显示 ID。服务器范围沿用插件已选择的 Emby；不会因封面操作切换播放网关。
 
 两类库共用四种布局、字体、海报优先级、Backdrop→Primary 回退、图片解码与去重。虚拟库保留图片标签并先从全部成员中挑选有图候选；原生库还通过 Emby ImageTypes 过滤寻找靠后的有图条目，避免前排缺图就直接放弃。图片请求仍有数量/时间/大小上限，源站超时或素材确实不可用时显示品牌画面及提示。
 
@@ -34,7 +34,7 @@
 
 原生图片接口依据 [Emby 官方上传规范](https://dev.emby.media/reference/RestAPI/ImageService/postItemsByIdImagesByType.html)发送 base64 图片与真实 MIME；不调用媒体库创建/删除、条目修改、媒体源修改等接口。
 
-播放端素材始终使用当前 Emby 用户凭据读取；管理端预览和历史需要 MoviePilot 管理员登录。**虚拟库恢复历史恢复的是设计参数**，播放端重新按当前用户权限取图，不把管理员生成的图片直接公开。无素材时使用品牌图。
+播放端素材始终使用当前 Emby 用户凭据读取；管理端预览和历史需要 MoviePilot 管理员登录。**虚拟库恢复历史恢复的是设计参数**，播放端重新按当前用户权限取图，不把管理员生成的图片直接公开。无素材时使用静态品牌图。Emby 的图片元素可能不带登录头：经认证的首页请求签发每用户、每库独立的短期 ImageTag 凭证（内存保存一小时，重载失效），只用于读取这一张封面。每次仍核验原用户和可见成员，撤销权限后不返回旧海报；不会把 API Token 写进图片 URL。
 
 静态模式强制静态输出；动态模式遇客户端 PNG/JPEG/WebP 请求自动返回对应静态格式，各格式独立缓存/ETag。Pillow 缺失或 GIF 编码失败时，网关仍有 PNG 回退；完整工坊需要安装绘图依赖。部分电视/手机客户端可能只显示 GIF 首帧。
 
@@ -42,7 +42,7 @@
 
 [原生库界面](docs/previews/studio-native.png) · [原图备份](docs/previews/studio-native-history.png) · [配置页截图](docs/previews/studio-config.png) · [手机截图](docs/previews/studio-mobile.png) · [历史页截图](docs/previews/studio-history.png) · [GIF 演示](cover-preview.gif)
 
-截图和 GIF 使用构造元数据/示例图，未连接用户 NAS。4.3.11 的完整历史说明见 [docs/HISTORY-4.3.11.md](docs/HISTORY-4.3.11.md)。
+截图和 GIF 使用构造元数据/原创示例图，不包含用户影片。另已对用户 NAS 做只读核验：旧版 4.4.1 与 Emby 4.9.5.0、Users/Me 500；新包尚未部署。4.3.11 的完整历史说明见 [docs/HISTORY-4.3.11.md](docs/HISTORY-4.3.11.md)。
 
 ## 4.3.10 整体识别优化
 
@@ -106,12 +106,12 @@
 
 ## 上传和升级
 
-本地发布包：`releases/MediaArchiver-v4.4.1.zip`。解压后按原目录上传文件，不要只把 ZIP 放进仓库。
+本地发布包：`releases/MediaArchiver-v4.5.0.zip`。解压后按原目录上传文件，不要只把 ZIP 放进仓库。
 
 1. **完整覆盖 `plugins.v2/mediaarchiver/`**：包括 `__init__.py`、`coverstudio.py`、`requirements.txt`、`fonts/` 和 **`dist/assets/` 全部文件**。只上传主 Python 文件会缺失工坊组件。
-2. 更新根目录 **`package.v2.json`** 的 `MediaArchiver` 条目到 **4.4.1**；仓库有其他插件时保留它们。同步图标、说明、字体许可与校验文件。`frontend/` 是可复现源码，NAS 运行不需要 Node。
+2. 更新根目录 **`package.v2.json`** 的 `MediaArchiver` 条目到 **4.5.0**；仓库有其他插件时保留它们。同步图标、说明、字体许可与校验文件。`frontend/` 是可复现源码，NAS 运行不需要 Node。
 3. 刷新 MoviePilot 插件市场并升级，使 MP 安装插件依赖。随后重启 MoviePilot，确保旧网关代码退出。
-4. 检查 `http://NAS地址:3334/__mediaarchiver__/health`：`version` 应为 `4.4.1`，`code_sha256` 对照 `SHA256SUMS` 中主文件；`decoders.br/zstd` 应启用。
+4. 检查 `http://NAS地址:3334/__mediaarchiver__/health`：`version` 和 `cover_engine` 应为 `4.5.0`，`code_sha256` 对照 `SHA256SUMS` 中主文件；`decoders.br/zstd` 应启用。
 5. 打开插件配置保存原有专区设置，执行“一键重建”，再进入封面工坊。客户端继续连接 8098，并刷新媒体库/图片缓存。
 
 新版页面使用 MoviePilot v2 的 Vue 远程组件机制，管理接口校验管理员身份。仍保留旧的原生配置表单/状态页供兼容调用。完整工坊需宿主支持 Vue 插件页面和管理员依赖；本包未在你的实际 MP 镜像中安装验证。
@@ -122,7 +122,7 @@
 
 Cron 使用 APScheduler 五段格式，按 MoviePilot 时区运行；建议 `0 4 * * *`。每六小时可用 `0 */6 * * *`，周日 03:30 可用 `30 3 * * sun`。星期推荐英文，数字 0 在 APScheduler 中是周一。新版配置页会拒绝无效 Cron。
 
-原有事件/周期校准、榜单更新、严格识别和分页保留。升级后重建一次，以便旧虚拟库索引补齐图片标签。混合榜部分失败时成功子源可新增，保留可信旧成员，来源完整恢复后再清理。4.4.1 没有修复源站网络问题：豆瓣 `tv_global` 404、IMDb 访问/结构变化、AniList/Bangumi 超时、猫眼只有标题缺少可靠身份仍需分别处理；不会用其他榜单冒充。
+原有事件/周期校准、榜单更新、严格识别和分页保留。升级后重建一次，以便旧虚拟库索引补齐图片标签。混合榜部分失败时成功子源可新增，保留可信旧成员，来源完整恢复后再清理。4.5.0 没有修复源站网络问题：豆瓣 `tv_global` 404、IMDb 访问/结构变化、AniList/Bangumi 超时、猫眼只有标题缺少可靠身份仍需分别处理；不会用其他榜单冒充。
 
 ## 开发与复现
 
@@ -132,7 +132,7 @@ Python 3.12、Node 20+。在独立虚拟环境执行（Windows 激活 `.venv/Scr
 python -m venv .venv
 # 激活后执行
 python -m pip install -r requirements-dev.txt
-python -m pytest tests/test_native_covers.py tests/test_coverstudio.py tests/test_gateway_runtime.py -q -p no:cacheprovider
+python -m pytest tests/test_server_cover_workflow.py tests/test_native_covers.py tests/test_coverstudio.py tests/test_gateway_runtime.py -q -p no:cacheprovider
 python tests/test_virtual_library.py
 python tests/test_accuracy.py
 python tests/test_animated_cover.py
@@ -149,4 +149,4 @@ python tests/preview_server.py
 
 前端构建输出到插件 `dist/assets/`；`build:preview` 输出到项目父目录 `.work/preview`。本地测试文件和数据不会进入运行组件。
 
-本次 **59 项 pytest、4 个独立回归脚本、13 个真实浏览器场景**通过。详情见 [TEST_REPORT.md](TEST_REPORT.md)，交接说明见 [HANDOFF.md](HANDOFF.md)。验证覆盖真实 Pillow/HTTPX/FastAPI、回环上游与生产前端组件，不代表 NAS、所有播放器或公网榜单可用性已现场验证。本包未上传 GitHub、未部署。逐项现场验收见 [ACCEPTANCE.md](ACCEPTANCE.md)。
+本次 **68 项 pytest、4 个独立回归脚本、17 个真实浏览器场景**通过。详情见 [TEST_REPORT.md](TEST_REPORT.md)，交接说明见 [HANDOFF.md](HANDOFF.md)。验证覆盖真实 Pillow/HTTPX/FastAPI、回环上游与生产前端组件，NAS 只读检查与本地新版本验证分别记录，不代表新包已部署或所有播放器、榜单均可用。本包未上传 GitHub、未部署。逐项现场验收见 [ACCEPTANCE.md](ACCEPTANCE.md)。

@@ -245,7 +245,7 @@ def test_ponytail_sync_and_cover_do_not_block_browsing(plugin_module, origin):
             assert release.wait(3), '封面绘图阻塞了请求事件循环'
             return b'\x89PNG\r\n\x1a\n'
 
-        p._render_cover_png = slow_render
+        p._render_cover_animated = lambda view: ('image/png', slow_render(view))
         tasks = []
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://gateway') as client:
             try:
@@ -292,7 +292,7 @@ def test_invalid_json_diagnostics_and_retry(plugin_module, origin):
                 response = await client.get('/Users/u/Views?encoding=broken&api_key=never-log-this')
                 assert response.status_code == 502
             health = (await client.get('/__mediaarchiver__/health')).json()
-            assert health['version'] == '4.4.1'
+            assert health['version'] == '4.5.0'
             assert len(health['code_sha256']) == 64
             assert health['performance']['failures'] == 2
             assert health['performance']['suppressed_errors'] == 1
@@ -496,13 +496,15 @@ def test_real_animated_cover_and_static_client_formats(plugin_module, origin):
     async def check():
         p, app, view_id = setup_gateway(plugin_module, origin)
         p._virtual_views[view_id]['key'] = 'attribute:remux'
+        from test_coverstudio import poster
+        p._virtual_views[view_id]['_cover_artwork'] = [poster('red'), poster('green'), poster('blue')]
         try:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://gateway') as client:
                 url = f'/Items/{view_id}/Images/Primary'
                 gif = await client.get(url)
                 assert gif.status_code == 200 and gif.headers['content-type'] == 'image/gif'
                 with Image.open(io.BytesIO(gif.content)) as image:
-                    assert image.n_frames == 12 and image.info['loop'] == 0
+                    assert image.n_frames == 15 and image.info['loop'] == 0
                 tags = {gif.headers['etag']}
                 for requested, expected in [('png', 'PNG'), ('jpg', 'JPEG'), ('webp', 'WEBP')]:
                     response = await client.get(url, params={'Format': requested})
@@ -536,7 +538,8 @@ def test_gif_encoding_failure_preserves_valid_png(plugin_module, monkeypatch):
 
     monkeypatch.setattr(Image.Image, 'save', fail_gif)
     p = plugin_module.MediaArchiver()
-    mime, data = p._render_cover_animated({'key': 'attribute:remux', 'item_ids': []})
+    from test_coverstudio import poster
+    mime, data = p._render_cover_animated({'key': 'attribute:remux', 'item_ids': [], '_cover_artwork': [poster('red'), poster('green')]})
     assert mime == 'image/png'
     with Image.open(io.BytesIO(data)) as image:
         image.load()

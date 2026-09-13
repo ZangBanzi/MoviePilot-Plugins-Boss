@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -106,6 +107,7 @@ def decode_image(payload: bytes):
 
 
 class CoverStudio:
+    engine_version = "4.5.0"
     def __init__(self, plugin):
         self.plugin = plugin
         self.lock = threading.RLock()
@@ -119,6 +121,41 @@ class CoverStudio:
         self.thumbs: dict = {}
         self.native_views: list = []
         self.native_owner = ""
+        self._client_context = threading.local()
+
+    @staticmethod
+    def server_id(client) -> str:
+        return hashlib.sha256(client.api_root.encode()).hexdigest()[:16]
+
+    def clients(self) -> list:
+        try:
+            return self.plugin._create_clients()
+        except Exception:
+            cached = self.plugin._gateway_client_cache
+            return [(cached, self.plugin._gateway_server_name or "Emby")] if cached else []
+
+    def client(self):
+        return getattr(self._client_context, "client", None) or self.plugin._gateway_client()
+
+    @contextmanager
+    def on_server(self, identifier: str = "", client=None):
+        previous = getattr(self._client_context, "client", None)
+        if client is None and identifier:
+            client = next((c for c, _ in self.clients() if self.server_id(c) == identifier), None)
+            if client is None:
+                raise ValueError("Emby 服务器已移除或连接配置不可用，请刷新服务器列表")
+        self._client_context.client = client or previous
+        try:
+            yield
+        finally:
+            self._client_context.client = previous
+
+    def servers(self) -> list[dict]:
+        gateway = self.plugin._gateway_client_cache
+        pairs = self.clients()
+        gateway = gateway or (pairs[0][0] if pairs else None)
+        return [{"id": self.server_id(c), "name": name, "gateway": bool(gateway and c.api_root == gateway.api_root)}
+                for c, name in pairs]
 
     @property
     def root(self) -> Path:
@@ -251,7 +288,7 @@ class CoverStudio:
         images = []
         for payload in (artwork or [])[:9]:
             try:
-                images.append(decode_image(payload))
+                images.append(payload if isinstance(payload, Image.Image) else decode_image(payload))
             except Exception:
                 continue
         base = Image.new("RGB", (width, height), background)
@@ -302,14 +339,13 @@ class CoverStudio:
             base.alpha_composite(shadow, (round(x+10), round(y+16)))
             base.alpha_composite(picture, (round(x), round(y)))
 
-        bob = 5 * math.sin(phase * math.tau)
         x, y = options["image_x"] * 9.6, options["image_y"] * 5.4
         scale = options["image_scale"] / 100
         if style == "stack":
             side = round(302 * scale)
-            card(poster(2, (side, side)), x-34, y-26+bob, -17, 26, .28)
-            card(poster(1, (side, side)), x-13, y-12+bob, -8, 26, .55)
-            card(poster(0, (side, side)), x, y+bob, 0, 26)
+            card(poster(2, (side, side)), x-34, y-26, -17, 26, .28)
+            card(poster(1, (side, side)), x-13, y-12, -8, 26, .55)
+            card(poster(0, (side, side)), x, y, 0, 26)
         elif style == "diagonal":
             image = poster(0, (width, height))
             mask = Image.new("L", (width, height))
@@ -323,7 +359,7 @@ class CoverStudio:
             for col in range(3):
                 for row in range(3):
                     card(poster(row+col*3, (pw, ph)), x + col*(pw+14) - row*32,
-                         y-180 + row*(ph+20)+bob, -11, 14)
+                         y-180 + row*(ph+20), -11, 14)
             fade = Image.new("RGBA", (width, height))
             fd = ImageDraw.Draw(fade)
             for fx in range(round(x+100)):
@@ -370,12 +406,6 @@ class CoverStudio:
         text_line(subtitle, title_y+used+25, options["subtitle_size"], options["subtitle_font"], (*accent, 255))
         if options["show_count"]:
             text_line(text, min(476, title_y+used+98), options["text_size"], options["text_font"], (196, 208, 226))
-        # Twelve-frame light on the bottom rule remains visible even without source posters.
-        progress = (math.cos(phase*math.tau)+1)/2
-        line_x = 415 if centered else round(options["text_x"]*9.6)
-        draw.rounded_rectangle((line_x, 492, line_x+112, 495), radius=2, fill=(55, 66, 82))
-        dot = line_x + round(progress*84)
-        draw.rounded_rectangle((dot, 491, dot+28, 496), radius=2, fill=(*accent, 255))
         result = base.convert("RGB")
         target_width = options["resolution"]
         if target_width != width:
@@ -386,21 +416,48 @@ class CoverStudio:
         from PIL import Image
         # Serialize expensive cold encodes without holding the synchronization or gateway lock.
         with self.render_lock:
-            base = self.render_frame(view, options, artwork)
             output = io.BytesIO()
-            if image_format == "gif":
+            # Only distinct, decodable library pictures count as slides. An empty
+            # library or one picture is honestly static, never a synthetic loading bar.
+            pictures, seen = [], set()
+            for payload in (artwork or [])[:9]:
                 try:
-                    # Cap animation at 960px; static requests retain selected export resolution.
+                    picture = decode_image(payload)
+                    digest = hashlib.sha256(picture.resize((32, 32)).tobytes()).digest()
+                    if digest not in seen:
+                        pictures.append(picture)
+                        seen.add(digest)
+                except Exception:
+                    continue
+            if image_format == "gif" and len(pictures) > 1:
+                try:
+                    # Render each composition once, then dissolve between them.
+                    # Four 80 ms transition frames + 1680 ms hold = two seconds
+                    # per picture, including the last-to-first transition.
                     animated_opts = dict(options, resolution=min(960, options["resolution"]))
-                    frames = [self.render_frame(view, animated_opts, artwork, i/12).quantize(colors=128,
-                              dither=Image.Dither.NONE) for i in range(12)]
+                    slides = [self.render_frame(view, animated_opts, pictures[i:]+pictures[:i])
+                              for i in range(min(6, len(pictures)))]
+                    # One palette across the cycle prevents color flicker at slide boundaries.
+                    atlas = Image.new("RGB", (160*len(slides), 90))
+                    for i, slide in enumerate(slides):
+                        atlas.paste(slide.resize((160, 90)), (160*i, 0))
+                    palette = atlas.quantize(colors=256)
+                    frames, durations = [], []
+                    for i, slide in enumerate(slides):
+                        frames.append(slide.quantize(palette=palette, dither=Image.Dither.NONE))
+                        durations.append(1680)
+                        for alpha in (.104, .352, .648, .896):
+                            frames.append(Image.blend(slide, slides[(i+1) % len(slides)], alpha)
+                                          .quantize(palette=palette, dither=Image.Dither.NONE))
+                            durations.append(80)
                     frames[0].save(output, format="GIF", save_all=True, append_images=frames[1:],
-                                   duration=120, loop=0, disposal=2, optimize=False)
+                                   duration=durations, loop=0, disposal=2, optimize=False)
                     return "image/gif", output.getvalue()
                 except Exception:
                     output = io.BytesIO()
                     image_format = "png"
             fmt = image_format if image_format in {"png", "jpeg", "webp"} else "png"
+            base = self.render_frame(view, options, pictures)
             try:
                 base.save(output, format=fmt.upper(), quality=88, optimize=True)
             except Exception:
@@ -436,7 +493,7 @@ class CoverStudio:
 
     def _admin_request(self, method: str, path: str, query=None, payload=None, mime=None):
         import httpx
-        client = self.plugin._gateway_client()
+        client = self.client()
         headers = {"X-Emby-Token": client.api_key}
         if mime:
             headers["Content-Type"] = mime
@@ -463,12 +520,19 @@ class CoverStudio:
         return value
 
     def load_native(self) -> list[dict]:
-        client = self.plugin._gateway_client()
+        owner = self.server_id(self.client())
+        try:
+            return self._read_native()
+        except Exception:
+            # Failed refreshes invalidate targets; successful refreshes replace
+            # the snapshot atomically so a concurrent preview never sees an empty list.
+            with self.lock:
+                self.native_views = [v for v in self.native_views if v.get("server") != owner]
+            raise
+
+    def _read_native(self) -> list[dict]:
+        client = self.client()
         owner = hashlib.sha256(client.api_root.encode()).hexdigest()[:16]
-        # Never keep stale native targets after a failed refresh or server change.
-        with self.lock:
-            self.native_views = []
-            self.native_owner = owner
         rows, start, legacy = [], 0, False
         for _ in range(20):
             status, _, body = self._admin_request("GET", "/Library/VirtualFolders/Query", {"StartIndex": start, "Limit": 100})
@@ -488,7 +552,7 @@ class CoverStudio:
                 if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier):
                     continue
                 rows.append({"key": f"native:{owner}:{identifier}", "id": identifier, "native": True,
-                             "name": str(item.get("Name") or identifier)[:160], "item_ids": []})
+                             "name": str(item.get("Name") or identifier)[:160], "item_ids": [], "server": owner})
             start += len(items)
             if legacy or isinstance(payload, list) or not items or start >= int(payload.get("TotalRecordCount", start)):
                 break
@@ -496,7 +560,8 @@ class CoverStudio:
             raise ValueError("原生媒体库列表超过分页上限，请缩小服务器范围")
         rows = list({row["key"]: row for row in rows}.values())
         with self.lock:
-            self.native_views = rows
+            self.native_views = [v for v in self.native_views if v.get("server") != owner] + rows
+            self.native_owner = owner
         return rows
 
     def native_items(self, view: Mapping, options: dict) -> dict:
@@ -542,7 +607,7 @@ class CoverStudio:
         if options["source"] == "brand" or not view.get("item_ids"):
             return [], []
         import httpx
-        client = self.plugin._gateway_client()
+        client = self.client()
         cache_key = ("admin", client.api_root, hashlib.sha256(client.api_key.encode()).hexdigest(),
                      str(view.get("key")), self.plugin._cover_tag(str(view.get("key")), view.get("item_ids", []), options))
         with self.lock:
@@ -598,17 +663,20 @@ class CoverStudio:
 
     @staticmethod
     def artwork_limit(options: dict) -> int:
-        return {"wall": 6, "stack": 3}.get(options["style"], 1)
+        return 6 if options["animated"] else {"wall": 6, "stack": 3}.get(options["style"], 1)
 
     def view(self, key: str) -> dict:
         if key.startswith("native:"):
-            client = self.plugin._gateway_client()
+            client = self.client()
             owner = hashlib.sha256(client.api_root.encode()).hexdigest()[:16]
             with self.lock:
                 native = next((dict(v) for v in self.native_views if v["key"] == key), None)
             if native is None or not key.startswith(f"native:{owner}:"):
                 raise ValueError("请先读取原生媒体库并选择有效目标")
             return native
+        context = getattr(self._client_context, "client", None)
+        if key and context and context.api_root != self.plugin._gateway_client().api_root:
+            raise ValueError("虚拟库属于当前播放网关服务器，不能跨服务器取材")
         with self.plugin._proxy_lock:
             view = next((dict(v) for v in self.plugin._virtual_views.values() if v.get("key") == key), None)
         if view is None:
@@ -659,10 +727,17 @@ class CoverStudio:
                 for suffix in (".image", ".jpg"):
                     self._file("history", row["id"], suffix).unlink(missing_ok=True)
 
-    def start_generate(self, key: str = "", publish: bool = False) -> dict:
-        if publish and not key.startswith("native:"):
+    def start_generate(self, key: str = "", publish: bool = False, server: str = "") -> dict:
+        if publish and not server and not key.startswith("native:"):
             raise ValueError("更新原生库封面必须指定一个已读取的原生媒体库")
-        if key:
+        client = self.client() if server or key.startswith("native:") else None
+        if server:
+            views = [dict(v) for v in self.load_native()]
+            gateway = self.plugin._gateway_client_cache
+            if gateway and gateway.api_root == client.api_root:
+                with self.plugin._proxy_lock:
+                    views.extend(dict(v) for v in self.plugin._virtual_views.values())
+        elif key:
             views = [self.view(key)]
         else:
             with self.plugin._proxy_lock:
@@ -675,6 +750,7 @@ class CoverStudio:
         self.job = {"running": True, "done": 0, "total": len(views), "failed": 0, "message": "准备生成"}
 
         def work():
+            self._client_context.client = client
             batch = uuid.uuid4().hex
             rows = []
             try:
@@ -685,13 +761,17 @@ class CoverStudio:
                         options = self.options(view)
                         art, notices = self.admin_artwork(view, options)
                         mime, payload = self.encode(view, options, art, "gif" if options["animated"] else "png")
-                        if publish:
+                        if publish and view.get("native"):
                             if options["source"] != "brand" and not art:
                                 raise ValueError("未匹配到海报，保留原生库现有封面；可先预览或选择纯品牌画面")
                             self._upload_native(view, mime, payload, batch)
                         if self.config.get("history_enabled", True):
                             with self.lock:
                                 rows.append(self._history_entry(view, options, mime, payload, batch))
+                        self.job.setdefault("results", []).append({"key": view["key"], "name": view["name"],
+                            "native": bool(view.get("native")), "artwork_count": len(art), "mime": mime,
+                            "status": "published" if publish and view.get("native") else "generated",
+                            "notice": "；".join(notices)})
                         self.job["message"] = view["name"] + (" · 品牌回退" if notices else " · 已生成")
                     except Exception as exc:
                         self.job["failed"] += 1
@@ -703,11 +783,12 @@ class CoverStudio:
                     with self.lock:
                         self._commit_history(rows + self._read_index("history"))
                 self.job["message"] = ("已停止" if self.cancel.is_set() else
-                    f"{'原生封面更新' if publish else '生成'}完成：{self.job['done']-self.job['failed']} 成功，{self.job['failed']} 失败")
+                    f"{'服务器封面' if server else '原生封面更新' if publish else '生成'}完成：{self.job['done']-self.job['failed']} 成功，{self.job['failed']} 失败")
             except Exception as exc:
                 self.job["message"] = f"保存历史失败（{type(exc).__name__}）"
                 self.job["failed"] = max(1, self.job["failed"])
             finally:
+                self._client_context.client = None
                 self.job["running"] = False
                 self.job_lock.release()
         threading.Thread(target=work, name="MediaArchiverCoverStudio", daemon=True).start()
@@ -746,7 +827,7 @@ class CoverStudio:
                 except Exception:
                     self.thumbs[identifier] = ""
             presets.append(dict(preset, thumbnail=self.thumbs[identifier]))
-        return {"version": self.plugin.plugin_version, "views": views, "presets": presets,
+        return {"cover_servers": self.servers(), "version": self.plugin.plugin_version, "views": views, "presets": presets,
                 "custom_presets": self.config.get("presets", []), "options": self.options({}),
                 "fonts": [{"id": "default", "name": "思源风格 · Noto Sans SC（内置）"}] + fonts,
                 "history": recent, "history_count": len(history), "backups": backups, "native_views": native_views,
@@ -823,13 +904,23 @@ class CoverStudio:
         return {"image": data_uri(payload, row["mime"]), "mime": row["mime"], "name": row["name"]}
 
     def action(self, data: dict) -> dict:
+        key = str(data.get("key") or "")
+        if data.get("action") in {"restore_native_image", "restore_history"}:
+            with self.lock:
+                row = next((r for r in self._read_index("history") if r["id"] == data.get("id")), {})
+            key = str(row.get("key") or "")
+        server = key.split(":")[1] if key.startswith("native:") else str(data.get("server") or "")
+        with self.on_server(server):
+            return self._action(data)
+
+    def _action(self, data: dict) -> dict:
         action = data.get("action")
         if action == "preview":
             return self.preview(str(data.get("key") or ""), data.get("options") or {}, bool(data.get("animated")))
         if action == "save_options":
             return {"options": self.save_options(str(data.get("key") or ""), data.get("options"), data.get("scope") == "global")}
         if action == "generate":
-            return self.start_generate(str(data.get("key") or ""), data.get("publish") is True)
+            return self.start_generate(str(data.get("key") or ""), data.get("publish") is True, str(data.get("server") or "") if data.get("all_server") is True else "")
         if action == "load_native":
             return {"count": len(self.load_native())}
         if action == "restore_native_image":

@@ -1,7 +1,7 @@
 # 项目接手规则
 
 先阅读 HANDOFF.md、README.md 和 TEST_REPORT.md，再修改源代码。
-当前有效基线是 plugins.v2/mediaarchiver/__init__.py，版本4.4.1。
+当前有效基线是 plugins.v2/mediaarchiver/__init__.py，版本4.5.0。
 archive/original_uploads 是过时的实体归档附件，只供追溯，不得覆盖当前虚拟库实现。
 
 保持 NextEmby 对外8098、MoviePilot API3334、Emby原生8096链路。
@@ -18,3 +18,5 @@ archive/original_uploads 是过时的实体归档附件，只供追溯，不得�
 本地浏览器测试可使用 tests/preview_server.py 的随机回环端口，不能给插件增加独立监听器。
 
 4.4.1 支持原生与虚拟库封面。原生发布必须重新校验库ID、成功备份旧Primary图后才写图片接口；不允许按同名猜库。自动同步和全虚拟库生成不得覆盖原生封面。新增 tests/test_native_covers.py 联合检查素材、备份、权限及原302。
+
+4.5.0 主选择框以服务器为单位；用户明确点击整台服务器生成时，逐个备份并更新原生库，同时生成当前网关的虚拟库。Cron/同步仍不发布原生图片。各库必须只取本库素材，动画必须轮播不同海报，不以进度条或抖动代替。播放端短期 ImageTag 凭证必须绑定用户和库，并逐次重新验证权限；不能复用管理端图片。已获 NAS 只读检查授权，未获远程部署授权；不要在交接或发布包中保存账号、密码、Token。

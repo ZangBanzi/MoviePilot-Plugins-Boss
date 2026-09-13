@@ -29,3 +29,9 @@
 - [管理员上传图片：base64 请求体](https://dev.emby.media/reference/RestAPI/ImageService/postItemsByIdImagesByType.html)。
 
 Emby 的接口名 VirtualFolders 在这里表示原生服务器媒体库列表；与本插件网关合成的虚拟专区分开处理。仅使用列表 GET 及已核验库 Primary 图片 POST，不创建 VirtualFolder。
+
+## 4.5.0 轮播与用户接口
+
+进一步阅读了 [Yahaha style_animated_1.py](https://github.com/justzerock/MoviePilot-Plugins/blob/main/plugins.v2/yahahacoverstudio/style/style_animated_1.py) 的多图轮播、图片去重和稳定画布设计。本项目用 Pillow 单次构图加共享调色板渐变实现，不复制其 NumPy/FFmpeg 动画源码。
+
+[Emby UserService](https://betadev.emby.media/reference/RestAPI/UserService.html) 提供 `/Users/{Id}`。现场确认当前服务器不支持旧代码使用的 `/Users/Me`；新代码优先使用认证首页已确认的用户 ID。没有取得可信用户身份时，只返回静态品牌图。
