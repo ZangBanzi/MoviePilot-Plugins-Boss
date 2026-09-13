@@ -29,7 +29,45 @@ PRESETS = (
     {"id": "diagonal", "name": "光幕", "description": "斜切画面 · 影院氛围"},
     {"id": "wall", "name": "映墙", "description": "多幅海报 · 丰富片库"},
     {"id": "minimal", "name": "留白", "description": "居中标题 · 纯粹表达"},
+    {"id": "cinema", "name": "银幕", "description": "全幅剧照 · 宽银幕光影"},
+    {"id": "filmstrip", "name": "胶片", "description": "六格海报 · 电影长廊"},
+    {"id": "triptych", "name": "三联", "description": "三幅并置 · 沉浸画廊"},
+    {"id": "editorial", "name": "刊物", "description": "纸感分栏 · 影像特刊"},
+    {"id": "disc", "name": "黑胶", "description": "圆形唱片 · 收藏时刻"},
+    {"id": "mosaic", "name": "拼色", "description": "色块四宫 · 视觉拼贴"},
 )
+# Shared by the renderer and editor. Apply these only when choosing a built-in
+# preset or normalizing omitted fields; never overwrite saved per-library edits.
+_LAYOUT_DEFAULTS = {
+    "cinema": {"text_y": 48, "title_size": 62},
+    "filmstrip": {"text_y": 17, "title_size": 54},
+    "triptych": {"text_y": 61, "title_size": 52},
+    "editorial": {"text_x": 5, "text_y": 36, "title_size": 48,
+                  "foreground": "#272B30", "background": "#EEE8DC", "accent": "#A05B40"},
+    "disc": {"text_x": 6, "text_y": 38, "title_size": 54},
+    "mosaic": {"text_x": 6, "text_y": 15, "title_size": 44},
+}
+_POSITION_FIELDS = ["text_x", "text_y", "image_x", "image_y", "image_scale"]
+for _preset in PRESETS:
+    _id = _preset["id"]
+    _preset["defaults"] = {"style": _id, "text_x": 7, "text_y": 38, "image_x": 58,
+                           "image_y": 16, "image_scale": 100, "title_size": 66,
+                           "foreground": "#F5F7FF", "background": "", "accent": "",
+                           **_LAYOUT_DEFAULTS.get(_id, {})}
+    _preset["fixed_layout"] = _id in {"filmstrip", "triptych", "editorial", "disc", "mosaic"}
+    _preset["hidden_fields"] = list(_POSITION_FIELDS) if _preset["fixed_layout"] else {
+        "minimal": ["text_x", "image_x", "image_y", "image_scale"],
+        "diagonal": ["image_y", "image_scale"],
+        "cinema": ["image_x", "image_y", "image_scale"],
+    }.get(_id, [])
+    if _id in {"cinema", "filmstrip", "triptych", "editorial", "mosaic"}:
+        _preset["hidden_fields"].append("blur")
+    if _id == "editorial":
+        _preset["hidden_fields"].append("overlay")
+    _preset["artwork_count"] = {"stack": 3, "wall": 6, "filmstrip": 6,
+                               "triptych": 3, "editorial": 3, "mosaic": 3}.get(_id, 1)
+    if _id == "cinema":
+        _preset["title_width"] = 81.25
 DEFAULTS = {
     "style": "stack", "animated": True, "resolution": 640,
     "source": "Backdrop", "sort": "random", "seed": 0,
@@ -56,6 +94,9 @@ def normalize_options(raw: Any) -> dict:
     if not isinstance(raw, dict):
         raise ValueError("封面参数必须是对象")
     result = dict(DEFAULTS)
+    preset = next((p for p in PRESETS if p["id"] == raw.get("style")), None)
+    if preset:
+        result.update(preset["defaults"])
     for key, value in raw.items():
         if key not in DEFAULTS:
             continue
@@ -97,6 +138,24 @@ def data_uri(payload: bytes, mime: str) -> str:
     return "data:" + mime + ";base64," + base64.b64encode(payload).decode("ascii")
 
 
+def preview_artwork() -> list:
+    """Original geometric sample art for the preset picker, never library output."""
+    from PIL import Image, ImageDraw
+    pictures = []
+    colors = (("#DFB99B", "#335E65", "#193E48"), ("#91C6C2", "#DBB880", "#40687A"),
+              ("#C6B1BF", "#655D86", "#313956"), ("#CCD2BE", "#819B77", "#31564C"),
+              ("#E7A187", "#964E62", "#443553"), ("#839AAE", "#596872", "#253B48"))
+    for index, (sky, middle, front) in enumerate(colors):
+        picture = Image.new("RGB", (240, 360), sky)
+        draw = ImageDraw.Draw(picture)
+        draw.ellipse((130-index*9, 44, 205-index*9, 119), fill="#F2E8CB")
+        draw.polygon([(0, 218), (85, 128+index*8), (240, 254), (240, 360), (0, 360)], fill=middle)
+        draw.polygon([(0, 308), (158, 205-index*8), (240, 264), (240, 360), (0, 360)], fill=front)
+        draw.line((0, 331, 240, 282-index*2), fill=sky, width=2)
+        pictures.append(picture)
+    return pictures
+
+
 def decode_image(payload: bytes):
     from PIL import Image
     if len(payload) > MAX_IMAGE:
@@ -118,7 +177,7 @@ def normalize_artwork(payload: bytes) -> bytes:
 
 
 class CoverStudio:
-    engine_version = "4.5.2"
+    engine_version = "4.6.0"
     def __init__(self, plugin):
         self.plugin = plugin
         self.lock = threading.RLock()
@@ -350,6 +409,16 @@ class CoverStudio:
             base.alpha_composite(shadow, (round(x+10), round(y+16)))
             base.alpha_composite(picture, (round(x), round(y)))
 
+        def shade(horizontal=True, strength=230):
+            fade = Image.new("RGBA", (width, height))
+            fd = ImageDraw.Draw(fade)
+            extent = width if horizontal else height
+            for pos in range(extent):
+                ratio = (1-pos/extent) ** 1.5 if horizontal else max(0, (pos/extent-.35)/.65)
+                color = (5, 10, 18, round(strength*ratio))
+                fd.line((pos, 0, pos, height) if horizontal else (0, pos, width, pos), fill=color)
+            base.alpha_composite(fade)
+
         x, y = options["image_x"] * 9.6, options["image_y"] * 5.4
         scale = options["image_scale"] / 100
         if style == "stack":
@@ -376,6 +445,64 @@ class CoverStudio:
             for fx in range(round(x+100)):
                 fd.line((fx, 0, fx, height), fill=(5, 10, 18, round(240*(1-fx/(x+100)))))
             base.alpha_composite(fade)
+        elif style == "cinema":
+            base = poster(0, (width, height))
+            shade(strength=min(255, 175+options["overlay"]))
+            shade(False, min(240, 110+options["overlay"]))
+            fd = ImageDraw.Draw(base)
+            fd.rectangle((0, 0, width, 21), fill=(7, 10, 15))
+            fd.rectangle((0, 519, width, height), fill=(7, 10, 15))
+        elif style == "filmstrip":
+            base = poster(0, (width, height))
+            shade(strength=min(255, 175+options["overlay"]))
+            fd = ImageDraw.Draw(base)
+            fd.rectangle((0, 270, width, height), fill=(10, 13, 18))
+            for px in range(18, width, 30):
+                for py in (279, 520):
+                    fd.rounded_rectangle((px, py, px+13, py+9), radius=2, fill=(128, 128, 117))
+            for index in range(6):
+                # Fixed six-frame strip; all repeated slots still come from this library.
+                base.alpha_composite(poster(index, (136, 216)), (42+index*148, 297))
+        elif style == "triptych":
+            base = Image.new("RGBA", (width, height), (9, 13, 20, 255))
+            for index in range(3):
+                base.alpha_composite(poster(index, (304, 516)), (12+index*316, 12))
+            shade(False, min(255, 195+options["overlay"]))
+            fd = ImageDraw.Draw(base)
+            for index in range(3):
+                fd.text((32+index*316, 32), f"0{index+1}", font=self.font("default", 14), fill=(245, 247, 255))
+        elif style == "editorial":
+            base = Image.new("RGBA", (width, height), (*background, 255))
+            fd = ImageDraw.Draw(base)
+            fd.line((46, 92, 372, 92), fill=(*accent, 150), width=1)
+            fd.line((398, 36, 398, 504), fill=(*accent, 90), width=1)
+            fd.text((46, 52), "THE COLLECTION", font=self.font("default", 17), fill=foreground)
+            for index, pos, size in ((0, (422, 36), (308, 468)), (1, (746, 36), (178, 226)),
+                                     (2, (746, 278), (178, 226))):
+                base.alpha_composite(poster(index, size), pos)
+        elif style == "disc":
+            fd = ImageDraw.Draw(base)
+            fd.ellipse((442, 22, 954, 534), fill=(8, 12, 17), outline=(*accent, 150), width=2)
+            for inset in range(9, 71, 5):
+                fd.ellipse((442+inset, 22+inset, 954-inset, 534-inset), outline=(40, 44, 49, 255), width=1)
+            picture = poster(0, (360, 360))
+            mask = Image.new("L", picture.size)
+            ImageDraw.Draw(mask).ellipse((0, 0, 359, 359), fill=255)
+            picture.putalpha(mask)
+            base.alpha_composite(picture, (518, 98))
+            fd = ImageDraw.Draw(base)
+            fd.ellipse((687, 267, 709, 289), fill=(12, 16, 21), outline=(210, 217, 218), width=2)
+            fd.line((920, 45, 887, 158, 840, 194), fill=(201, 207, 209), width=5)
+            fd.rounded_rectangle((827, 184, 852, 211), radius=4, fill=(*accent, 255))
+        elif style == "mosaic":
+            base = Image.new("RGBA", (width, height), (*background, 255))
+            for index, pos in enumerate(((480, 0), (0, 270), (480, 270))):
+                picture = poster(index, (480, 270))
+                picture = Image.blend(picture, Image.new("RGBA", picture.size, (*background, 255)), options["overlay"]/550)
+                base.alpha_composite(picture, pos)
+            fd = ImageDraw.Draw(base)
+            fd.line((480, 0, 480, height), fill=(*accent, 255), width=3)
+            fd.line((0, 270, width, 270), fill=(*accent, 255), width=3)
         else:
             # Centered typography, subtle outline and cinematic lighting.
             ImageDraw.Draw(base).rounded_rectangle((32, 32, 928, 508), radius=26,
@@ -386,10 +513,14 @@ class CoverStudio:
         subtitle = options["subtitle"]
         count = view.get("total_count", len(view.get("item_ids") or []))
         text = options["text"].replace("{count}", str(count)).replace("{name}", str(view.get("name") or ""))
-        title_x = round(options["text_x"] * 9.6)
-        title_y = round(options["text_y"] * 5.4)
-        centered = style == "minimal"
+        preset = next(p for p in PRESETS if p["id"] == style)
+        layout = preset["defaults"] if preset["fixed_layout"] else options
+        title_x = round(layout["text_x"] * 9.6)
+        title_y = round(layout["text_y"] * 5.4)
+        centered = style in {"minimal", "triptych"}
         max_width = min(850 if centered else 475, 920-title_x)
+        max_width = {"cinema": min(780, 920-title_x), "filmstrip": 826, "triptych": 840,
+                     "editorial": 326, "disc": 330, "mosaic": 350}.get(style, max_width)
         if centered:
             title_x = width//2
         anchor = "mt" if centered else "lt"
@@ -411,12 +542,51 @@ class CoverStudio:
                       stroke_width=0)
             return size
 
+        def title_block(value, size, available_height):
+            # Narrow editorial tiles need two legible lines, not a tiny single
+            # line. Existing four presets keep their exact typography behavior.
+            font_id = self.text_font_id(options["title_font"], value)
+            minimum = min(size, 28)
+            while True:
+                font = self.font(font_id, size)
+                lines, current = [], ""
+                for token in re.findall(r"[A-Za-z0-9]+(?:[.+-][A-Za-z0-9]+)*|.", value, re.DOTALL):
+                    # Keep names and IDs such as Netflix/TMDB together. Only a
+                    # word wider than the entire column needs character breaks.
+                    units = token if draw.textlength(token, font=font) > max_width else [token]
+                    for unit in units:
+                        if current and draw.textlength(current+unit, font=font) > max_width:
+                            lines.append(current.rstrip())
+                            current = unit.lstrip()
+                        else:
+                            current += unit
+                if current:
+                    lines.append(current.rstrip())
+                if (len(lines) <= 2 and len(lines)*size+max(0, len(lines)-1)*8 <= available_height) or size <= minimum:
+                    break
+                size = max(minimum, size-2)
+            if len(lines) > 2:
+                lines = lines[:2]
+                while lines[1] and draw.textlength(lines[1]+"…", font=font) > max_width:
+                    lines[1] = lines[1][:-1]
+                lines[1] += "…"
+            for index, line in enumerate(lines):
+                draw.text((title_x, title_y+index*(size+8)), line, font=font,
+                          fill=foreground, anchor=anchor)
+            return len(lines)*size+max(0, len(lines)-1)*8
+
         label = "BOSS / MEDIA LIBRARY" if view.get("native") else "BOSS / VIRTUAL LIBRARY"
         text_line(label, max(24, title_y-58), 13, "default", (*accent, 255))
-        used = text_line(title, title_y, options["title_size"], options["title_font"], foreground)
+        caption_bottom = {"filmstrip": 265, "mosaic": 265}.get(style, 510)
+        title_size = min(options["title_size"], max(24, caption_bottom-title_y-112)) if style in _LAYOUT_DEFAULTS else options["title_size"]
+        if style in {"editorial", "disc", "mosaic"}:
+            used = title_block(title, title_size, max(24, caption_bottom-title_y-112))
+        else:
+            used = text_line(title, title_y, title_size, options["title_font"], foreground)
         text_line(subtitle, title_y+used+25, options["subtitle_size"], options["subtitle_font"], (*accent, 255))
         if options["show_count"]:
-            text_line(text, min(476, title_y+used+98), options["text_size"], options["text_font"], (196, 208, 226))
+            text_line(text, min(caption_bottom-34, title_y+used+98), options["text_size"], options["text_font"],
+                      (91, 83, 74) if style == "editorial" else (196, 208, 226))
         result = base.convert("RGB")
         target_width = options["resolution"]
         if target_width != width:
@@ -727,7 +897,7 @@ class CoverStudio:
 
     @staticmethod
     def artwork_limit(options: dict) -> int:
-        return 6 if options["animated"] else {"wall": 6, "stack": 3}.get(options["style"], 1)
+        return 6 if options["animated"] else next(p["artwork_count"] for p in PRESETS if p["id"] == options["style"])
 
     def view(self, key: str) -> dict:
         if key.startswith("native:"):
@@ -927,12 +1097,20 @@ class CoverStudio:
             value["thumbnail"] = data_uri(path.read_bytes(), "image/jpeg") if path.is_file() else ""
             recent.append(value)
         presets = []
+        samples = []
+        if any(p["id"] not in self.thumbs for p in PRESETS):
+            try:
+                samples = preview_artwork()
+            except Exception:
+                # Status/configuration stay accessible when drawing dependencies
+                # are unavailable; each thumbnail has the same fallback below.
+                pass
         for preset in PRESETS:
             identifier = preset["id"]
             if identifier not in self.thumbs:
                 try:
-                    image = self.render_frame({"name": "私人影院", "key": "attribute:4k", "item_ids": []},
-                                              normalize_options({"style": identifier, "source": "brand"}))
+                    image = self.render_frame({"name": "私人影院", "key": "attribute:4k", "item_ids": [], "total_count": 128},
+                                              normalize_options({"style": identifier, "source": "brand"}), samples)
                     image.thumbnail((320, 180))
                     output = io.BytesIO()
                     image.save(output, "JPEG", quality=80)

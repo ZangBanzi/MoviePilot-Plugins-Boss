@@ -1,10 +1,13 @@
 {
-  "version": "4.5.2",
+  "version": "4.6.0",
   "date": "2026-09-13",
   "author": "Boss",
-  "pytest_passed": 117,
-  "pytest_seconds": 54.76,
-  "history_followup_passed": 15,
+  "pytest_passed": 137,
+  "original_pytest_passed": 117,
+  "original_pytest_seconds": 56.77,
+  "template_tests": 20,
+  "final_related_pytest_passed": 43,
+  "final_related_pytest_seconds": 12.31,
   "standalone_passed": 4,
   "browser_scenarios": [
     "Desktop canvas renders real backend PNG",
@@ -25,12 +28,6 @@
     "Whole-server cards and primary batch action remain usable at 390px",
     "Real multi-poster GIF preview starts and pauses back to a static image"
   ],
-  "browser_diagnostic_fixtures": [
-    "Empty-library preview and server card explain static output without duplicated notices",
-    "History and modal explain PNG; old JPEG/WebP labels and unknown legacy reasons remain truthful",
-    "Per-library results separate expected static covers from failed native backup and count actual output",
-    "390px results and history explain long messages without horizontal overflow"
-  ],
   "browser_selection_scenarios": [
     "All, invert and individual checkboxes control the batch without changing the editor",
     "Switching editors and refreshing libraries preserve drafts and explicit selection",
@@ -43,16 +40,48 @@
     "Clear-all confirms the full count including backups and removes all local history",
     "UI fixtures show full counts, report partial deletion and permit residual cleanup with zero indexed rows"
   ],
-  "browser_real_api_scenarios": 26,
+  "browser_diagnostic_fixtures": [
+    "Empty-library preview and server card explain static output without duplicated notices",
+    "History and modal explain PNG; old JPEG/WebP labels and unknown legacy reasons remain truthful",
+    "Per-library results separate expected static covers from failed native backup and count actual output",
+    "390px results and history explain long messages without horizontal overflow"
+  ],
+  "browser_template_scenarios": [
+    "All ten template thumbnails and real previews render while preserving text, source and output settings",
+    "Switching from the light editorial theme resets all original templates to their correct palette",
+    "Fixed compositions hide unsupported controls and drag handles; cinema keeps movable typography",
+    "Custom templates preserve full overrides through selection, export and JSON reimport",
+    "Native and virtual libraries retain their own new-template drafts when switching editors",
+    "Batch generation applies cinema to checked native and virtual libraries while leaving unchecked plans unchanged",
+    "The new cinema layout plays a real GIF from the selected virtual library",
+    "The ten-template gallery stays readable, scrollable and selectable at 390 pixels without overflow"
+  ],
+  "browser_total_scenarios": 39,
+  "browser_real_api_scenarios": 34,
   "browser_fixture_scenarios": 5,
   "browser": "153.0.4234.32",
   "browser_errors": [],
   "api_errors": [],
   "deployed": false,
-  "nas_access": "none in 4.5.2 repair",
-  "main_sha256": "9d93ab59838336b1402797b405ef79374429ec302803fcd971c03f3abe61e1ca",
-  "cover_sha256": "e125aa027208cf6259d13e9765415a778bd43cd507372be15a135bbf05ae88c2",
-  "python_ast_files": 15,
+  "nas_access": "none in 4.6.0 update",
+  "template_count": 10,
+  "new_templates": [
+    "cinema",
+    "filmstrip",
+    "triptych",
+    "editorial",
+    "disc",
+    "mosaic"
+  ],
+  "main_sha256": "53f0d6d5f0017b16f6bdf0dc17292c37b973ddd7326441e196a36211ebee532b",
+  "cover_sha256": "a6be8585929ccab3fabbd4b262305a42fa6cffd166b93553ca5b938464aa461a",
+  "studio_js": "Studio-DVvNFOSz.js",
+  "studio_js_sha256": "d92e8c5b607f80a69919b9a2607a5135ab1cb8f66af122d9e007ace685fa8270",
+  "studio_css": "Studio-D66KJlH8.css",
+  "studio_css_sha256": "910984ab8540b136715b3252e09bc98975c10deb6a8102f3aa974c3ea4c0fdc1",
+  "remote_entry_sha256": "db2bd1407fe1a0329e19e62d6d0f8176d206df59356148b48febee9b15c46ff6",
+  "main_only_version_changed": true,
+  "python_ast_files": 17,
   "budgets_mib": {
     "poster": 16,
     "metadata": 16,

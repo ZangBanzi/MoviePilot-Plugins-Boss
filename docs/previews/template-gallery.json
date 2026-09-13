@@ -1,0 +1,52 @@
+[
+  {
+    "id": "stack",
+    "name": "叠影",
+    "file": "template-stack.png"
+  },
+  {
+    "id": "diagonal",
+    "name": "光幕",
+    "file": "template-diagonal.png"
+  },
+  {
+    "id": "wall",
+    "name": "映墙",
+    "file": "template-wall.png"
+  },
+  {
+    "id": "minimal",
+    "name": "留白",
+    "file": "template-minimal.png"
+  },
+  {
+    "id": "cinema",
+    "name": "银幕",
+    "file": "template-cinema.png"
+  },
+  {
+    "id": "filmstrip",
+    "name": "胶片",
+    "file": "template-filmstrip.png"
+  },
+  {
+    "id": "triptych",
+    "name": "三联",
+    "file": "template-triptych.png"
+  },
+  {
+    "id": "editorial",
+    "name": "刊物",
+    "file": "template-editorial.png"
+  },
+  {
+    "id": "disc",
+    "name": "黑胶",
+    "file": "template-disc.png"
+  },
+  {
+    "id": "mosaic",
+    "name": "拼色",
+    "file": "template-mosaic.png"
+  }
+]

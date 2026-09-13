@@ -836,7 +836,7 @@ def main():
     assert fetcher._provider_id("apple_tv", "Movie") == 350
 
     assert module.MediaArchiver.PUBLIC_GATEWAY_PORT == 8098
-    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "4.5.2"
+    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "4.6.0"
     assert module.MediaArchiver.plugin_author == "Boss"
     print("PASS: 定时全量、增量校准、3334网关、首页View、动态封面、原ItemId、分页、Latest与302透传通过")
 

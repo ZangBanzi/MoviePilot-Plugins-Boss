@@ -46,8 +46,7 @@ const layoutFields = computed(() => [
   ['image_x','海报横向位置',5,70],['image_y','海报纵向位置',2,50],
   ['image_scale','海报缩放',50,125],['blur','背景模糊',0,60],
   ['overlay','背景压暗',15,90],['subtitle_size','副标题字号',10,50],['text_size','说明字号',10,36],
-].filter(field => !(options.style === 'minimal' && ['text_x','image_x','image_y','image_scale'].includes(field[0]))
-  && !(options.style === 'diagonal' && ['image_y','image_scale'].includes(field[0]))))
+].filter(field => !hiddenLayoutFields.value.includes(field[0])))
 let previewTimer, pollTimer, toastTimer, previewId = 0, disposed = false, suppressWatch = false
 const clone = value => JSON.parse(JSON.stringify(value))
 const server = computed(() => state.value?.cover_servers?.find(s => s.id === selectedServer.value))
@@ -80,6 +79,10 @@ function resultLabel(row) {
   return ({ published: '已更新原生库', generated: '已生成', failed: '未完成' })[row.status] || row.status || '已处理'
 }
 const activePreset = computed(() => state.value?.presets?.find(p => p.id === options.style))
+const hiddenLayoutFields = computed(() => activePreset.value?.hidden_fields ||
+  (options.style === 'minimal' ? ['text_x','image_x','image_y','image_scale'] : options.style === 'diagonal' ? ['image_y','image_scale'] : []))
+const movableTitle = computed(() => !activePreset.value?.fixed_layout && !hiddenLayoutFields.value.includes('text_y'))
+const movableImage = computed(() => !activePreset.value?.fixed_layout && !hiddenLayoutFields.value.includes('image_x'))
 const isDirty = computed(() => JSON.stringify(options) !== JSON.stringify(view.value?.options || state.value?.options || {}))
 const historyGroups = computed(() => {
   const groups = []
@@ -92,7 +95,7 @@ const historyGroups = computed(() => {
 })
 const titleStyle = computed(() => options.style === 'minimal'
   ? { left: '12%', top: `${options.text_y}%`, width: '76%' }
-  : { left: `${options.text_x}%`, top: `${options.text_y}%`, width: '46%' })
+  : { left: `${options.text_x}%`, top: `${options.text_y}%`, width: `${Math.min(activePreset.value?.title_width || 46, 96 - options.text_x)}%` })
 const imageStyle = computed(() => ({ left: `${options.image_x}%`, top: `${options.image_y}%`, width: `${31.5 * options.image_scale / 100}%` }))
 
 function message(text, failed = false) {
@@ -283,7 +286,8 @@ function generate(all = false, publish = false) {
 }
 function choosePreset(preset) {
   if (preset.options) setOptions(preset.options).then(() => refreshPreview())
-  else Object.assign(options, { style: preset.id, text_x: 7, text_y: 38, image_x: 58, image_y: 16, image_scale: 100 })
+  else Object.assign(options, { text_x: 7, text_y: 38, image_x: 58, image_y: 16, image_scale: 100,
+    foreground: '#F5F7FF', accent: '', background: '', ...preset.defaults, style: preset.id })
 }
 function downloadJson(value, filename) {
   const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: 'application/json' }))
@@ -447,7 +451,7 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
         </div>
       </div>
       <div class="ma-hero-bottom">
-        <div class="ma-badges"><span><i :class="{ on: runtime.proxy?.running }"></i>{{ runtime.proxy?.running ? '虚拟库已启用' : '等待启用' }}</span><span>{{ activePreset?.name || '封面工坊' }}</span><span>{{ options.animated ? '动态 GIF' : '静态封面' }}</span><span>v{{ state?.version || '4.5.2' }}</span></div>
+        <div class="ma-badges"><span><i :class="{ on: runtime.proxy?.running }"></i>{{ runtime.proxy?.running ? '虚拟库已启用' : '等待启用' }}</span><span>{{ activePreset?.name || '封面工坊' }}</span><span>{{ options.animated ? '动态 GIF' : '静态封面' }}</span><span>v{{ state?.version || '4.6.0' }}</span></div>
         <nav v-if="!settings" class="ma-tabs" aria-label="工坊页面"><button v-for="t in [['generate','封面生成'],['history','历史封面'],['status','运行状态']]" :key="t[0]" :class="{ active: tab === t[0] }" :aria-current="tab === t[0] ? 'page' : undefined" @click="tab=t[0]">{{ t[1] }}<span v-if="t[0] === 'history' && state?.history_count">{{ state.history_count }}</span></button></nav>
         <nav v-else class="ma-tabs" aria-label="配置页面"><button :class="{ active: configTab === 'settings' }" @click="configTab='settings'"><Icon name="layout" :size="17" />配置</button><button :class="{ active: configTab === 'titles' }" @click="configTab='titles'">T&nbsp; 默认标题与字体</button></nav>
       </div>
@@ -479,8 +483,8 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
               <div v-else class="ma-preview-empty"><Icon name="image" :size="42" /><span>正在绘制你的片库封面</span></div>
               <span v-if="previewBusy" class="ma-render-pill"><span class="ma-spinner"></span>绘制中</span>
               <template v-if="editing && preview">
-                <button class="ma-drag-box ma-drag-title" :style="titleStyle" aria-label="移动标题，支持方向键" @pointerdown="startDrag($event,'text')" @pointermove="moveDrag" @pointerup="drag=null" @pointercancel="drag=null" @keydown="keyboardMove($event,'text')"><span>标题 · 拖动调整</span></button>
-                <button v-if="options.style !== 'minimal'" class="ma-drag-box ma-drag-image" :style="imageStyle" aria-label="移动海报，支持方向键" @pointerdown="startDrag($event,'image')" @pointermove="moveDrag" @pointerup="drag=null" @pointercancel="drag=null" @keydown="keyboardMove($event,'image')"><span>海报</span></button>
+                <button v-if="movableTitle" class="ma-drag-box ma-drag-title" :style="titleStyle" aria-label="移动标题，支持方向键" @pointerdown="startDrag($event,'text')" @pointermove="moveDrag" @pointerup="drag=null" @pointercancel="drag=null" @keydown="keyboardMove($event,'text')"><span>标题 · 拖动调整</span></button>
+                <button v-if="movableImage" class="ma-drag-box ma-drag-image" :style="imageStyle" aria-label="移动海报，支持方向键" @pointerdown="startDrag($event,'image')" @pointermove="moveDrag" @pointerup="drag=null" @pointercancel="drag=null" @keydown="keyboardMove($event,'image')"><span>海报</span></button>
               </template>
             </div>
             <div class="ma-canvas-controls"><label>海报来源<select v-model="options.source"><option value="Backdrop">横版 Backdrop</option><option value="Primary">竖版海报 Primary</option><option value="brand">纯品牌画面</option></select></label><label>素材排序<select v-model="options.sort"><option value="random">{{ view?.native ? '随机素材' : '随机 · 固定种子' }}</option><option value="latest">最新入库</option><option value="name">名称排序</option></select></label><label>输出分辨率<select v-model.number="options.resolution"><option :value="640">360p · 轻量</option><option :value="960">540p · 标准</option><option :value="1280">720p · 高清</option><option :value="1920">1080p · 超清</option></select></label></div>
@@ -488,6 +492,7 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
           <div class="ma-preview-caption"><span><i class="ma-status-dot"></i>{{ artworkCount ? `已读取 ${artworkCount} 幅 Emby 海报` : '品牌画面' }}<span v-if="!selected"> · 示例，尚未应用</span></span><button v-if="options.animated" class="ma-text-btn" :disabled="previewBusy" @click="refreshPreview(!playingPreview)"><Icon name="play" :size="14" />{{ playingPreview ? '暂停动图预览' : '播放动图预览' }}</button></div>
           <div v-if="previewOutput" class="ma-output-info" :data-output-reason="previewOutput.render_info?.reason"><span class="ma-format-badge">{{ formatLabel(previewOutput) }} 预览</span><p>{{ outputMessage(previewOutput) }}</p></div>
           <p v-for="notice in previewNotices" :key="notice" class="ma-note">{{ notice }}</p>
+          <p v-if="activePreset?.fixed_layout" class="ma-composition-note"><Icon name="layout" :size="16" />「{{ activePreset.name }}」采用固定构图，可调整标题、字体、配色与素材。</p>
           <div class="ma-editor-tabs"><button :class="{ active: editor === 'type' }" @click="editor='type'">标题与文案</button><button :class="{ active: editor === 'layout' }" @click="editor='layout'">布局与配色</button></div>
           <div v-if="editor === 'type'" class="ma-fields ma-edit-fields">
             <label>主标题<input v-model="options.title" maxlength="160" :placeholder="view?.name || '跟随虚拟库名称'" /></label><label>副标题<input v-model="options.subtitle" maxlength="160" placeholder="VIRTUAL COLLECTION" /></label>
@@ -500,8 +505,9 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
           <p v-if="view?.customized" class="ma-note">当前库使用独立方案。<button class="ma-text-btn" @click="attempt(async () => { await action('reset_override',{key:selected}); await load(true); delete drafts[selected]; await setOptions(view?.options || state.options); refreshPreview() },'已恢复使用默认方案')">恢复跟随默认方案</button></p>
         </section>
 
-        <aside class="ma-panel ma-presets-panel"><div class="ma-section-head"><div><span class="ma-eyebrow">PRESETS</span><h2>封面方案</h2></div><label class="ma-mode"><span>静态</span><input v-model="options.animated" type="checkbox" aria-label="动态封面" /><span class="ma-toggle"></span><span>动图</span></label></div>
-          <div class="ma-presets"><button v-for="preset in state.presets" :key="preset.id" class="ma-preset" :class="{ active: options.style === preset.id }" :aria-pressed="options.style === preset.id" @click="choosePreset(preset)"><img v-if="preset.thumbnail" :src="preset.thumbnail" :alt="preset.name" /><div v-else class="ma-preset-art" :class="preset.id"><i></i><i></i><i></i></div><div class="ma-preset-copy"><div><strong>{{ preset.name }}</strong><small>{{ preset.description }}</small></div><Icon v-if="options.style === preset.id" name="check" :size="18" /></div></button></div>
+        <aside class="ma-panel ma-presets-panel"><div class="ma-section-head"><div><span class="ma-eyebrow">PRESETS · {{ state.presets.length }}</span><h2>封面方案</h2></div><label class="ma-mode"><span>静态</span><input v-model="options.animated" type="checkbox" aria-label="动态封面" /><span class="ma-toggle"></span><span>动图</span></label></div>
+          <div class="ma-preset-selection" aria-live="polite"><strong>当前 · {{ activePreset?.name || '自定义方案' }}</strong><span>{{ activePreset?.description }}</span></div>
+          <div class="ma-presets" role="group" aria-label="内置封面方案"><button v-for="preset in state.presets" :key="preset.id" class="ma-preset" :data-preset-id="preset.id" :class="{ active: options.style === preset.id }" :aria-pressed="options.style === preset.id" @click="choosePreset(preset)"><img v-if="preset.thumbnail" :src="preset.thumbnail" :alt="preset.name" /><div v-else class="ma-preset-art" :class="preset.id"><i></i><i></i><i></i></div><div class="ma-preset-copy"><div><strong>{{ preset.name }}</strong><small>{{ preset.description }}</small></div><Icon v-if="options.style === preset.id" name="check" :size="18" /></div></button></div>
           <p class="ma-note">方案同时支持静态和动态输出。动图轮播本库最多 6 幅不同海报，每幅展示约 2 秒；素材不足两幅时输出静态图。最高 540p，支持暂停预览与静态请求。</p>
           <template v-if="state.custom_presets.length"><div class="ma-divider"></div><span class="ma-eyebrow">MY PRESETS</span><div v-for="preset in state.custom_presets" :key="preset.id" class="ma-custom-preset"><button @click="choosePreset(preset)"><Icon name="layers" :size="17" />{{ preset.name }}</button><button class="ma-icon-btn ma-small" :aria-label="`删除方案 ${preset.name}`" @click="deletePreset(preset)"><Icon name="trash" :size="16" /></button></div></template>
           <div class="ma-preset-actions"><button class="ma-btn" @click="presetDialog=true"><Icon name="plus" :size="17" />添加方案</button><button class="ma-btn" @click="exportPreset"><Icon name="share" :size="17" />分享方案</button><button class="ma-text-btn ma-span-2" @click="importPresetInput.click()"><Icon name="upload" :size="15" />导入方案文件</button></div>
@@ -536,7 +542,7 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
       <template v-else><section class="ma-config-card"><span class="ma-eyebrow">TYPOGRAPHY</span><h2>默认标题与字体</h2><p>新建封面使用以下默认值，独立配置的虚拟库保留各自设置。</p><div class="ma-fields ma-edit-fields"><label>默认主标题<input v-model="config.cover_studio.defaults.title" placeholder="留空跟随每个虚拟库名称" maxlength="160" /></label><label>默认副标题<input v-model="config.cover_studio.defaults.subtitle" maxlength="160" /></label><label class="ma-span-2">默认自定义文本<input v-model="config.cover_studio.defaults.text" maxlength="160" /><small>支持 {count} 和 {name}。</small></label><label v-for="field in [['title_font','主标题字体'],['subtitle_font','副标题字体'],['text_font','自定义文本字体']]" :key="field[0]">{{ field[1] }}<select v-model="config.cover_studio.defaults[field[0]]"><option v-for="font in state.fonts" :key="font.id" :value="font.id">{{ font.name }}</option></select></label></div></section></template>
       <footer class="ma-config-save"><p><Icon name="check" :size="16" />客户端入口 8098 · 原 ItemId 与 302 链路保留</p><button class="ma-btn ma-primary" :disabled="busy" @click="saveConfig"><Icon name="save" :size="19" />保存配置</button></footer>
     </main>
-    <footer class="ma-footnote">BOSS COVER STUDIO <span>媒体虚拟库 {{ state?.version || '4.5.2' }}</span><span>Designed for your collection.</span></footer>
+    <footer class="ma-footnote">BOSS COVER STUDIO <span>媒体虚拟库 {{ state?.version || '4.6.0' }}</span><span>Designed for your collection.</span></footer>
     <input ref="importPresetInput" type="file" accept=".json,application/json" hidden @change="importPreset" /><input ref="importBackupInput" type="file" accept=".json,application/json" hidden @change="importBackup" /><input ref="fontInput" type="file" accept=".ttf,.otf,.ttc,.woff,.woff2" hidden @change="uploadFont" />
     <div v-if="toast" class="ma-toast" :class="{ error: toastError }" :role="toastError ? 'alert' : 'status'"><Icon :name="toastError ? 'close' : 'check'" :size="19" />{{ toast }}</div>
     <div v-if="presetDialog" class="ma-modal-backdrop" @click.self="presetDialog=false"><section class="ma-modal" role="dialog" aria-modal="true" aria-label="保存自定义方案" @keydown.esc="presetDialog=false"><div class="ma-section-head"><h2>留住这个设计</h2><button class="ma-icon-btn" aria-label="关闭弹窗" @click="presetDialog=false"><Icon name="close" /></button></div><label class="ma-block">方案名称<input v-model="presetName" maxlength="40" placeholder="例如：我的影院 · 深蓝" @keydown.enter="addPreset" /></label><p>保存当前布局、标题、字体、配色与输出设置。</p><button class="ma-btn ma-primary ma-full" :disabled="busy" @click="addPreset">保存为我的方案</button></section></div>

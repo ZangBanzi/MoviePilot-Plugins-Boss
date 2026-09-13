@@ -15,6 +15,17 @@
 @media(prefers-reduced-motion:reduce){.ma-studio *{animation:none!important;transition:none!important}.ma-studio button:active{transform:none!important}}
 .ma-studio .ma-presets-panel > .ma-full + .ma-full { margin-top: 10px; }
 
+/* Keep ten distinct compositions browseable beside the canvas, including phones. */
+.ma-studio .ma-presets{max-height:550px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#456380 #111b29;grid-auto-rows:max-content;align-content:start;padding:3px 6px 3px 3px;scroll-padding:3px}
+.ma-studio .ma-preset-selection{display:flex;flex-direction:column;gap:5px;padding:12px 14px;margin:0 0 16px;border:1px solid #2f4159;border-radius:12px;background:#142234}
+.ma-studio .ma-preset-selection strong{font-size:13px;color:#d9eaff}
+.ma-studio .ma-preset-selection span{font-size:11px;color:#9eb5cf;line-height:1.6}
+.ma-studio .ma-preset-copy{min-height:62px}
+.ma-studio .ma-preset-copy small{white-space:normal;line-height:1.6}
+.ma-studio .ma-composition-note{display:flex;align-items:center;gap:8px;padding:11px 13px;margin:15px 0 0;background:#142234;border-radius:9px;color:#b7cce3;font-size:12px;line-height:1.7}
+.ma-studio .ma-composition-note svg{flex-shrink:0}
+@media(max-width:760px){.ma-studio .ma-presets{grid-template-columns:repeat(2,minmax(0,1fr));max-height:336px;gap:10px}.ma-studio .ma-preset-copy{padding:8px 5px;min-height:57px}.ma-studio .ma-preset-copy strong{font-size:13px}.ma-studio .ma-preset-copy small{display:block;font-size:10px}.ma-studio .ma-preset-selection{margin-bottom:12px}.ma-studio .ma-composition-note{align-items:flex-start}}
+
 /* Checkboxes define the batch; each separate card button opens its draft. */
 .ma-studio .ma-server-panel{margin:24px 0;padding:24px}
 .ma-server-head,.ma-server-toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap}

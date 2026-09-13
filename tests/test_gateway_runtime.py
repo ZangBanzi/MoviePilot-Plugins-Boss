@@ -292,7 +292,7 @@ def test_invalid_json_diagnostics_and_retry(plugin_module, origin):
                 response = await client.get('/Users/u/Views?encoding=broken&api_key=never-log-this')
                 assert response.status_code == 502
             health = (await client.get('/__mediaarchiver__/health')).json()
-            assert health['version'] == '4.5.2'
+            assert health['version'] == '4.6.0'
             assert len(health['code_sha256']) == 64
             assert health['performance']['failures'] == 2
             assert health['performance']['suppressed_errors'] == 1
