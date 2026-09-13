@@ -1,10 +1,19 @@
 # 媒体虚拟库 · MoviePilot v2
 
-版本 **4.5.1** · 作者 **Boss**
+版本 **4.5.2** · 作者 **Boss**
 
 在 Emby 首页展示属性专区与平台榜单，继续使用原媒体 ItemId。4.5.0 把封面生成改为整台 Emby 服务器逐库处理，并用真实海报轮播替代旧版进度条动画。
 
-## 4.5.1 修复
+## 4.5.2 方案选择与历史管理
+
+- 媒体库支持 **全选、反选、逐库勾选**。勾选决定批量处理范围，点击卡片的编辑区域调整画布；切换媒体库会保留页面内未保存的修改。
+- 默认 **统一使用当前方案**：选择“光幕”等方案后，“预览已选库”和“生成并应用已选库”都按当前参数处理所有勾选库。生成前一次保存选中库方案并固定本次参数，未勾选库保留原设置。统一方案包含字体和标题；主标题留空时分别使用各库名称。
+- 也可选择 **使用各库已保存方案**，保留各库独立设计；草稿不会自动应用，需要先保存单库方案。卡片显示实际将生成的方案。
+- 历史卡片可直接删除单张；**清空全部历史**覆盖所有服务器、全部批次，包含页面未展示的记录和原生封面备份。点击后确认再清理，保留 Emby 已应用封面、方案设置、字体和配置备份；生成或恢复期间禁用清理。文件删除失败可重试，即使索引已空也可“清理历史残留”。
+
+[批量选择截图](docs/previews/studio-selection.png) · [手机选择截图](docs/previews/studio-selection-mobile.png) · [历史清理截图](docs/previews/studio-history-cleanup.png)
+
+## 保留 4.5.1 大图修复
 
 - 原生库旧封面备份使用独立 **64 MiB** 限额，按原始字节保存 GIF，恢复保留全部帧与时长；不再被海报的旧 3 MiB 限额拦截。超限、无法解码或备份失败时保留原图，并显示失败发生在备份阶段。
 - 本库海报读取限额为 **16 MiB**，校验像素后缩至最长边 960 像素缓存；原生库、虚拟库和播放端采用同一处理方式。元数据响应另有 16 MiB 限额。
@@ -24,7 +33,7 @@
 - **素材**：Emby 横版 Backdrop、竖版 Primary 或本地品牌画面；按最新入库、名称或固定随机种子排序。素材不可用时显示品牌画面及提示。
 - **输出**：静态 PNG/JPEG/WebP，尺寸可选 640×360、960×540、1280×720、1920×1080；GIF 轮播最多 6 幅不同的本库海报，每幅停留 1680ms，再用 4 帧共 320ms 渐变过渡，包含末幅到首幅的过渡；最高 960×540。素材少于两幅时返回静态 PNG。高分辨率静态输出由统一画布缩放生成。
 - **方案管理**：各虚拟库可独立设置，也可跟随默认方案；最多 20 个自定义方案，支持 JSON 导入/分享。
-- **历史封面**：当前库/全部库后台生成、进度、停止、预览、原图下载、恢复方案、删除。默认保留 30 批，可设 1–100 批，图片总量上限 256 MiB；页面展示最近 60 张。
+- **历史封面**：当前库/勾选库后台生成、进度、停止、预览、原图下载、恢复方案、卡片删除和全部清理。默认保留 30 批，可设 1–100 批，图片总量上限 256 MiB；页面展示最近 60 张。
 - **字体库**：内置 Noto Sans SC 中文字体；支持 TTF/TTC/OTF/WOFF/WOFF2 文件和公网 HTTPS 直链导入，单文件最多 24 MiB、最多 20 个上传字体。缺失字形回退到内置字体。
 - **配置页**：运行/Cron、事件维护、Emby 与专区范围、榜单、默认标题字体、历史保存、配置备份/导入和缓存清理。桌面、390px 手机页面均已实测。
 
@@ -35,7 +44,7 @@
 | 本插件虚拟媒体库 | 选择已有专区，“应用封面方案”更新 ImageTag，播放器下次请求按方案取材绘制；“生成当前封面”另保存管理端历史 |
 | Emby 原生媒体库 | 在“Emby 服务器”中选择服务器，点选对应的媒体库卡片。预览/保存方案/“生成当前封面”不改原库图片；点击“生成并更新原生库封面”才更新所选库的 Primary 图片 |
 
-主选择框以已配置的 Emby 服务器为单位。“预览整台服务器”逐库读取素材但不写入 Emby；“生成并应用整台服务器”逐库生成，先备份再更新该服务器各原生库图片，同时生成当前播放网关服务器的虚拟库历史。点选卡片可调整单库方案，同名库会显示 ID。服务器范围沿用插件已选择的 Emby；不会因封面操作切换播放网关。
+主选择框以已配置的 Emby 服务器为单位。先勾选目标；全选即可处理整台服务器。“预览已选库”逐库读取素材但不写入 Emby；“生成并应用已选库”按选择的方案模式生成，先备份再更新所选原生库图片，同时生成所选虚拟库历史并保存其播放端方案。点选卡片的编辑区域可调整单库，同名库显示 ID。服务器范围沿用插件已选择的 Emby；不会因封面操作切换播放网关。
 
 两类库共用四种布局、字体、海报优先级、Backdrop→Primary 回退、图片解码与去重。虚拟库保留图片标签并先从全部成员中挑选有图候选；原生库还通过 Emby ImageTypes 过滤寻找靠后的有图条目，避免前排缺图就直接放弃。图片请求仍有数量/时间/大小上限，源站超时或素材确实不可用时显示品牌画面及提示。
 
@@ -51,7 +60,7 @@
 
 [原生库界面](docs/previews/studio-native.png) · [原图备份](docs/previews/studio-native-history.png) · [配置页截图](docs/previews/studio-config.png) · [手机截图](docs/previews/studio-mobile.png) · [历史页截图](docs/previews/studio-history.png) · [GIF 演示](cover-preview.gif)
 
-截图和 GIF 使用构造元数据/原创示例图，不包含用户影片。新增诊断截图使用本地固定状态展示空库、单图和备份失败。此前曾对 NAS 做 4.4.1 的只读核验；用户本次截图显示已安装 4.5.0。本次 4.5.1 未连接或改动 NAS。4.3.11 的完整历史说明见 [docs/HISTORY-4.3.11.md](docs/HISTORY-4.3.11.md)。
+截图和 GIF 使用构造元数据/原创示例图，不包含用户影片。新增诊断截图使用本地固定状态展示空库、单图和备份失败。此前曾对 NAS 做 4.4.1 的只读核验；用户本次截图显示已安装 4.5.0。本次 4.5.2 未连接或改动 NAS。4.3.11 的完整历史说明见 [docs/HISTORY-4.3.11.md](docs/HISTORY-4.3.11.md)。
 
 ## 4.3.10 整体识别优化
 
@@ -115,12 +124,12 @@
 
 ## 上传和升级
 
-本地发布包：`releases/MediaArchiver-v4.5.1.zip`。解压后按原目录上传文件，不要只把 ZIP 放进仓库。
+本地发布包：`releases/MediaArchiver-v4.5.2.zip`。解压后按原目录上传文件，不要只把 ZIP 放进仓库。
 
 1. **完整覆盖 `plugins.v2/mediaarchiver/`**：包括 `__init__.py`、`coverstudio.py`、`requirements.txt`、`fonts/` 和 **`dist/assets/` 全部文件**。只上传主 Python 文件会缺失工坊组件。
-2. 更新根目录 **`package.v2.json`** 的 `MediaArchiver` 条目到 **4.5.1**；仓库有其他插件时保留它们。同步图标、说明、字体许可与校验文件。`frontend/` 是可复现源码，NAS 运行不需要 Node。
+2. 更新根目录 **`package.v2.json`** 的 `MediaArchiver` 条目到 **4.5.2**；仓库有其他插件时保留它们。同步图标、说明、字体许可与校验文件。`frontend/` 是可复现源码，NAS 运行不需要 Node。
 3. 刷新 MoviePilot 插件市场并升级，使 MP 安装插件依赖。随后重启 MoviePilot，确保旧网关代码退出。
-4. 检查 `http://NAS地址:3334/__mediaarchiver__/health`：`version` 和 `cover_engine` 应为 `4.5.1`，`code_sha256` 对照 `SHA256SUMS` 中主文件；`decoders.br/zstd` 应启用。
+4. 检查 `http://NAS地址:3334/__mediaarchiver__/health`：`version` 和 `cover_engine` 应为 `4.5.2`，`code_sha256` 对照 `SHA256SUMS` 中主文件；`decoders.br/zstd` 应启用。
 5. 打开插件配置保存原有专区设置，执行“一键重建”，再进入封面工坊。客户端继续连接 8098，并刷新媒体库/图片缓存。
 
 新版页面使用 MoviePilot v2 的 Vue 远程组件机制，管理接口校验管理员身份。仍保留旧的原生配置表单/状态页供兼容调用。完整工坊需宿主支持 Vue 插件页面和管理员依赖；本包未在你的实际 MP 镜像中安装验证。
@@ -141,7 +150,7 @@ Python 3.12、Node 20+。在独立虚拟环境执行（Windows 激活 `.venv/Scr
 python -m venv .venv
 # 激活后执行
 python -m pip install -r requirements-dev.txt
-python -m pytest tests/test_output_diagnostics.py tests/test_cover_size_limits.py tests/test_server_cover_workflow.py tests/test_native_covers.py tests/test_coverstudio.py tests/test_gateway_runtime.py -q -p no:cacheprovider
+python -m pytest tests/test_batch_selection.py tests/test_history_cleanup.py tests/test_output_diagnostics.py tests/test_cover_size_limits.py tests/test_server_cover_workflow.py tests/test_native_covers.py tests/test_coverstudio.py tests/test_gateway_runtime.py -q -p no:cacheprovider
 python tests/test_virtual_library.py
 python tests/test_accuracy.py
 python tests/test_animated_cover.py
@@ -154,8 +163,8 @@ cd ..
 python tests/preview_server.py
 ```
 
-另一个终端在项目根目录执行 `node tests/ui_smoke.mjs` 和 `node tests/ui_output_diagnostics.mjs`。Windows 自动使用已安装的 Edge；其他环境先在 `frontend/` 执行 `npx playwright install chromium`。测试服务仅监听随机回环端口，使用构造 Emby 数据；关闭终端即可退出，不是插件新增服务。
+另一个终端在项目根目录执行 `node tests/ui_smoke.mjs`、`node tests/ui_output_diagnostics.mjs`，另从全新 QA 服务执行 `node tests/ui_selection.mjs`。Windows 自动使用已安装的 Edge；其他环境先在 `frontend/` 执行 `npx playwright install chromium`。测试服务仅监听随机回环端口，使用构造 Emby 数据；关闭终端即可退出，不是插件新增服务。
 
 前端构建输出到插件 `dist/assets/`；`build:preview` 输出到项目父目录 `.work/preview`。本地测试文件和数据不会进入运行组件。
 
-本次 **87 项 pytest、4 个独立回归脚本、21 个浏览器场景**通过。浏览器包括 17 项真实本地 API 流程和 4 项固定诊断响应展示检查。详情见 [TEST_REPORT.md](TEST_REPORT.md)，交接说明见 [HANDOFF.md](HANDOFF.md)。不代表新包已部署或所有播放器、榜单均可用。本包未上传 GitHub、未部署。逐项现场验收见 [ACCEPTANCE.md](ACCEPTANCE.md)。
+本次 **117 项 pytest、4 个独立回归脚本、31 个浏览器场景**通过。浏览器包括 26 项真实本地 API 流程和 5 项固定诊断响应展示检查。详情见 [TEST_REPORT.md](TEST_REPORT.md)，交接说明见 [HANDOFF.md](HANDOFF.md)。不代表新包已部署或所有播放器、榜单均可用。本包未上传 GitHub、未部署。逐项现场验收见 [ACCEPTANCE.md](ACCEPTANCE.md)。

@@ -174,7 +174,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.1",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.2",
             },
             method=method.upper(),
         )
@@ -541,7 +541,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.5.1",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.5.2",
         }
         merged.update(headers or {})
         body = None
@@ -842,7 +842,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.1 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.5.2 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -1102,7 +1102,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.5.1"
+    plugin_version = "4.5.2"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"

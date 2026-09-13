@@ -15,21 +15,28 @@
 @media(prefers-reduced-motion:reduce){.ma-studio *{animation:none!important;transition:none!important}.ma-studio button:active{transform:none!important}}
 .ma-studio .ma-presets-panel > .ma-full + .ma-full { margin-top: 10px; }
 
-/* Server is the batch boundary; cards select a library only for editing. */
+/* Checkboxes define the batch; each separate card button opens its draft. */
 .ma-studio .ma-server-panel{margin:24px 0;padding:24px}
 .ma-server-head,.ma-server-toolbar{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap}
 .ma-server-head p{color:#9aacc0;max-width:650px;line-height:1.6;margin:8px 0}
 .ma-server-select{display:grid;gap:8px;min-width:250px;font-size:13px;color:#aab9cb}
 .ma-server-toolbar{margin:20px 0;font-size:13px;color:#9aacc0}
-.ma-library-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;max-height:390px;overflow:auto;padding:3px}
-.ma-library-card{display:flex;align-items:center;gap:12px;padding:9px;border:1px solid #2d3b4b;border-radius:14px;background:#101a24;text-align:left;color:#f1f5fb;min-width:0;cursor:pointer}
+.ma-batch-controls{display:grid;grid-template-columns:minmax(210px,280px) minmax(0,1fr);gap:20px;align-items:center;margin-top:18px;padding:16px;background:#122132;border:1px solid #2b4056;border-radius:14px}
+.ma-batch-controls p{font-size:12px;line-height:1.8;overflow-wrap:anywhere}.ma-batch-controls select{font-size:12px}
+.ma-selection-tools{display:flex;flex-wrap:wrap;align-items:center;gap:14px}.ma-selection-count{color:#d4e8fc;font-size:13px;font-variant-numeric:tabular-nums}
+.ma-library-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;max-height:440px;overflow:auto;padding:3px;margin-top:14px}
+.ma-library-card{padding:9px;border:1px solid #2d3b4b;border-radius:14px;background:#101a24;text-align:left;color:#f1f5fb;min-width:0}
+.ma-library-card.checked{border-color:#396384}.ma-library-check{display:flex;align-items:center;gap:8px;min-height:34px;margin-bottom:6px;cursor:pointer}.ma-library-check input{margin:0}
+.ma-library-editor{display:flex;align-items:center;gap:12px;width:100%;padding:0;background:none;border:0;text-align:left}.ma-library-editor>div:last-child{min-width:0}
 .ma-library-card.active{border-color:#1685ff;background:#132b45;box-shadow:0 0 0 1px #1685ff}
 .ma-library-art{width:84px;aspect-ratio:16/9;flex-shrink:0;display:grid;place-items:center;background:#1d2c3e;border-radius:7px;overflow:hidden;color:#70839a}
 .ma-library-art img{width:100%;height:100%;object-fit:cover}
-.ma-library-card>div:last-child{min-width:0}.ma-library-card strong{display:block;font-size:13px;overflow-wrap:anywhere}
+.ma-library-card strong{display:block;font-size:13px;overflow-wrap:anywhere}
 .ma-library-card span{display:block;color:#92a6bd;font-size:11px;margin-top:4px}
+.ma-library-card .ma-library-check span{margin:0;font-size:10px}.ma-library-card .ma-library-plan{color:#bad4ed}.ma-library-card .ma-draft-note{color:#e8bf7d}.ma-library-card .ma-library-editing{color:#66c6ff;font-weight:700}
+.ma-history-panel>.ma-section-head{align-items:flex-start;flex-wrap:wrap}.ma-icon-btn.ma-danger{color:#ffb9c3!important;border-color:#72414d;background:#37232c}
 @media(max-width:1100px){.ma-library-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.ma-library-art{width:60px}}
-@media(max-width:700px){.ma-studio .ma-server-panel{padding:16px}.ma-server-select{width:100%;min-width:0}.ma-library-grid{grid-template-columns:repeat(2,minmax(0,1fr));max-height:290px}.ma-library-card{flex-direction:column;align-items:stretch}.ma-library-art{width:100%}.ma-server-toolbar>.ma-inline{width:100%}}
+@media(max-width:700px){.ma-studio .ma-server-panel{padding:16px}.ma-server-select{width:100%;min-width:0}.ma-library-grid{grid-template-columns:repeat(2,minmax(0,1fr));max-height:390px}.ma-library-editor{flex-direction:column;align-items:stretch}.ma-library-art{width:100%}.ma-server-toolbar>.ma-inline{width:100%}.ma-batch-controls{grid-template-columns:1fr;gap:12px;padding:13px}.ma-batch-controls p{font-size:11px}.ma-library-editor{gap:9px}.ma-library-check{min-height:36px}.ma-history-panel>.ma-section-head>.ma-inline{width:100%}}
 
 /* Explain the real output beside each image, including intentional static output. */
 .ma-output-info{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;margin:12px 0;background:#122333;border:1px solid #2b4359;border-radius:12px}

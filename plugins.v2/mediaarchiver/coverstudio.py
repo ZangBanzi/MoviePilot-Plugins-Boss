@@ -118,7 +118,7 @@ def normalize_artwork(payload: bytes) -> bytes:
 
 
 class CoverStudio:
-    engine_version = "4.5.1"
+    engine_version = "4.5.2"
     def __init__(self, plugin):
         self.plugin = plugin
         self.lock = threading.RLock()
@@ -793,25 +793,57 @@ class CoverStudio:
                 for suffix in (".image", ".jpg"):
                     self._file("history", row["id"], suffix).unlink(missing_ok=True)
 
-    def start_generate(self, key: str = "", publish: bool = False, server: str = "") -> dict:
+    def start_generate(self, key: str = "", publish: bool = False, server: str = "",
+                       keys: list | None = None, options: dict | None = None) -> dict:
+        if keys is not None:
+            if (not server or key or not isinstance(keys, list) or not keys or len(keys) > 4096
+                    or any(not isinstance(value, str) or not value or len(value) > 180 for value in keys)):
+                raise ValueError("请选择服务器中的有效媒体库，勾选列表不能为空")
+            keys = list(dict.fromkeys(keys))
+        if key and server:
+            raise ValueError("单库与整台服务器范围不能同时指定")
         if publish and not server and not key.startswith("native:"):
             raise ValueError("更新原生库封面必须指定一个已读取的原生媒体库")
+        normalized = normalize_options(options) if options is not None else None
         client = self.client() if server or key.startswith("native:") else None
-        if server:
-            views = [dict(v) for v in self.load_native()]
-            gateway = self.plugin._gateway_client_cache
-            if gateway and gateway.api_root == client.api_root:
-                with self.plugin._proxy_lock:
-                    views.extend(dict(v) for v in self.plugin._virtual_views.values())
-        elif key:
-            views = [self.view(key)]
-        else:
-            with self.plugin._proxy_lock:
-                views = [dict(v) for v in self.plugin._virtual_views.values()]
-        if not views:
-            raise ValueError("没有可生成的虚拟库，请先保存配置并一键重建")
         if not self.job_lock.acquire(blocking=False):
             raise ValueError("封面生成正在进行中")
+        try:
+            if server:
+                if server != self.server_id(client):
+                    raise ValueError("所选服务器与当前操作范围不一致，请刷新后重试")
+                views = ([dict(v) for v in self.load_native()]
+                         if keys is None or any(k.startswith("native:") for k in keys) else [])
+                gateway = self.plugin._gateway_client_cache
+                if gateway and gateway.api_root == client.api_root:
+                    with self.plugin._proxy_lock:
+                        views.extend(copy.deepcopy(v) for v in self.plugin._virtual_views.values())
+                if keys is not None:
+                    catalog = {view["key"]: view for view in views}
+                    if any(value not in catalog for value in keys):
+                        raise ValueError("勾选库已失效或不属于此服务器，请刷新后重新选择")
+                    views = [catalog[value] for value in keys]
+            elif key:
+                views = [copy.deepcopy(self.view(key))]
+            else:
+                with self.plugin._proxy_lock:
+                    views = [copy.deepcopy(v) for v in self.plugin._virtual_views.values()]
+            if not views:
+                raise ValueError("没有可生成的媒体库，请先读取媒体库或重建虚拟库")
+            with self.lock:
+                # Persist the same explicit plan to every selected target in one write.
+                # This also updates virtual playback tags, not just history thumbnails.
+                if normalized is not None:
+                    cfg = copy.deepcopy(self.config)
+                    overrides = cfg.setdefault("overrides", {})
+                    for view in views:
+                        overrides[view["key"]] = dict(normalized)
+                    self._save_studio(cfg)
+                # Freeze each plan now: later default/config changes cannot switch layouts mid-batch.
+                plans = [(view, self.options(view)) for view in views]
+        except Exception:
+            self.job_lock.release()
+            raise
         self.cancel.clear()
         self.job = {"running": True, "done": 0, "total": len(views), "failed": 0,
                     "animated": 0, "static": 0, "fallback": 0, "message": "准备生成"}
@@ -821,11 +853,10 @@ class CoverStudio:
             batch = uuid.uuid4().hex
             rows = []
             try:
-                for view in views:
+                for view, options in plans:
                     if self.cancel.is_set() or self.plugin._stopping:
                         break
                     try:
-                        options = self.options(view)
                         art, notices = self.admin_artwork(view, options)
                         report = {}
                         mime, payload = self.encode(view, options, art, "gif" if options["animated"] else "png", report)
@@ -843,7 +874,7 @@ class CoverStudio:
                             self.job["fallback"] += 1
                         self.job.setdefault("results", []).append({"key": view["key"], "name": view["name"],
                             "native": bool(view.get("native")), "artwork_count": report["artwork_count"], "mime": mime,
-                            "render_info": report,
+                            "render_info": report, "style": options["style"],
                             "status": "published" if publish and view.get("native") else "generated",
                             "notice": "；".join(notices)})
                         self.job["message"] = view["name"] + (" · 已生成 GIF" if mime == "image/gif" else " · 已生成静态封面")
@@ -867,7 +898,13 @@ class CoverStudio:
                 self._client_context.client = None
                 self.job["running"] = False
                 self.job_lock.release()
-        threading.Thread(target=work, name="MediaArchiverCoverStudio", daemon=True).start()
+        try:
+            threading.Thread(target=work, name="MediaArchiverCoverStudio", daemon=True).start()
+        except Exception:
+            self.job["running"] = False
+            self.job["message"] = "生成任务未能启动，请重试"
+            self.job_lock.release()
+            raise
         return dict(self.job)
 
     def state(self) -> dict:
@@ -979,7 +1016,63 @@ class CoverStudio:
             payload = self._file("history", identifier, ".image").read_bytes()
         return {"image": data_uri(payload, row["mime"]), "mime": row["mime"], "name": row["name"]}
 
+    def delete_history(self, identifier: str | None = None, clear_all: bool = False) -> dict:
+        """Remove local history only; serialize with generation and native restoration."""
+        if not self.job_lock.acquire(blocking=False):
+            raise ValueError("封面正在生成或恢复，完成或停止后再清理历史")
+        try:
+            with self.lock:
+                directory = (self.root / "history").resolve()
+                if directory.parent != self.root.resolve():
+                    raise ValueError("历史目录超出插件数据目录，已停止清理")
+                rows = self._read_index("history")
+                if not clear_all:
+                    self._file("history", identifier, ".image")
+                selected = rows if clear_all else [row for row in rows if row["id"] == identifier]
+                if not clear_all and not selected:
+                    raise ValueError("历史封面已不存在")
+                identifiers = {row["id"] for row in selected}
+                indexed_ids = set(identifiers)
+                if clear_all and directory.is_dir():
+                    # Retry leftovers from interrupted cleanups, never recurse or touch unrelated files.
+                    identifiers.update(path.stem for path in directory.iterdir()
+                        if re.fullmatch(r"[0-9a-f]{32}\.(image|jpg)", path.name) and path.is_file())
+                paths = {value: [self._file("history", value, suffix) for suffix in (".jpg", ".image")]
+                         for value in identifiers}
+                if any(path.stem != value for value, files in paths.items() for path in files):
+                    raise ValueError("历史文件指向其他记录，已停止清理")
+                retained = [row for row in rows if row["id"] not in identifiers]
+                # A failed index write must leave all original files untouched.
+                self._write_index("history", retained)
+                failed = set()
+                for value, files in paths.items():
+                    try:
+                        # If thumbnail removal fails, retain the downloadable original too.
+                        for path in files:
+                            path.unlink(missing_ok=True)
+                    except OSError:
+                        failed.add(value)
+                if failed:
+                    retained = [row for row in rows if row["id"] not in identifiers or row["id"] in failed]
+                    try:
+                        self._write_index("history", retained)
+                    except OSError:
+                        raise ValueError("部分历史文件未能清理且索引恢复失败，请重试“清空全部历史”") from None
+                deleted = sum(row["id"] not in failed for row in selected)
+                orphan_deleted = len(identifiers - indexed_ids - failed)
+                message = f"已清理 {deleted} 张历史封面"
+                if orphan_deleted:
+                    message += f"，清理 {orphan_deleted} 项残留文件"
+                if failed:
+                    message += f"，{len(failed)} 项文件未能删除，请重试清理"
+                return {"deleted": deleted, "failed": len(failed), "remaining": len(retained),
+                        "orphan_deleted": orphan_deleted, "message": message}
+        finally:
+            self.job_lock.release()
+
     def action(self, data: dict) -> dict:
+        if data.get("action") in {"delete_history", "clear_history"}:
+            return self._action(data)
         key = str(data.get("key") or "")
         if data.get("action") in {"restore_native_image", "restore_history"}:
             with self.lock:
@@ -996,7 +1089,13 @@ class CoverStudio:
         if action == "save_options":
             return {"options": self.save_options(str(data.get("key") or ""), data.get("options"), data.get("scope") == "global")}
         if action == "generate":
-            return self.start_generate(str(data.get("key") or ""), data.get("publish") is True, str(data.get("server") or "") if data.get("all_server") is True else "")
+            if "keys" in data and not isinstance(data["keys"], list):
+                raise ValueError("勾选列表必须是数组")
+            if "options" in data and not isinstance(data["options"], dict):
+                raise ValueError("封面参数必须是对象")
+            return self.start_generate(str(data.get("key") or ""), data.get("publish") is True,
+                                       str(data.get("server") or "") if data.get("all_server") is True or "keys" in data else "",
+                                       data.get("keys"), data.get("options"))
         if action == "load_native":
             return {"count": len(self.load_native())}
         if action == "restore_native_image":
@@ -1021,6 +1120,12 @@ class CoverStudio:
             return self.import_font_url(data)
         if action == "history_image":
             return self.history_image(str(data.get("id")))
+        if action == "delete_history":
+            return self.delete_history(data.get("id"))
+        if action == "clear_history":
+            if data.get("confirm") is not True:
+                raise ValueError("请确认清空全部历史封面；此操作也会删除历史中的原生封面备份")
+            return self.delete_history(clear_all=True)
         with self.lock:
             if action == "save_preset":
                 cfg = copy.deepcopy(self.config)
@@ -1042,17 +1147,12 @@ class CoverStudio:
                 cfg.setdefault("overrides", {}).pop(str(data.get("key")), None)
                 self._save_studio(cfg)
                 return {}
-            if action in {"restore_history", "delete_history"}:
+            if action == "restore_history":
                 rows = self._read_index("history")
                 row = next((r for r in rows if r["id"] == data.get("id")), None)
                 if row is None:
                     raise ValueError("历史封面已不存在")
-                if action == "restore_history":
-                    return {"options": self.save_options(row["key"], row["options"])}
-                self._write_index("history", [r for r in rows if r["id"] != row["id"]])
-                for suffix in (".image", ".jpg"):
-                    self._file("history", row["id"], suffix).unlink(missing_ok=True)
-                return {}
+                return {"options": self.save_options(row["key"], row["options"])}
             if action == "backup":
                 identifier = uuid.uuid4().hex
                 snapshot = {"format": "mediaarchiver-config-v1", "version": self.plugin.plugin_version,

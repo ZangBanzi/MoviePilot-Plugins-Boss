@@ -12,6 +12,10 @@ const tab = ref('generate')
 const configTab = ref('settings')
 const selected = ref('')
 const selectedServer = ref('')
+const checkedKeys = ref([])
+const batchMode = ref('current')
+const drafts = reactive({})
+let selectionInitialized = false
 const libraryPreviews = ref({})
 const libraryOutputs = ref({})
 const galleryBusy = ref(false)
@@ -48,6 +52,7 @@ let previewTimer, pollTimer, toastTimer, previewId = 0, disposed = false, suppre
 const clone = value => JSON.parse(JSON.stringify(value))
 const server = computed(() => state.value?.cover_servers?.find(s => s.id === selectedServer.value))
 const libraries = computed(() => [...(server.value?.gateway ? (state.value?.views || []) : []), ...(state.value?.native_views || []).filter(v => v.server === selectedServer.value)])
+const checkedLibraries = computed(() => libraries.value.filter(library => checkedKeys.value.includes(library.key)))
 const view = computed(() => libraries.value.find(v => v.key === selected.value))
 const job = computed(() => state.value?.job || {})
 const runtime = computed(() => state.value?.runtime || {})
@@ -118,6 +123,32 @@ async function setOptions(value) {
   await nextTick()
   suppressWatch = false
 }
+function rememberDraft() {
+  if (!selected.value) return
+  if (isDirty.value) drafts[selected.value] = clone(options)
+  else delete drafts[selected.value]
+}
+function reconcileSelection() {
+  const available = libraries.value.map(library => library.key)
+  checkedKeys.value = selectionInitialized ? checkedKeys.value.filter(key => available.includes(key)) : available
+}
+function selectLibraries(mode) {
+  selectionInitialized = true
+  checkedKeys.value = mode === 'all' ? libraries.value.map(library => library.key)
+    : libraries.value.filter(library => !checkedKeys.value.includes(library.key)).map(library => library.key)
+}
+function toggleLibrary(key, checked) {
+  selectionInitialized = true
+  checkedKeys.value = checked ? [...new Set([...checkedKeys.value, key])] : checkedKeys.value.filter(value => value !== key)
+}
+function batchOptions(library) {
+  return clone(batchMode.value === 'current' ? options : library.options)
+}
+function libraryPlan(library) {
+  const style = checkedKeys.value.includes(library.key) ? batchOptions(library).style
+    : library.key === selected.value ? options.style : drafts[library.key]?.style || library.options?.style
+  return state.value.presets.find(preset => preset.id === style)?.name || '自定义方案'
+}
 async function load(preserve = false) {
   error.value = ''
   try {
@@ -125,11 +156,12 @@ async function load(preserve = false) {
     if (disposed) return
     state.value = data
     if (!data.cover_servers?.some(s => s.id === selectedServer.value)) selectedServer.value = data.cover_servers?.[0]?.id || ''
+    reconcileSelection()
     if (!preserve) {
       config.value = { ...clone(data.defaults), ...clone(data.config), ...clone(props.initialConfig) }
       config.value.cover_studio = { defaults: clone(data.options), history_enabled: true, history_limit: 30, overrides: {}, presets: [], ...clone(data.studio_config) }
       if (!libraries.value.some(v => v.key === selected.value)) selected.value = libraries.value[0]?.key || ''
-      await setOptions(view.value?.options || data.options)
+      await setOptions(drafts[selected.value] || view.value?.options || data.options)
       scope.value = selected.value ? 'view' : 'global'
     }
     loaded.value = true
@@ -137,23 +169,27 @@ async function load(preserve = false) {
   } catch (err) { error.value = err.message || '加载失败，请检查插件依赖与连接' }
 }
 async function chooseLibrary(key = selected.value) {
+  rememberDraft()
   ++previewId
   selected.value = key
   preview.value = libraryPreviews.value[key] || ''
   previewOutput.value = libraryOutputs.value[key] || null
   previewNotices.value = []
   playingPreview.value = false
-  await setOptions(view.value?.options || state.value.options)
+  await setOptions(drafts[key] || view.value?.options || state.value.options)
   refreshPreview()
 }
 function loadNative() {
   return attempt(async () => {
     const result = await action('load_native'); await load(true)
-    if (!selected.value && state.value.native_views.length) { selected.value = state.value.native_views[0].key; await chooseLibrary() }
+    selectionInitialized = true
+    if (!selected.value && libraries.value.length) await chooseLibrary(libraries.value[0].key)
     message(`已读取 ${result.count} 个原生媒体库，每个库分别从自身影片取材`)
   })
 }
 async function chooseServer() {
+  if (selected.value) drafts[selected.value] = clone(options)
+  selectionInitialized = false; checkedKeys.value = []
   ++previewId
   selected.value = ''; preview.value = ''; previewOutput.value = null
   await loadNative()
@@ -161,11 +197,12 @@ async function chooseServer() {
   await chooseLibrary()
 }
 async function previewServer() {
-  if (galleryBusy.value) return
+  if (galleryBusy.value || !checkedLibraries.value.length) return
   galleryBusy.value = true
   const owner = selectedServer.value
+  const targets = checkedLibraries.value.map(library => ({ key: library.key, options: batchOptions(library) }))
   try {
-    for (const library of libraries.value) {
+    for (const library of targets) {
       if (disposed || owner !== selectedServer.value) break
       const data = await action('preview', { key: library.key, options: library.options, animated: false })
       libraryPreviews.value[library.key] = data.image
@@ -176,8 +213,12 @@ async function previewServer() {
 }
 function generateServer() {
   return attempt(async () => {
-    if (isDirty.value && selected.value) await saveOptions()
-    state.value.job = await action('generate', { all_server: true, publish: true })
+    const keys = checkedLibraries.value.map(library => library.key)
+    if (!keys.length) throw new Error('请至少选择一个媒体库')
+    const plan = clone(options)
+    state.value.job = await action('generate', { keys, publish: true, ...(batchMode.value === 'current' ? { options: plan } : {}) })
+    if (batchMode.value === 'current') for (const key of keys) delete drafts[key]
+    await load(true)
   }, '已开始逐库生成，原生库更新前自动备份')
 }
 async function refreshPreview(animated = false) {
@@ -202,6 +243,7 @@ async function refreshPreview(animated = false) {
 }
 watch(options, () => {
   if (suppressWatch || !loaded.value || props.settings) return
+  rememberDraft()
   ++previewId // Discard any in-flight render immediately when the draft changes.
   clearTimeout(previewTimer)
   previewTimer = setTimeout(() => refreshPreview(), 450)
@@ -227,14 +269,16 @@ async function poll() {
 }
 async function saveOptions() {
   await action('save_options', { key: selected.value, scope: scope.value, options: clone(options) })
+  if (scope.value === 'view') delete drafts[selected.value]
   await load(true)
 }
 function applyOptions() { return attempt(saveOptions, scope.value === 'global' ? '已保存默认方案，独立配置的媒体库保留自己的方案' : view.value?.native ? '原生库方案已保存，点击更新按钮后写入 Emby' : '当前虚拟库封面已更新') }
 function generate(all = false, publish = false) {
   return attempt(async () => {
-    if (isDirty.value) await saveOptions()
-    const job = await action('generate', { key: all ? '' : selected.value, publish })
+    const job = await action('generate', { key: all ? '' : selected.value, publish, options: clone(options) })
+    delete drafts[selected.value]
     state.value.job = job
+    await load(true)
   }, '已开始生成，可在历史封面中查看结果')
 }
 function choosePreset(preset) {
@@ -295,15 +339,31 @@ function restoreHistory(row) {
   attempt(async () => {
     if (row.native) await action('load_native')
     await action('restore_history', { id: row.id }); await load(true)
-    selected.value = row.key; await chooseLibrary(); tab.value = 'generate'; selectedHistory.value = null
+    delete drafts[row.key]; selected.value = ''; await chooseLibrary(row.key); tab.value = 'generate'; selectedHistory.value = null
   }, '已恢复历史方案；素材继续按当前用户权限获取')
 }
 function restoreNativeImage(row) {
   attempt(async () => { await action('restore_native_image', { id: row.id }); selectedHistory.value = null; await load(true) }, '原生库图片已恢复，更新前的图片也已保存到历史')
 }
 function deleteHistory(row) {
-  if (!window.confirm(`删除“${row.name}”的这张历史封面？`)) return
-  attempt(async () => { await action('delete_history', { id: row.id }); selectedHistory.value = null; await load(true) }, '历史封面已删除')
+  if (!window.confirm(`删除“${row.name}”的这张历史封面${row.purpose === 'before_native_publish' ? '及其原图备份' : ''}？已应用的 Emby 封面与方案设置保持不变。`)) return
+  attempt(async () => {
+    const result = await action('delete_history', { id: row.id })
+    selectedHistory.value = null; await load(true)
+    message(result.message || '历史封面已删除', result.failed > 0)
+  })
+}
+function clearHistory() {
+  const count = state.value.history_count || 0
+  const question = count ? `清空所有服务器的全部 ${count} 张历史封面？包含所有批次的原图备份，清理后无法从这里恢复。`
+    : '清理所有服务器的历史残留文件？包含未被历史索引记录的原图备份。'
+  if (!window.confirm(`${question}已应用的 Emby 封面与方案设置保持不变。`)) return
+  attempt(async () => {
+    const result = await action('clear_history', { confirm: true })
+    selectedHistory.value = null
+    await load(true)
+    message(result.message || `已清理 ${result.deleted} 张历史封面`, result.failed > 0)
+  })
 }
 function backup() {
   attempt(async () => { const data = await action('backup'); await load(true); downloadJson(data.backup, '媒体虚拟库-配置备份.json') }, '备份已保存到插件数据目录并下载')
@@ -380,14 +440,14 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
           <div class="ma-heading"><span class="ma-ghost" aria-hidden="true">{{ settings ? 'Configuration' : 'BOSS Cover Studio' }}</span><h1>{{ settings ? '配置' : '媒体虚拟库 · 封面工坊' }}</h1><p>为每一个片库，留一个好看的入口。</p></div>
         </div>
         <div class="ma-toolbar">
-          <button v-if="!settings" class="ma-icon-btn ma-play" title="生成服务器封面" aria-label="生成服务器封面" :disabled="busy || job.running || !selectedServer" @click="generateServer"><Icon name="play" /></button>
+          <button v-if="!settings" class="ma-icon-btn ma-play" title="生成已选媒体库封面" aria-label="生成已选媒体库封面" :disabled="busy || job.running || galleryBusy || !checkedLibraries.length" @click="generateServer"><Icon name="play" /></button>
           <button v-if="settings" class="ma-icon-btn ma-play" title="保存配置" aria-label="保存配置" :disabled="busy || !loaded" @click="saveConfig"><Icon name="save" /></button>
           <button class="ma-icon-btn" :title="settings ? '返回封面工坊' : '打开配置'" :aria-label="settings ? '返回封面工坊' : '打开配置'" @click="emit('switch')"><Icon :name="settings ? 'image' : 'settings'" /></button>
           <button class="ma-icon-btn" title="关闭" aria-label="关闭" @click="emit('close')"><Icon name="close" /></button>
         </div>
       </div>
       <div class="ma-hero-bottom">
-        <div class="ma-badges"><span><i :class="{ on: runtime.proxy?.running }"></i>{{ runtime.proxy?.running ? '虚拟库已启用' : '等待启用' }}</span><span>{{ activePreset?.name || '封面工坊' }}</span><span>{{ options.animated ? '动态 GIF' : '静态封面' }}</span><span>v{{ state?.version || '4.5.1' }}</span></div>
+        <div class="ma-badges"><span><i :class="{ on: runtime.proxy?.running }"></i>{{ runtime.proxy?.running ? '虚拟库已启用' : '等待启用' }}</span><span>{{ activePreset?.name || '封面工坊' }}</span><span>{{ options.animated ? '动态 GIF' : '静态封面' }}</span><span>v{{ state?.version || '4.5.2' }}</span></div>
         <nav v-if="!settings" class="ma-tabs" aria-label="工坊页面"><button v-for="t in [['generate','封面生成'],['history','历史封面'],['status','运行状态']]" :key="t[0]" :class="{ active: tab === t[0] }" :aria-current="tab === t[0] ? 'page' : undefined" @click="tab=t[0]">{{ t[1] }}<span v-if="t[0] === 'history' && state?.history_count">{{ state.history_count }}</span></button></nav>
         <nav v-else class="ma-tabs" aria-label="配置页面"><button :class="{ active: configTab === 'settings' }" @click="configTab='settings'"><Icon name="layout" :size="17" />配置</button><button :class="{ active: configTab === 'titles' }" @click="configTab='titles'">T&nbsp; 默认标题与字体</button></nav>
       </div>
@@ -402,8 +462,10 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
       <section v-if="tab === 'generate'" class="ma-panel ma-server-panel">
         <div class="ma-server-head"><div><span class="ma-eyebrow">SERVER COLLECTION</span><h2>整台服务器，一次生成</h2><p>每个媒体库读取自己的影片海报，分别生成封面。原生图片更新前自动备份。</p></div>
           <div class="ma-server-select"><label for="ma-server">Emby 服务器</label><select id="ma-server" v-model="selectedServer" :disabled="busy || job.running || galleryBusy" @change="chooseServer"><option v-if="!state.cover_servers?.length" value="">请先在 MoviePilot 配置 Emby</option><option v-for="item in state.cover_servers" :key="item.id" :value="item.id">{{ item.name }} · {{ item.gateway ? '原生库 + 虚拟库' : '原生库' }}</option></select></div></div>
-        <div class="ma-server-toolbar"><span>{{ libraries.length }} 个媒体库 · 点选卡片调整独立方案</span><div class="ma-inline ma-wrap"><button class="ma-btn ma-small" :disabled="busy || job.running || !selectedServer" @click="loadNative"><Icon name="refresh" :size="16" />刷新媒体库</button><button class="ma-btn ma-small" :disabled="galleryBusy || busy || job.running || !libraries.length" @click="previewServer">{{ galleryBusy ? '逐库预览中…' : '预览整台服务器' }}</button><button class="ma-btn ma-primary ma-small" :disabled="busy || job.running || !selectedServer" @click="generateServer"><Icon name="play" :size="16" />生成并应用整台服务器</button></div></div>
-        <div class="ma-library-grid"><button v-for="library in libraries" :key="library.key" class="ma-library-card" :class="{active: selected === library.key}" :aria-pressed="selected === library.key" :data-library-key="library.key" :disabled="busy || job.running" @click="chooseLibrary(library.key)"><div class="ma-library-art"><img v-if="libraryPreviews[library.key] || state.history.find(h => h.key === library.key && h.purpose !== 'before_native_publish')?.thumbnail" :src="libraryPreviews[library.key] || state.history.find(h => h.key === library.key && h.purpose !== 'before_native_publish')?.thumbnail" alt="" /><Icon v-else name="image" :size="28" /></div><div><strong>{{ library.name }}</strong><span>{{ library.native ? '原生库' : '虚拟库' }}{{ libraries.filter(v => v.name === library.name).length > 1 ? ' · ' + library.id : '' }}{{ library.customized ? ' · 独立方案' : ' · 默认方案' }}</span><span v-if="libraryOutput(library.key)" class="ma-library-output">{{ libraryOutputs[library.key] ? '预览' : '最近生成' }} {{ formatLabel(libraryOutput(library.key)) }}</span><small v-if="outputMessage(libraryOutput(library.key))" class="ma-output-note">{{ outputMessage(libraryOutput(library.key)) }}</small></div></button></div>
+        <div class="ma-batch-controls"><div><label for="ma-batch-mode">批量封面方案</label><select id="ma-batch-mode" v-model="batchMode" :disabled="busy || job.running || galleryBusy"><option value="current">统一使用当前方案</option><option value="saved">使用各库已保存方案</option></select></div><p v-if="batchMode === 'current'">已选库统一使用当前的「{{ activePreset?.name || '自定义' }}」方案，包括标题、字体、配色与动图设置。主标题留空会跟随各库名称。</p><p v-else>使用各库已保存的方案。草稿不会自动应用，请先保存单库方案；未保存的修改继续保留在本页。</p></div>
+        <div class="ma-server-toolbar"><div class="ma-selection-tools"><strong role="status" class="ma-selection-count">已选 {{ checkedLibraries.length }} / {{ libraries.length }} 个媒体库</strong><div class="ma-inline"><button class="ma-btn ma-small" :disabled="busy || job.running || galleryBusy || !libraries.length" @click="selectLibraries('all')">全选</button><button class="ma-btn ma-small" :disabled="busy || job.running || galleryBusy || !libraries.length" @click="selectLibraries('invert')">反选</button></div></div><div class="ma-inline ma-wrap"><button class="ma-btn ma-small" :disabled="busy || job.running || galleryBusy || !selectedServer" @click="loadNative"><Icon name="refresh" :size="16" />刷新媒体库</button><button class="ma-btn ma-small" :disabled="galleryBusy || busy || job.running || !checkedLibraries.length" @click="previewServer">{{ galleryBusy ? '逐库预览中…' : '预览已选库' }}</button><button class="ma-btn ma-primary ma-small" :disabled="busy || job.running || galleryBusy || !checkedLibraries.length" @click="generateServer"><Icon name="play" :size="16" />生成并应用已选库</button></div></div>
+        <p class="ma-note">勾选框决定批量范围；点击封面或名称编辑单库，切换时保留未保存的修改。</p>
+        <div class="ma-library-grid"><article v-for="library in libraries" :key="library.key" class="ma-library-card" :class="{active: selected === library.key, checked: checkedKeys.includes(library.key)}" :data-library-key="library.key"><label class="ma-library-check" @click.stop><input type="checkbox" :checked="checkedKeys.includes(library.key)" :aria-label="`选择媒体库 ${library.name}${libraries.filter(v => v.name === library.name).length > 1 ? ' ' + library.id : ''}`" :disabled="busy || job.running || galleryBusy" @change="toggleLibrary(library.key, $event.target.checked)" /><span>{{ checkedKeys.includes(library.key) ? '已选择' : '未选择' }}</span></label><button class="ma-library-editor" :aria-pressed="selected === library.key" :aria-label="`编辑媒体库 ${library.name}${libraries.filter(v => v.name === library.name).length > 1 ? ' ' + library.id : ''}`" :disabled="busy || job.running || galleryBusy" @click="chooseLibrary(library.key)"><div class="ma-library-art"><img v-if="libraryPreviews[library.key] || state.history.find(h => h.key === library.key && h.purpose !== 'before_native_publish')?.thumbnail" :src="libraryPreviews[library.key] || state.history.find(h => h.key === library.key && h.purpose !== 'before_native_publish')?.thumbnail" alt="" /><Icon v-else name="image" :size="28" /></div><div><strong>{{ library.name }}</strong><span>{{ library.native ? '原生库' : '虚拟库' }}{{ libraries.filter(v => v.name === library.name).length > 1 ? ' · ' + library.id : '' }}</span><span class="ma-library-plan">{{ libraryPlan(library) }} · {{ batchMode === 'current' && checkedKeys.includes(library.key) ? '批量统一方案' : library.customized ? '独立方案' : '默认方案' }}</span><span v-if="drafts[library.key]" class="ma-draft-note">有未保存修改</span><span v-if="selected === library.key" class="ma-library-editing">正在编辑</span><span v-if="libraryOutput(library.key)" class="ma-library-output">{{ libraryOutputs[library.key] ? '预览' : '最近生成' }} {{ formatLabel(libraryOutput(library.key)) }}</span><small v-if="outputMessage(libraryOutput(library.key))" class="ma-output-note">{{ outputMessage(libraryOutput(library.key)) }}</small></div></button></article></div>
         <p v-if="!libraries.length" class="ma-note">选择 Emby 服务器后读取媒体库。未开启虚拟库时，也能生成原生库封面。</p>
         <p v-if="job.done && !job.running" class="ma-note" role="status">{{ job.message }} · {{ jobSummary }} <button class="ma-text-btn" @click="tab='status'">查看逐库结果</button></p>
       </section>
@@ -435,7 +497,7 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
           </div>
           <div v-else class="ma-fields ma-edit-fields"><label v-for="field in layoutFields" :key="field[0]">{{ field[1] }}<output>{{ options[field[0]] }}</output><input v-model.number="options[field[0]]" type="range" :aria-label="field[1]" :min="field[2]" :max="field[3]" /></label><label>强调色<input v-model="options.accent" type="text" placeholder="自动使用专区品牌色" pattern="#[0-9a-fA-F]{6}" maxlength="7" /></label><label>背景色<input v-model="options.background" type="text" placeholder="自动使用专区背景色" maxlength="7" /></label><label>标题颜色<input v-model="options.foreground" type="color" /></label></div>
           <footer class="ma-apply-bar"><label class="ma-check"><input v-model="options.show_count" type="checkbox" />显示说明文字</label><div class="ma-inline"><select v-model="scope" aria-label="应用范围"><option v-if="selected" value="view">仅当前媒体库</option><option value="global">设为默认方案</option></select><button class="ma-btn ma-primary" :disabled="busy" @click="applyOptions"><Icon name="check" :size="17" />{{ isDirty ? '应用封面方案' : '保存方案设置' }}</button></div></footer>
-          <p v-if="view?.customized" class="ma-note">当前库使用独立方案。<button class="ma-text-btn" @click="attempt(async () => { await action('reset_override',{key:selected}); await load(true); await chooseLibrary() },'已恢复使用默认方案')">恢复跟随默认方案</button></p>
+          <p v-if="view?.customized" class="ma-note">当前库使用独立方案。<button class="ma-text-btn" @click="attempt(async () => { await action('reset_override',{key:selected}); await load(true); delete drafts[selected]; await setOptions(view?.options || state.options); refreshPreview() },'已恢复使用默认方案')">恢复跟随默认方案</button></p>
         </section>
 
         <aside class="ma-panel ma-presets-panel"><div class="ma-section-head"><div><span class="ma-eyebrow">PRESETS</span><h2>封面方案</h2></div><label class="ma-mode"><span>静态</span><input v-model="options.animated" type="checkbox" aria-label="动态封面" /><span class="ma-toggle"></span><span>动图</span></label></div>
@@ -448,7 +510,7 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
         </aside>
       </main>
 
-      <section v-else-if="tab === 'history'" class="ma-panel ma-history-panel"><div class="ma-section-head"><div><span class="ma-eyebrow">TIME MACHINE</span><h2>历史封面</h2><p>按生成批次保存，展示最近 60 张封面。</p></div><button class="ma-btn" @click="attempt(() => load(true))"><Icon name="refresh" :size="17" />刷新</button></div><div v-if="!historyGroups.length" class="ma-empty"><Icon name="history" :size="44" /><h3>你的第一张封面，还在等你</h3><p>选择方案并生成封面，历史记录会保存在这里。</p><button class="ma-btn ma-primary" @click="tab='generate'">去生成封面</button></div><section v-for="group in historyGroups" :key="group.id" class="ma-history-batch"><div class="ma-batch-title"><h3>{{ group.created }}</h3><span>{{ group.rows.length }} 张封面</span></div><div class="ma-history-grid"><article v-for="row in group.rows" :key="row.id" class="ma-history-card" :data-output-reason="row.render_info?.reason"><button class="ma-history-image" @click="openHistory(row)"><img :src="row.thumbnail" :alt="row.name" loading="lazy" /><span>{{ formatLabel(row) }}</span></button><div><strong>{{ row.name }}{{ row.purpose === 'before_native_publish' ? ' · 更新前备份' : '' }}</strong><p v-if="outputMessage(row)" class="ma-output-note">{{ outputMessage(row) }}</p><div class="ma-inline"><button class="ma-icon-btn ma-small" title="恢复此方案" aria-label="恢复此方案" :disabled="busy || job.running" @click="restoreHistory(row)"><Icon name="history" :size="17" /></button><button class="ma-icon-btn ma-small" title="查看与下载" aria-label="查看与下载" @click="openHistory(row)"><Icon name="download" :size="17" /></button></div></div></article></div></section></section>
+      <section v-else-if="tab === 'history'" class="ma-panel ma-history-panel"><div class="ma-section-head"><div><span class="ma-eyebrow">TIME MACHINE</span><h2>历史封面</h2><p>共 {{ state.history_count || 0 }} 张，展示最近 60 张。清理仅移除历史文件与原图备份，已应用的封面和方案保留。</p></div><div class="ma-inline ma-wrap"><button class="ma-btn" :disabled="busy || job.running" @click="attempt(() => load(true))"><Icon name="refresh" :size="17" />刷新</button><button class="ma-btn ma-danger" :disabled="busy || job.running" @click="clearHistory"><Icon name="trash" :size="17" />{{ state.history_count ? `清空全部历史（${state.history_count}）` : '清理历史残留' }}</button></div></div><div v-if="!historyGroups.length" class="ma-empty"><Icon name="history" :size="44" /><h3>你的第一张封面，还在等你</h3><p>选择方案并生成封面，历史记录会保存在这里。</p><button class="ma-btn ma-primary" @click="tab='generate'">去生成封面</button></div><section v-for="group in historyGroups" :key="group.id" class="ma-history-batch"><div class="ma-batch-title"><h3>{{ group.created }}</h3><span>{{ group.rows.length }} 张封面</span></div><div class="ma-history-grid"><article v-for="row in group.rows" :key="row.id" class="ma-history-card" :data-history-id="row.id" :data-output-reason="row.render_info?.reason"><button class="ma-history-image" @click="openHistory(row)"><img :src="row.thumbnail" :alt="row.name" loading="lazy" /><span>{{ formatLabel(row) }}</span></button><div><strong>{{ row.name }}{{ row.purpose === 'before_native_publish' ? ' · 更新前备份' : '' }}</strong><p v-if="outputMessage(row)" class="ma-output-note">{{ outputMessage(row) }}</p><div class="ma-inline"><button class="ma-icon-btn ma-small" title="恢复此方案" aria-label="恢复此方案" :disabled="busy || job.running" @click="restoreHistory(row)"><Icon name="history" :size="17" /></button><button class="ma-icon-btn ma-small" title="查看与下载" aria-label="查看与下载" @click="openHistory(row)"><Icon name="download" :size="17" /></button><button class="ma-icon-btn ma-small ma-danger" title="删除历史封面" aria-label="删除历史封面" :disabled="busy || job.running" @click="deleteHistory(row)"><Icon name="trash" :size="17" /></button></div></div></article></div></section></section>
 
       <section v-else class="ma-panel ma-status-panel">
         <section v-if="job.done || job.running || job.errors?.length" class="ma-output-results" aria-label="最近封面生成结果">
@@ -474,10 +536,10 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
       <template v-else><section class="ma-config-card"><span class="ma-eyebrow">TYPOGRAPHY</span><h2>默认标题与字体</h2><p>新建封面使用以下默认值，独立配置的虚拟库保留各自设置。</p><div class="ma-fields ma-edit-fields"><label>默认主标题<input v-model="config.cover_studio.defaults.title" placeholder="留空跟随每个虚拟库名称" maxlength="160" /></label><label>默认副标题<input v-model="config.cover_studio.defaults.subtitle" maxlength="160" /></label><label class="ma-span-2">默认自定义文本<input v-model="config.cover_studio.defaults.text" maxlength="160" /><small>支持 {count} 和 {name}。</small></label><label v-for="field in [['title_font','主标题字体'],['subtitle_font','副标题字体'],['text_font','自定义文本字体']]" :key="field[0]">{{ field[1] }}<select v-model="config.cover_studio.defaults[field[0]]"><option v-for="font in state.fonts" :key="font.id" :value="font.id">{{ font.name }}</option></select></label></div></section></template>
       <footer class="ma-config-save"><p><Icon name="check" :size="16" />客户端入口 8098 · 原 ItemId 与 302 链路保留</p><button class="ma-btn ma-primary" :disabled="busy" @click="saveConfig"><Icon name="save" :size="19" />保存配置</button></footer>
     </main>
-    <footer class="ma-footnote">BOSS COVER STUDIO <span>媒体虚拟库 {{ state?.version || '4.5.1' }}</span><span>Designed for your collection.</span></footer>
+    <footer class="ma-footnote">BOSS COVER STUDIO <span>媒体虚拟库 {{ state?.version || '4.5.2' }}</span><span>Designed for your collection.</span></footer>
     <input ref="importPresetInput" type="file" accept=".json,application/json" hidden @change="importPreset" /><input ref="importBackupInput" type="file" accept=".json,application/json" hidden @change="importBackup" /><input ref="fontInput" type="file" accept=".ttf,.otf,.ttc,.woff,.woff2" hidden @change="uploadFont" />
     <div v-if="toast" class="ma-toast" :class="{ error: toastError }" :role="toastError ? 'alert' : 'status'"><Icon :name="toastError ? 'close' : 'check'" :size="19" />{{ toast }}</div>
     <div v-if="presetDialog" class="ma-modal-backdrop" @click.self="presetDialog=false"><section class="ma-modal" role="dialog" aria-modal="true" aria-label="保存自定义方案" @keydown.esc="presetDialog=false"><div class="ma-section-head"><h2>留住这个设计</h2><button class="ma-icon-btn" aria-label="关闭弹窗" @click="presetDialog=false"><Icon name="close" /></button></div><label class="ma-block">方案名称<input v-model="presetName" maxlength="40" placeholder="例如：我的影院 · 深蓝" @keydown.enter="addPreset" /></label><p>保存当前布局、标题、字体、配色与输出设置。</p><button class="ma-btn ma-primary ma-full" :disabled="busy" @click="addPreset">保存为我的方案</button></section></div>
-    <div v-if="selectedHistory" class="ma-modal-backdrop" @click.self="selectedHistory=null"><section class="ma-modal ma-image-modal" role="dialog" aria-modal="true" aria-label="历史封面预览" @keydown.esc="selectedHistory=null"><div class="ma-section-head"><h2>{{ selectedHistory.name }}</h2><button class="ma-icon-btn" aria-label="关闭预览" @click="selectedHistory=null"><Icon name="close" /></button></div><img :src="selectedHistory.image" :alt="selectedHistory.name" /><p>{{ selectedHistory.created }}{{ selectedHistory.purpose === 'before_native_publish' ? ' · 原生库更新前的原图备份' : '' }}</p><div class="ma-output-info" :data-output-reason="selectedHistory.render_info?.reason"><span class="ma-format-badge">{{ formatLabel(selectedHistory) }}</span><p>{{ outputMessage(selectedHistory) }}</p></div><div class="ma-inline ma-wrap"><button class="ma-btn ma-primary" @click="downloadImage(selectedHistory.image,selectedHistory.name,selectedHistory.mime)"><Icon name="download" :size="18" />下载原图</button><button class="ma-btn" :disabled="busy || job.running" @click="restoreHistory(selectedHistory)"><Icon name="history" :size="18" />恢复此方案</button><button v-if="selectedHistory.native" class="ma-btn" :disabled="busy || job.running" @click="restoreNativeImage(selectedHistory)"><Icon name="upload" :size="18" />恢复原生库图片</button><button class="ma-btn ma-danger" :disabled="busy" @click="deleteHistory(selectedHistory)"><Icon name="trash" :size="18" />删除</button></div></section></div>
+    <div v-if="selectedHistory" class="ma-modal-backdrop" @click.self="selectedHistory=null"><section class="ma-modal ma-image-modal" role="dialog" aria-modal="true" aria-label="历史封面预览" @keydown.esc="selectedHistory=null"><div class="ma-section-head"><h2>{{ selectedHistory.name }}</h2><button class="ma-icon-btn" aria-label="关闭预览" @click="selectedHistory=null"><Icon name="close" /></button></div><img :src="selectedHistory.image" :alt="selectedHistory.name" /><p>{{ selectedHistory.created }}{{ selectedHistory.purpose === 'before_native_publish' ? ' · 原生库更新前的原图备份' : '' }}</p><div class="ma-output-info" :data-output-reason="selectedHistory.render_info?.reason"><span class="ma-format-badge">{{ formatLabel(selectedHistory) }}</span><p>{{ outputMessage(selectedHistory) }}</p></div><div class="ma-inline ma-wrap"><button class="ma-btn ma-primary" @click="downloadImage(selectedHistory.image,selectedHistory.name,selectedHistory.mime)"><Icon name="download" :size="18" />下载原图</button><button class="ma-btn" :disabled="busy || job.running" @click="restoreHistory(selectedHistory)"><Icon name="history" :size="18" />恢复此方案</button><button v-if="selectedHistory.native" class="ma-btn" :disabled="busy || job.running" @click="restoreNativeImage(selectedHistory)"><Icon name="upload" :size="18" />恢复原生库图片</button><button class="ma-btn ma-danger" :disabled="busy || job.running" @click="deleteHistory(selectedHistory)"><Icon name="trash" :size="18" />删除</button></div></section></div>
   </div>
 </template>
