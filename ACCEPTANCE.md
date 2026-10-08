@@ -1,14 +1,14 @@
-# 4.6.0 用户环境验收
+# 4.6.1 用户环境验收
 
 本地回归与浏览器验证结果见 TEST_REPORT.md。本次未连接或改动NAS，新版尚未部署。
 
 ## 升级
 
-完整上传 `plugins.v2/mediaarchiver/` 和根目录 `package.v2.json` 的MediaArchiver条目，保留其他插件。coverstudio.py、dist/assets、fonts、requirements.txt不能遗漏。
+完整上传 `plugins.v2/mediaarchiver/` 和根目录 `package.v2.json` 的MediaArchiver条目，保留其他插件。coverstudio.py、cache.py、dist/assets、fonts、requirements.txt不能遗漏。
 
-刷新市场升级4.6.0，在合适时间重启MoviePilot以统一加载子模块并结束旧任务；此次没有代为重启。保持8098→3334→8096。
+刷新市场升级4.6.1，在合适时间重启MoviePilot以统一加载子模块并结束旧任务；此次没有代为重启。保持8098→3334→8096。
 
-读取 `http://NAS地址:8098/__mediaarchiver__/health`（或直连3334），确认version和cover_engine均为4.6.0，code_sha256匹配SHA256SUMS中的主文件。reload-required表示仍加载旧封面子模块。
+读取 `http://NAS地址:8098/__mediaarchiver__/health`（或直连3334），确认version和cover_engine均为4.6.1，code_sha256匹配SHA256SUMS中的主文件。reload-required表示仍加载旧封面子模块。
 
 ## 封面
 
@@ -51,3 +51,10 @@
 - 原生图不由原Cron/增量自动发布。停止/重载产生的取消保留已有虚拟库，不应误报为源站同步失败。
 
 遇到问题保留版本/主文件指纹、库名与ID、图像格式、响应状态、插件提示和相邻日志，去掉Key/Token/Cookie。外部榜单失效与封面/播放分别核验，不因源站失败放宽身份识别。
+
+## 4.6.1 新增验收
+
+- 多个库初次生成 GIF 时，已缓存库封面与播放/302仍及时返回。长时间使用多用户/多方案后检查进程占用；64 MiB 成品与32 MiB素材预算只约束缓存图片字节，不是全进程 RSS 上限。
+- 批量预览中一个库失败，其他已选库仍继续预览，失败卡片显示原因；恢复连接后重试。
+- 外部榜单重试中停止插件，等待能及时取消；已发出的网络请求仍受原超时约束。
+- 原生备份、恢复、字体上传、历史清理与旧保存方案保持可用。完整更新包含 cache.py；仅上传两个旧Python文件会导致模块缺失。

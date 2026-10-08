@@ -1,28 +1,19 @@
-# 媒体虚拟库交接 · 4.6.0
+# 媒体虚拟库交接 · 4.6.1
 
-作者 Boss，2026-09-13。项目无 Git 元数据。基线为已交付的4.5.2，当前主模块、封面引擎、市场索引和前端统一为4.6.0。用户要求参考 GitHub 丰富封面模板，不再扩展同质的叠卡/斜墙。
+作者 Boss，2026-10-08。接手 GitHub main 基线 4fc86fa（4.6.0），本地分支 codex/plugin-reliability-optimization。保留十款封面、严格识别、增量/Cron、用户权限和 NextEmby 8098 → MoviePilot API3334 → Emby8096。
 
-## 本次实现
+新增cache.py：成品缓存96项/64MiB，素材缓存48项/32MiB/60秒，按最近使用淘汰。字节预算只计算编码图片，不限制进程整体RSS。命中成品缓存时无需等待冷绘图；冷绘图仍串行。配置更新/清理后旧绘图不填回新缓存。每次权限核验、用户凭据隔离和原302保留。
 
-- 保留叠影、光幕、映墙、留白，新增银幕、胶片、三联、刊物、黑胶、拼色，共10款真实 Pillow 构图。参考项目及许可核查见 THIRD_PARTY_NOTICES.md，未复制第三方源码或海报。
-- PRESETS 统一返回 defaults、hidden_fields、fixed_layout、artwork_count。选择内置方案合并构图/配色预设，保留标题内容、字体、素材来源、排序、分辨率和动画开关；自定义方案仍完整恢复参数。已有配置不会自动重置，部分参数接口保持原有合并语义。
-- 新增5款固定构图仅显示适用编辑控件；银幕仍可移动标题。方案缩略图为原创几何演示，实际生成只使用当前库的授权素材。样图异常/缺绘图依赖时，状态接口仍可返回配置和空缩略图。
-- 刊物、黑胶、拼色长标题优先两行，最小28基准像素（用户主动设24时遵从24），按实际高度放置副标题与计数。连续英文和ID按词换行，超长内容省略；旧4款文字逻辑保持。
-- 静态胶片最多取6张本库图片，三联/刊物/拼色最多3张；所有动态模式继续最多6张不同本库海报轮播。0/1张仍诚实返回PNG及原因。
-- 桌面与手机方案网格可滚动，手机两列且不压缩卡片文字。保留批量当前/已保存方案、全选反选、逐库草稿和历史清理。
+同步和榜单响应限制16MiB。分页无新增ID则停止保留旧快照；总数字段缺失时完整页继续读，短页结束。重试等待用取消事件及时结束，已发出的请求仍遵守原超时。没有通过改名、放宽识别或混用其他榜单掩盖源站问题。
 
-## 既有边界
+历史图片先解码生成缩略图再写文件，写入失败尝试清理新文件；保留预算只累加保留记录。数据子目录拒绝越出根目录的符号链接。不删除用户文件；旧安装若把子目录指向根目录之外，应改回真实子目录。原生图仍按原字节备份、精确库ID核验后手动上传，生成/恢复/清理仍共享job_lock。
 
-保持8098→MoviePilot API3334→Emby8096，MP前端3333。不增加插件监听端口，不操作原媒体文件，不改ItemId/MediaSource/302 Location，不恢复Collection/BoxSet。
+前端批量预览逐库失败隔离，失败卡片提供原因，剩余库继续；刷新响应绑定请求序号与服务器，页面卸载后轮询不再更新。预览构建、截图及QA数据改为项目内.work/，避免写父目录及覆盖历史docs截图。
 
-原生图片只在明确发布时重新核验库ID、备份后上传。Cron/增量不发布原生图片。取材权限、ImageTag、缓存、真实GIF、原图64MiB/素材16MiB/元数据16MiB和历史256MiB限额保留。历史清空仍含原生备份，并保留Emby已应用图片、方案和字体。
+Vite7.3.7与Vue构建插件6.0.9，Node需20.19+或22.12+；NAS无需Node。锁文件审计0漏洞。正式dist完整重建，约488KiB降至120KiB。发布必须完整包含cache.py、coverstudio.py、fonts、requirements与dist/assets。
 
-## 测试及交付
+155项pytest、4个独立脚本、42个浏览器场景验证见TEST_REPORT.md。scripts/check.py隔离旧脚本污染；check_ui.py逐套件启动全新回环服务；release.py生成完整SHA256SUMS与可复现ZIP，并逐文件验证包内字节。GitHub Actions同时执行检查、构建、依赖审计和浏览器回归。
 
-137项不重复pytest（旧117项及新增20项）、4个独立脚本、39个浏览器场景通过。新增文件tests/test_template_catalog.py、tests/render_template_gallery.py、tests/ui_templates.mjs。长标题和缺依赖修正后又运行43项相关测试。详细证据见TEST_REPORT.md与docs/BUILDINFO.json。
+原4.6.0交接与报告保存在docs/。本次未连接或部署NAS，没有使用远程凭据、重启MoviePilot或更新真实Emby封面。本地测试不能代表现场部署或全部客户端兼容。完整发布包：releases/MediaArchiver-v4.6.1.zip。上传须解压并按原目录更新；不用把ZIP直接当市场插件安装。
 
-主模块对比4.5.2发布包，统一换行和版本后源代码完全相同。播放、识别、同步、权限分发没有业务改动。新模板通过真实本地Emby接口验证原生与虚拟批量输出及未选库保留。
-
-发布包releases/MediaArchiver-v4.6.0.zip须完整覆盖plugins.v2/mediaarchiver/（含fonts、requirements、dist/assets）及根package.v2.json的MediaArchiver条目；其他插件条目保留。包内SHA256SUMS逐文件验证，NAS不需要Node。health的version与cover_engine应均为4.6.0。
-
-仅本地开发、回环测试与打包，没有连接或改动NAS，没有上传GitHub、生成远程封面、重启或部署。旧NAS只读授权不等于部署授权。账号、密码、Token不写项目、包或记忆。4.5.2旧报告已保存在docs/HANDOFF-4.5.2.md与docs/TEST_REPORT-4.5.2.md。
+远程交付未完成：终端HTTPS缺少登录凭据，已连接GitHub插件创建分支返回403 Resource not accessible by integration。未上传GitHub、未创建PR、未合并main。本地提交、完整源码和ZIP可用，需要仓库写入权限才能继续同步。

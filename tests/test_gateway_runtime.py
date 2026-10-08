@@ -157,9 +157,10 @@ class Origin(BaseHTTPRequestHandler):
 
 @pytest.fixture(scope='module')
 def origin():
-    server = ThreadingHTTPServer(('127.0.0.1', 0), Origin)
+    class QAHTTPServer(ThreadingHTTPServer):
+        request_queue_size = 128
+    server = QAHTTPServer(('127.0.0.1', 0), Origin)
     server.daemon_threads = True
-    server.request_queue_size = 128
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     yield f'http://127.0.0.1:{server.server_address[1]}'
@@ -292,7 +293,7 @@ def test_invalid_json_diagnostics_and_retry(plugin_module, origin):
                 response = await client.get('/Users/u/Views?encoding=broken&api_key=never-log-this')
                 assert response.status_code == 502
             health = (await client.get('/__mediaarchiver__/health')).json()
-            assert health['version'] == '4.6.0'
+            assert health['version'] == '4.6.1'
             assert len(health['code_sha256']) == 64
             assert health['performance']['failures'] == 2
             assert health['performance']['suppressed_errors'] == 1

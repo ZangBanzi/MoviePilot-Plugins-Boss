@@ -1,19 +1,21 @@
 // Browser checks for output explanations. Uses the local QA host and deterministic API fixtures.
 // Run after build:preview and tests/preview_server.py; no NAS connections or mutations.
 import { createRequire } from 'node:module'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import assert from 'node:assert/strict'
 const root = fileURLToPath(new URL('..', import.meta.url))
-const work = path.resolve(root, '../.work')
+const work = path.resolve(root, '.work')
+const output = path.join(work, 'screenshots')
+await mkdir(output, { recursive: true })
 const require = createRequire(path.join(root, 'frontend/package.json'))
 const { chromium } = require('playwright')
 const port = (await readFile(path.join(work, 'preview-port.txt'), 'utf8')).trim()
 const base = `http://127.0.0.1:${port}`
 const edge = 'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'
-const browser = await chromium.launch({ headless: true, ...(existsSync(edge) ? { executablePath: edge } : {}) })
+const browser = await chromium.launch({ headless: true, ...(process.env.MEDIAARCHIVER_BROWSER ? { executablePath: process.env.MEDIAARCHIVER_BROWSER } : existsSync(edge) ? { executablePath: edge } : {}) })
 const context = await browser.newContext({ viewport: { width: 1440, height: 1080 }, reducedMotion: 'reduce' })
 const page = await context.newPage()
 const errors = []
@@ -102,10 +104,10 @@ try {
   await page.setViewportSize({ width: 390, height: 844 })
   await page.locator('.ma-toast').waitFor({ state: 'hidden' })
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true)
-  await page.screenshot({ path: path.join(root, 'docs/previews/studio-output-diagnostics-mobile.png'), fullPage: true })
+  await page.screenshot({ path: path.join(output, 'studio-output-diagnostics-mobile.png'), fullPage: true })
   await page.getByRole('button', { name: /历史封面/ }).click()
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true)
-  await page.screenshot({ path: path.join(root, 'docs/previews/studio-output-history-mobile.png'), fullPage: true })
+  await page.screenshot({ path: path.join(output, 'studio-output-history-mobile.png'), fullPage: true })
   done('390px results and history explain long messages without horizontal overflow')
   assert.deepEqual(errors, [])
   await writeFile(path.join(work, 'ui-output-diagnostics.json'), JSON.stringify({ steps, errors }, null, 2))

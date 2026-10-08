@@ -1,8 +1,17 @@
 # 媒体虚拟库 · MoviePilot v2
 
-版本 **4.6.0** · 作者 **Boss**
+版本 **4.6.1** · 作者 **Boss**
 
 在 Emby 首页展示属性专区与平台榜单，继续使用原媒体 ItemId。4.5.0 把封面生成改为整台 Emby 服务器逐库处理，并用真实海报轮播替代旧版进度条动画。
+
+## 4.6.1 稳定性与工程优化
+
+- 播放端成品图片缓存最多 96 项 / 64 MiB，海报缓存最多 48 项 / 32 MiB，按最近使用淘汰，海报存入后 60 秒到期。单项超过预算不缓存；预算仅计算已编码图片字节，不代表整个进程的内存上限。缓存命中无需等待其他库的冷 GIF 绘制；冷绘图仍串行，控制瞬时 CPU 与内存。
+- 配置更新或清理会替换成品缓存，正在绘制的旧结果不能重新填入新缓存；用户凭据、当前权限、ImageTag、原 ItemId 和 302 继续按原逻辑处理。
+- 同步元数据与外部榜单单次响应最多 16 MiB；分页返回重复页且无新增 ID 时停止同步，保留旧快照。榜单重试等待支持立即取消，源站故障仍明确报告。
+- 历史图片先验证再写入；缩略图写入失败会尝试清理新原图，文件系统仍拒绝删除的残留可通过历史清理重试。256 MiB 保留预算仅计算实际保留记录，避免已淘汰记录挤占预算。字体、备份和历史子目录不能通过符号链接越出插件数据根目录。
+- 批量预览逐库报告失败并继续处理后续目标；刷新时的过时服务器响应不会覆盖新的选择，卸载页面后不再接受轮询状态。
+- 更新并锁定前端构建依赖，重建正式组件并移除已不再引用的旧构建文件。Node 仅用于开发和打包，NAS 运行无需 Node。新增 GitHub Actions、本地统一回归、完整校验与可复现 ZIP。
 
 ## 4.6.0 十款封面方案
 
@@ -135,12 +144,12 @@
 
 ## 上传和升级
 
-本地发布包：`releases/MediaArchiver-v4.6.0.zip`。解压后按原目录上传文件，不要只把 ZIP 放进仓库。
+本地发布包：`releases/MediaArchiver-v4.6.1.zip`。解压后按原目录上传文件，不要只把 ZIP 放进仓库。
 
-1. **完整覆盖 `plugins.v2/mediaarchiver/`**：包括 `__init__.py`、`coverstudio.py`、`requirements.txt`、`fonts/` 和 **`dist/assets/` 全部文件**。只上传主 Python 文件会缺失工坊组件。
-2. 更新根目录 **`package.v2.json`** 的 `MediaArchiver` 条目到 **4.6.0**；仓库有其他插件时保留它们。同步图标、说明、字体许可与校验文件。`frontend/` 是可复现源码，NAS 运行不需要 Node。
+1. **完整覆盖 `plugins.v2/mediaarchiver/`**：包括 `__init__.py`、`coverstudio.py`、`cache.py`、`requirements.txt`、`fonts/` 和 **`dist/assets/` 全部文件**。只上传主 Python 文件会缺失工坊组件。
+2. 更新根目录 **`package.v2.json`** 的 `MediaArchiver` 条目到 **4.6.1**；仓库有其他插件时保留它们。同步图标、说明、字体许可与校验文件。`frontend/` 是可复现源码，NAS 运行不需要 Node。
 3. 刷新 MoviePilot 插件市场并升级，使 MP 安装插件依赖。随后重启 MoviePilot，确保旧网关代码退出。
-4. 检查 `http://NAS地址:3334/__mediaarchiver__/health`：`version` 和 `cover_engine` 应为 `4.6.0`，`code_sha256` 对照 `SHA256SUMS` 中主文件；`decoders.br/zstd` 应启用。
+4. 检查 `http://NAS地址:3334/__mediaarchiver__/health`：`version` 和 `cover_engine` 应为 `4.6.1`，`code_sha256` 对照 `SHA256SUMS` 中主文件；`decoders.br/zstd` 应启用。
 5. 打开插件配置保存原有专区设置，执行“一键重建”，再进入封面工坊。客户端继续连接 8098，并刷新媒体库/图片缓存。
 
 新版页面使用 MoviePilot v2 的 Vue 远程组件机制，管理接口校验管理员身份。仍保留旧的原生配置表单/状态页供兼容调用。完整工坊需宿主支持 Vue 插件页面和管理员依赖；本包未在你的实际 MP 镜像中安装验证。
@@ -155,27 +164,28 @@ Cron 使用 APScheduler 五段格式，按 MoviePilot 时区运行；建议 `0 4
 
 ## 开发与复现
 
-Python 3.12、Node 20+。在独立虚拟环境执行（Windows 激活 `.venv/Scripts/Activate.ps1`，Linux 使用 `source .venv/bin/activate`）：
+使用 Python 3.12、Node 20.19+ 或 22.12+（建议 24）。只在独立虚拟环境安装测试依赖，不能将 requirements-dev.txt 安装进运行中的 MoviePilot。
 
 ```bash
 python -m venv .venv
-# 激活后执行
+# macOS/Linux：source .venv/bin/activate
+# Windows：.venv/Scripts/Activate.ps1
 python -m pip install -r requirements-dev.txt
-python -m pytest tests/test_batch_selection.py tests/test_history_cleanup.py tests/test_output_diagnostics.py tests/test_cover_size_limits.py tests/test_server_cover_workflow.py tests/test_native_covers.py tests/test_coverstudio.py tests/test_gateway_runtime.py -q -p no:cacheprovider
-python tests/test_virtual_library.py
-python tests/test_accuracy.py
-python tests/test_animated_cover.py
-python tests/test_ranking_failures.py
+python scripts/check.py
 cd frontend
 npm ci
+npm audit --audit-level=moderate
 npm run build
 npm run build:preview
+npx playwright install chromium
 cd ..
-python tests/preview_server.py
+python scripts/check_ui.py
+python scripts/release.py
+python scripts/release.py --check
 ```
 
-另一个终端在项目根目录执行 `node tests/ui_smoke.mjs`、`node tests/ui_output_diagnostics.mjs`，另从全新 QA 服务执行 `node tests/ui_selection.mjs`。Windows 自动使用已安装的 Edge；其他环境先在 `frontend/` 执行 `npx playwright install chromium`。测试服务仅监听随机回环端口，使用构造 Emby 数据；关闭终端即可退出，不是插件新增服务。
+`check.py` 执行完整 pytest 和四个独立回归脚本；普通 `pytest` 不再误收集会污染 FastAPI 的独立脚本。`check_ui.py` 为每个浏览器套件启动全新随机回环服务并自动关闭，仅使用本地构造的 Emby 数据。可用环境变量 `MEDIAARCHIVER_BROWSER` 指定已有 Chrome/Edge 可执行文件，`MEDIAARCHIVER_NODE` 指定 Node 路径。
 
-前端构建输出到插件 `dist/assets/`；`build:preview` 输出到项目父目录 `.work/preview`。本地测试文件和数据不会进入运行组件。
+正式前端输出到插件 `dist/assets/`，预览输出到本项目 `.work/preview`，浏览器截图、结果和临时数据均保存在忽略目录 `.work/`。`release.py` 同步完整 SHA256SUMS 并生成 `releases/MediaArchiver-v4.6.1.zip`；ZIP 包含完整插件、源码、测试和说明，不包含虚拟环境、node_modules、运行数据和其他发布包。上传时完整覆盖插件目录，保留目标仓库其他插件。
 
-本次 **117 项 pytest、4 个独立回归脚本、31 个浏览器场景**通过。浏览器包括 26 项真实本地 API 流程和 5 项固定诊断响应展示检查。详情见 [TEST_REPORT.md](TEST_REPORT.md)，交接说明见 [HANDOFF.md](HANDOFF.md)。不代表新包已部署或所有播放器、榜单均可用。本包未上传 GitHub、未部署。逐项现场验收见 [ACCEPTANCE.md](ACCEPTANCE.md)。
+4.6.1 的实际本地验证见 [TEST_REPORT.md](TEST_REPORT.md)，交接见 [HANDOFF.md](HANDOFF.md)，现场验收见 [ACCEPTANCE.md](ACCEPTANCE.md)。本地验证不代表 NAS 部署或所有播放器、榜单兼容性保证；外部源故障仍需分别处理。

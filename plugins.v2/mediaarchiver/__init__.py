@@ -34,6 +34,7 @@ from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .coverstudio import CoverStudio, DEFAULTS as COVER_DEFAULTS, MAX_IMAGE, normalize_options, normalize_artwork
+from .cache import ImageCache
 
 from app import schemas
 from app.core.config import settings
@@ -120,6 +121,7 @@ class EmbyClient:
         "ProviderIds,ProductionYear,PremiereDate,DateCreated,DateLastSaved,"
         "OriginalTitle,SortName,Overview,Genres,Studios,Tags,CommunityRating,OfficialRating"
     )
+    MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
     def __init__(self, base_url: str, api_key: str, timeout: int = 30):
         base_url = str(base_url or "").strip().rstrip("/")
@@ -174,13 +176,15 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.6.0",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.6.1",
             },
             method=method.upper(),
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = response.read()
+                body = response.read(self.MAX_RESPONSE_BYTES + 1)
+                if len(body) > self.MAX_RESPONSE_BYTES:
+                    raise ValueError("Emby 元数据超过 16 MiB，已停止同步并保留旧快照")
                 if response.status not in expected:
                     raise EmbyHttpError(response.status, f"Emby 返回 HTTP {response.status}")
                 return body
@@ -208,14 +212,23 @@ class EmbyClient:
     def _paged_items(self, **query: Any) -> List[Dict[str, Any]]:
         start, limit = 0, 300
         result: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
         while True:
             params = dict(query)
             params.update({"StartIndex": start, "Limit": limit})
             payload = self.request_json("GET", "/Items", params)
             items = payload.get("Items") or []
+            if not isinstance(items, list):
+                raise ValueError("Emby 分页 Items 必须是数组，已保留旧快照")
+            identifiers = {str(item["Id"]) for item in items if isinstance(item, dict) and item.get("Id")}
+            if items and not identifiers.difference(seen):
+                raise ValueError("Emby 分页未前进，已停止同步并保留旧快照")
+            seen.update(identifiers)
             result.extend(item for item in items if isinstance(item, dict))
-            total = int(payload.get("TotalRecordCount") or len(result))
-            if not items or len(result) >= total:
+            total = payload.get("TotalRecordCount")
+            if not items or (total is not None and len(result) >= int(total)):
+                break
+            if total is None and len(items) < limit:
                 break
             start += len(items)
         return result
@@ -405,6 +418,7 @@ class RankingFetcher:
         "douban_tv_domestic": ("tv_domestic", "Series"),
         "douban_tv_global": ("tv_global", "Series"),
     }
+    MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
     def __init__(
         self,
@@ -541,7 +555,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.6.0",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.6.1",
         }
         merged.update(headers or {})
         body = None
@@ -557,7 +571,10 @@ class RankingFetcher:
             request = urllib.request.Request(url, data=body, headers=merged, method=method)
             try:
                 with urllib.request.urlopen(request, timeout=timeout) as response:
-                    return response.read()
+                    value = response.read(self.MAX_RESPONSE_BYTES + 1)
+                    if len(value) > self.MAX_RESPONSE_BYTES:
+                        raise ValueError("榜单响应超过 16 MiB，已停止读取并保留可信旧结果")
+                    return value
             except urllib.error.HTTPError as err:
                 err.close()
                 explanation = {404: "来源接口或榜单不存在", 403: "来源拒绝访问或暂时停服",
@@ -575,7 +592,12 @@ class RankingFetcher:
                 delay = 0.8 * (2 ** attempt)
             if attempt + 1 < attempts:
                 self.log("WARNING", f"榜单请求暂时失败，{delay:.1f}秒后重试（{attempt + 1}/{attempts - 1}）：{last_error}")
-                time.sleep(delay)
+                cancel = getattr(self, "cancel_event", None)
+                if cancel is not None:
+                    if cancel.wait(delay):
+                        raise CancelledError()
+                else:
+                    time.sleep(delay)
         raise RuntimeError(str(last_error or "网络请求失败"))
 
     def _json(
@@ -842,7 +864,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.6.0 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.6.1 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -1102,7 +1124,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.6.0"
+    plugin_version = "4.6.1"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -1179,7 +1201,7 @@ class MediaArchiver(_PluginBase):
         self._proxy_lock = threading.RLock()
         self._virtual_views: Dict[str, Dict[str, Any]] = {}
         self._proxy_item_index: Dict[str, Dict[str, Any]] = {}
-        self._cover_cache: Dict[str, Tuple[str, bytes]] = {}
+        self._cover_cache = ImageCache()
         self._cover_lock = threading.Lock()
         self._selection_cache: OrderedDict = OrderedDict()
         self._selection_index: Any = None
@@ -1633,7 +1655,7 @@ class MediaArchiver(_PluginBase):
                 str(view.get("key")), view.get("item_ids") or []))
                 for identifier, view in self._virtual_views.items()}
         # Swap the reference; never acquire the rendering lock while holding the studio lock.
-        self._cover_cache = {}
+        self._cover_cache = ImageCache()
 
     def rebuild(self) -> schemas.Response:
         return self._start_sync("rebuild")
@@ -2374,8 +2396,6 @@ class MediaArchiver(_PluginBase):
                     artwork = artwork[:studio.artwork_limit(options)]
                     view["_cover_artwork"] = artwork
                     with studio.lock:
-                        if len(studio.art_cache) >= 48:
-                            studio.art_cache.pop(next(iter(studio.art_cache)))
                         studio.art_cache[cache_key] = (time.monotonic(), artwork)
                 # Byte changes and recovered artwork must invalidate a previously cached fallback.
                 art_digest = hashlib.sha256(b"".join(hashlib.sha256(data).digest()
@@ -2413,17 +2433,20 @@ class MediaArchiver(_PluginBase):
         etag = f'"{tag}"'
         if str(request.headers.get("If-None-Match") or "").strip() == etag:
             return Response(status_code=304, headers={"ETag": etag})
-        # ponytail: 冷封面串行生成，限制 CPU 并避免重复绘图；需要时再按 tag 分锁。
-        with self._cover_lock:
-            cached = self._cover_cache.get(tag)
-            if cached:
-                mime_type, payload = cached
-            else:
-                mime_type, payload = (self._render_cover_animated(view) if image_format == "gif"
-                                      else self._render_cover_static(view, image_format))
-                if len(self._cover_cache) >= 96:
-                    self._cover_cache.pop(next(iter(self._cover_cache)), None)
-                self._cover_cache[tag] = (mime_type, payload)
+        # A warm cover must not wait for another library's cold GIF encode.
+        # Keep cold renders serialized to bound transient Pillow memory and CPU.
+        cache = self._cover_cache
+        cached = cache.get(tag)
+        if cached is None:
+            with self._cover_lock:
+                cached = cache.get(tag)
+                if cached is None:
+                    cached = (self._render_cover_animated(view) if image_format == "gif"
+                              else self._render_cover_static(view, image_format))
+                    # A config/cache reset swaps the cache. In-flight renders only
+                    # update their old instance, never repopulate the new cache.
+                    cache[tag] = cached
+        mime_type, payload = cached
         return Response(
             content=b"" if str(request.method).upper() == "HEAD" else payload,
             status_code=200,

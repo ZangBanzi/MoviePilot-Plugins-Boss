@@ -5,6 +5,7 @@ Local persistence stays in the plugin data directory. Explicit native publishing
 only updates a verified library's Primary image through Emby's documented API.
 """
 from __future__ import annotations
+from .cache import ImageCache
 
 import base64
 import copy
@@ -177,7 +178,7 @@ def normalize_artwork(payload: bytes) -> bytes:
 
 
 class CoverStudio:
-    engine_version = "4.6.0"
+    engine_version = "4.6.1"
     def __init__(self, plugin):
         self.plugin = plugin
         self.lock = threading.RLock()
@@ -185,7 +186,7 @@ class CoverStudio:
         self.job_lock = threading.Lock()
         self.cancel = threading.Event()
         self.job = {"running": False, "done": 0, "total": 0, "message": "尚未生成"}
-        self.art_cache: dict = {}
+        self.art_cache = ImageCache(max_entries=48, max_bytes=32 * 1024 * 1024, ttl=60)
         self.font_cache: dict = {}
         self.glyph_cache: dict = {}
         self.thumbs: dict = {}
@@ -255,6 +256,8 @@ class CoverStudio:
         if not re.fullmatch(r"[0-9a-f]{32}", str(identifier)):
             raise ValueError("无效文件编号")
         root = (self.root / folder).resolve()
+        if root != self.root.resolve() / folder:
+            raise ValueError("文件目录超出插件数据目录")
         target = (root / (identifier + suffix)).resolve()
         if target.parent != root:
             raise ValueError("文件超出插件数据目录")
@@ -890,8 +893,6 @@ class CoverStudio:
         if not images:
             notices.append("未取得可用 Emby 海报，已使用品牌画面。")
         with self.lock:
-            if len(self.art_cache) >= 32:
-                self.art_cache.pop(next(iter(self.art_cache)))
             self.art_cache[cache_key] = (time.monotonic(), images, notices)
         return images, notices
 
@@ -932,14 +933,24 @@ class CoverStudio:
 
     def _history_entry(self, view: dict, options: dict, mime: str, payload: bytes, batch: str) -> dict:
         identifier = uuid.uuid4().hex
-        self._atomic(self._file("history", identifier, ".image"), payload)
         from PIL import Image
         with Image.open(io.BytesIO(payload)) as source:
             thumb = source.convert("RGB")
             thumb.thumbnail((320, 180))
             output = io.BytesIO()
             thumb.save(output, "JPEG", quality=75)
-        self._atomic(self._file("history", identifier, ".jpg"), output.getvalue())
+        original = self._file("history", identifier, ".image")
+        thumbnail = self._file("history", identifier, ".jpg")
+        try:
+            self._atomic(original, payload)
+            self._atomic(thumbnail, output.getvalue())
+        except Exception:
+            for path in (original, thumbnail):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass  # Clear-history can retry filesystem failures later.
+            raise
         return {"id": identifier, "batch": batch, "key": view["key"], "name": view["name"], "native": bool(view.get("native")),
                 "created": time.strftime("%Y-%m-%d %H:%M:%S"), "mime": mime,
                 "size": len(payload), "options": options}
@@ -949,9 +960,9 @@ class CoverStudio:
         batches = list(dict.fromkeys(row["batch"] for row in entries))[:limit]
         keep, size = [], 0
         for row in entries:
-            size += row["size"]
-            if row["batch"] in batches and size <= 256*1024*1024:
+            if row["batch"] in batches and size + row["size"] <= 256*1024*1024:
                 keep.append(row)
+                size += row["size"]
         return keep
 
     def _commit_history(self, entries: list) -> None:
@@ -1348,7 +1359,7 @@ class CoverStudio:
             if action == "clean_images":
                 self.art_cache.clear()
                 self.thumbs.clear()
-                self.plugin._cover_cache = {}
+                self.plugin._cover_cache = ImageCache()
                 return {"message": "已清理图片缓存，历史封面保留"}
             if action == "clean_fonts":
                 self.font_cache.clear()

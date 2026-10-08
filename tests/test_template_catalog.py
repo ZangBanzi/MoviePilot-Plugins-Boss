@@ -190,4 +190,4 @@ def test_catalog_state_survives_missing_pillow(plugin, monkeypatch):
     state = instance._cover_studio.state()
     assert len(state["presets"]) == 10
     assert all(preset["thumbnail"] == "" for preset in state["presets"])
-    assert state["version"] == "4.6.0" and state["config"]
+    assert state["version"] == "4.6.1" and state["config"]

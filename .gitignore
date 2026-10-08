@@ -1,0 +1,9 @@
+.venv/
+.work/
+**/__pycache__/
+.pytest_cache/
+frontend/node_modules/
+frontend/.preview/
+releases/
+.DS_Store
+*.log

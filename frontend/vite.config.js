@@ -11,7 +11,7 @@ export default defineConfig(({ mode }) => ({
   })])],
   build: {
     target: 'esnext',
-    outDir: mode === 'preview' ? '../../.work/preview' : '../plugins.v2/mediaarchiver/dist',
+    outDir: mode === 'preview' ? '../.work/preview' : '../plugins.v2/mediaarchiver/dist',
     emptyOutDir: true,
     rollupOptions: { input: mode === 'preview' ? 'index.html' : {},
       output: { chunkFileNames: 'assets/[name]-[hash].js', assetFileNames: 'assets/[name]-[hash][extname]' } },

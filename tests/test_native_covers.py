@@ -111,7 +111,11 @@ def origin():
             self.posted[path] = value
             return self.reply(204)
 
-    server = ThreadingHTTPServer(('127.0.0.1', 0), Origin)
+    class QAHTTPServer(ThreadingHTTPServer):
+        # The eight-library cold-gallery test opens more than the default five
+        # pending connections. Set the backlog before server_activate/listen.
+        request_queue_size = 128
+    server = QAHTTPServer(('127.0.0.1', 0), Origin)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     yield Origin, f'http://127.0.0.1:{server.server_port}'

@@ -47,7 +47,7 @@ const layoutFields = computed(() => [
   ['image_scale','海报缩放',50,125],['blur','背景模糊',0,60],
   ['overlay','背景压暗',15,90],['subtitle_size','副标题字号',10,50],['text_size','说明字号',10,36],
 ].filter(field => !hiddenLayoutFields.value.includes(field[0])))
-let previewTimer, pollTimer, toastTimer, previewId = 0, disposed = false, suppressWatch = false
+let previewTimer, pollTimer, toastTimer, previewId = 0, loadId = 0, disposed = false, suppressWatch = false
 const clone = value => JSON.parse(JSON.stringify(value))
 const server = computed(() => state.value?.cover_servers?.find(s => s.id === selectedServer.value))
 const libraries = computed(() => [...(server.value?.gateway ? (state.value?.views || []) : []), ...(state.value?.native_views || []).filter(v => v.server === selectedServer.value)])
@@ -153,10 +153,12 @@ function libraryPlan(library) {
   return state.value.presets.find(preset => preset.id === style)?.name || '自定义方案'
 }
 async function load(preserve = false) {
+  const id = ++loadId
+  const owner = selectedServer.value
   error.value = ''
   try {
     const data = await resultOf(props.api.get('plugin/MediaArchiver/studio'))
-    if (disposed) return
+    if (disposed || id !== loadId || owner !== selectedServer.value) return
     state.value = data
     if (!data.cover_servers?.some(s => s.id === selectedServer.value)) selectedServer.value = data.cover_servers?.[0]?.id || ''
     reconcileSelection()
@@ -169,7 +171,7 @@ async function load(preserve = false) {
     }
     loaded.value = true
     if (!props.settings && !preserve) refreshPreview()
-  } catch (err) { error.value = err.message || '加载失败，请检查插件依赖与连接' }
+  } catch (err) { if (!disposed && id === loadId) error.value = err.message || '加载失败，请检查插件依赖与连接' }
 }
 async function chooseLibrary(key = selected.value) {
   rememberDraft()
@@ -204,14 +206,25 @@ async function previewServer() {
   galleryBusy.value = true
   const owner = selectedServer.value
   const targets = checkedLibraries.value.map(library => ({ key: library.key, options: batchOptions(library) }))
+  const failures = []
   try {
     for (const library of targets) {
       if (disposed || owner !== selectedServer.value) break
-      const data = await action('preview', { key: library.key, options: library.options, animated: false })
-      libraryPreviews.value[library.key] = data.image
-      libraryOutputs.value[library.key] = { mime: data.mime, render_info: data.render_info }
+      try {
+        const data = await action('preview', { server: owner, key: library.key, options: library.options, animated: false })
+        if (disposed || owner !== selectedServer.value) break
+        libraryPreviews.value[library.key] = data.image
+        libraryOutputs.value[library.key] = { mime: data.mime, render_info: data.render_info }
+      } catch (err) {
+        if (disposed || owner !== selectedServer.value) break
+        const notice = err.message || '预览失败，请重试'
+        delete libraryPreviews.value[library.key]
+        libraryOutputs.value[library.key] = { status: 'failed', notice }
+        failures.push(notice)
+      }
     }
-  } catch (err) { message(err.message || '部分预览未完成', true) }
+    if (failures.length && !disposed) message(`${failures.length} 个媒体库预览失败，其他已选库已继续处理：${failures[0]}`, true)
+  }
   finally { galleryBusy.value = false }
 }
 function generateServer() {
@@ -255,6 +268,7 @@ async function poll() {
   if (disposed) return
   try {
     const data = await resultOf(props.api.get('plugin/MediaArchiver/studio?light=true'))
+    if (disposed) return
     if (state.value) {
       const finished = state.value.job?.running && !data.job.running
       state.value.job = data.job
@@ -451,7 +465,7 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
         </div>
       </div>
       <div class="ma-hero-bottom">
-        <div class="ma-badges"><span><i :class="{ on: runtime.proxy?.running }"></i>{{ runtime.proxy?.running ? '虚拟库已启用' : '等待启用' }}</span><span>{{ activePreset?.name || '封面工坊' }}</span><span>{{ options.animated ? '动态 GIF' : '静态封面' }}</span><span>v{{ state?.version || '4.6.0' }}</span></div>
+        <div class="ma-badges"><span><i :class="{ on: runtime.proxy?.running }"></i>{{ runtime.proxy?.running ? '虚拟库已启用' : '等待启用' }}</span><span>{{ activePreset?.name || '封面工坊' }}</span><span>{{ options.animated ? '动态 GIF' : '静态封面' }}</span><span>v{{ state?.version || '4.6.1' }}</span></div>
         <nav v-if="!settings" class="ma-tabs" aria-label="工坊页面"><button v-for="t in [['generate','封面生成'],['history','历史封面'],['status','运行状态']]" :key="t[0]" :class="{ active: tab === t[0] }" :aria-current="tab === t[0] ? 'page' : undefined" @click="tab=t[0]">{{ t[1] }}<span v-if="t[0] === 'history' && state?.history_count">{{ state.history_count }}</span></button></nav>
         <nav v-else class="ma-tabs" aria-label="配置页面"><button :class="{ active: configTab === 'settings' }" @click="configTab='settings'"><Icon name="layout" :size="17" />配置</button><button :class="{ active: configTab === 'titles' }" @click="configTab='titles'">T&nbsp; 默认标题与字体</button></nav>
       </div>
@@ -542,7 +556,7 @@ onUnmounted(() => { document.removeEventListener('keydown', modalKey, true); dis
       <template v-else><section class="ma-config-card"><span class="ma-eyebrow">TYPOGRAPHY</span><h2>默认标题与字体</h2><p>新建封面使用以下默认值，独立配置的虚拟库保留各自设置。</p><div class="ma-fields ma-edit-fields"><label>默认主标题<input v-model="config.cover_studio.defaults.title" placeholder="留空跟随每个虚拟库名称" maxlength="160" /></label><label>默认副标题<input v-model="config.cover_studio.defaults.subtitle" maxlength="160" /></label><label class="ma-span-2">默认自定义文本<input v-model="config.cover_studio.defaults.text" maxlength="160" /><small>支持 {count} 和 {name}。</small></label><label v-for="field in [['title_font','主标题字体'],['subtitle_font','副标题字体'],['text_font','自定义文本字体']]" :key="field[0]">{{ field[1] }}<select v-model="config.cover_studio.defaults[field[0]]"><option v-for="font in state.fonts" :key="font.id" :value="font.id">{{ font.name }}</option></select></label></div></section></template>
       <footer class="ma-config-save"><p><Icon name="check" :size="16" />客户端入口 8098 · 原 ItemId 与 302 链路保留</p><button class="ma-btn ma-primary" :disabled="busy" @click="saveConfig"><Icon name="save" :size="19" />保存配置</button></footer>
     </main>
-    <footer class="ma-footnote">BOSS COVER STUDIO <span>媒体虚拟库 {{ state?.version || '4.6.0' }}</span><span>Designed for your collection.</span></footer>
+    <footer class="ma-footnote">BOSS COVER STUDIO <span>媒体虚拟库 {{ state?.version || '4.6.1' }}</span><span>Designed for your collection.</span></footer>
     <input ref="importPresetInput" type="file" accept=".json,application/json" hidden @change="importPreset" /><input ref="importBackupInput" type="file" accept=".json,application/json" hidden @change="importBackup" /><input ref="fontInput" type="file" accept=".ttf,.otf,.ttc,.woff,.woff2" hidden @change="uploadFont" />
     <div v-if="toast" class="ma-toast" :class="{ error: toastError }" :role="toastError ? 'alert' : 'status'"><Icon :name="toastError ? 'close' : 'check'" :size="19" />{{ toast }}</div>
     <div v-if="presetDialog" class="ma-modal-backdrop" @click.self="presetDialog=false"><section class="ma-modal" role="dialog" aria-modal="true" aria-label="保存自定义方案" @keydown.esc="presetDialog=false"><div class="ma-section-head"><h2>留住这个设计</h2><button class="ma-icon-btn" aria-label="关闭弹窗" @click="presetDialog=false"><Icon name="close" /></button></div><label class="ma-block">方案名称<input v-model="presetName" maxlength="40" placeholder="例如：我的影院 · 深蓝" @keydown.enter="addPreset" /></label><p>保存当前布局、标题、字体、配色与输出设置。</p><button class="ma-btn ma-primary ma-full" :disabled="busy" @click="addPreset">保存为我的方案</button></section></div>
