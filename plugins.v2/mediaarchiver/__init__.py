@@ -176,7 +176,7 @@ class EmbyClient:
                 "Content-Type": "application/json",
                 "X-Emby-Token": self.api_key,
                 "X-MediaBrowser-Token": self.api_key,
-                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.6.1",
+                "User-Agent": "MoviePilot-MediaVirtualLibrary/4.6.2",
             },
             method=method.upper(),
         )
@@ -555,7 +555,7 @@ class RankingFetcher:
     ) -> bytes:
         merged = {
             "Accept": "application/json,text/html;q=0.9,*/*;q=0.8",
-            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.6.1",
+            "User-Agent": "Mozilla/5.0 MoviePilot-MediaVirtualLibrary/4.6.2",
         }
         merged.update(headers or {})
         body = None
@@ -864,7 +864,7 @@ class RankingFetcher:
     def _bangumi(self) -> RankingResult:
         payload = self._json(
             "https://api.bgm.tv/calendar",
-            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.6.1 (private use)"},
+            headers={"User-Agent": "MoviePilot-MediaVirtualLibrary/4.6.2 (private use)"},
         )
         today = date.today().isoweekday()
         groups = payload if isinstance(payload, list) else []
@@ -1124,7 +1124,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.6.1"
+    plugin_version = "4.6.2"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -1259,6 +1259,7 @@ class MediaArchiver(_PluginBase):
         self._ranking_cache: Dict[str, RankingResult] = {}
 
     def init_plugin(self, config: Optional[dict] = None) -> None:
+        self._cover_studio.invalidate_jobs()
         self._sync_cancel.set()
         self._sync_cancel = threading.Event()
         with self._proxy_lock:
@@ -1334,6 +1335,7 @@ class MediaArchiver(_PluginBase):
             self._boot_timer = threading.Timer(15.0, self._scheduled_sync)
             self._boot_timer.daemon = True
             self._boot_timer.start()
+        self._cover_studio.activate_jobs()
 
     @staticmethod
     def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -1584,7 +1586,7 @@ class MediaArchiver(_PluginBase):
         try:
             if light:
                 return schemas.Response(success=True, data={
-                    "job": dict(self._cover_studio.job), "runtime": self.status().data})
+                    "job": self._cover_studio.job_snapshot(), "runtime": self.status().data})
             data = self._cover_studio.state()
             data["ranking_groups"] = [dict(group) for group in RANK_GROUPS]
             data["rankings"] = RANK_META
@@ -4294,7 +4296,7 @@ class MediaArchiver(_PluginBase):
     def stop_service(self) -> None:
         self._stopping = True
         self._sync_cancel.set()
-        self._cover_studio.cancel.set()
+        self._cover_studio.invalidate_jobs()
         self._cancel_timers()
         self._remove_gateway_routes()
         self._close_httpx_client()

@@ -1,9 +1,9 @@
 {
-  "version": "4.6.1",
-  "date": "2026-10-08",
+  "version": "4.6.2",
+  "date": "2026-10-09",
   "author": "Boss",
-  "baseline_commit": "4fc86fa7d9806e021aeda5ba629b798814bfd7c7",
-  "pytest_passed": 155,
+  "baseline_commit": "b93ea034905e4fb6d77e9fe5c1283aa0a3016084",
+  "pytest_passed": 175,
   "new_resource_tests": 18,
   "standalone_passed": 4,
   "browser_total_scenarios": 42,
@@ -14,16 +14,16 @@
   "api_errors": [],
   "deployed": false,
   "nas_access": "none",
-  "main_sha256": "49ade37095ff45685f72316d2e12781d9f0aff8792fcfd368cc7c13ab8f09863",
-  "cover_sha256": "ec450eeff87e82599b4ba513cf531c11614f4363e705a5e59cc80e963a854c10",
+  "main_sha256": "b7f2ad3e70c349d24ac0a9de5d18dd9cc3a10a58d9cd6c6b5ca6788b0b05227d",
+  "cover_sha256": "4dee859b71592b9771638f3635232732929ad70a88effec3fe745c4bf3be62db",
   "cache_sha256": "8b89efadf394ec476803118a36b47297e5f00d756cf379fb78badd0fc9a134ee",
   "assets": {
     "Studio-Bup-zSAb.css": "206a24ce80721dd57dc33f9f946e2f991a1629be27058aafe1aad26cde97bae0",
-    "__federation_expose_Config-BPibZkYU.js": "3422c26ec950a8943ded1c8f232b8ef4326630b457d936974d357f228f56a2ae",
+    "Studio-DZUX4nu3.js": "7e380b0c631ffecea69bcef4506e143417ccaca5bfe04528871a85cc2a519fd5",
+    "__federation_expose_Config-BcyIyMPR.js": "e037d4d79bfedc73eb74566ecf4dc8dd0954ebc643ec02e0057682a62605dd49",
+    "__federation_expose_Page-Cai2irWw.js": "5228c8eb528ed387327df6c668a0b53dcb9f7ec3d72981ebc0c6d2f56733e63a",
     "__federation_fn_import-E6wRZccp.js": "11a2d68813601dffb4a4bb619cabf25526a7a445b054e418100e24128f6bdca2",
-    "__federation_expose_Page-B_QGyZQb.js": "09f0434de0f45264f5822f4041eccf77c4f38ccf2eaa4d119da35932a0f7251f",
-    "Studio-Wh2nUMCj.js": "b71a1bed670de1151a5742090df04e77abad35f83e0f772e6233cfa5494fcee1",
-    "remoteEntry.js": "4021a041675ce3ee8ddbbd8c11bc104786a174d00f49d143724a2366d1b38146"
+    "remoteEntry.js": "a4ec6b9dacb599418e008ee772f489800534469b2c3f8a7edb6e47002957447e"
   },
   "frontend_audit_vulnerabilities": 0,
   "build_tools": {
@@ -42,6 +42,12 @@
   "github_upload": {
     "uploaded": false,
     "pull_request_created": false,
-    "reason": "GitHub integration create_branch returned 403 Resource not accessible by integration; terminal HTTPS has no configured credential"
-  }
+    "reason": "GitHub integration create_branch returned 403 Resource not accessible by integration; terminal HTTPS has no configured credential",
+    "attempted_this_version": false
+  },
+  "new_lifecycle_tests": 20,
+  "pytest_seconds": 43.49,
+  "frontend_audit_run": false,
+  "frontend_audit_baseline": "4.6.1; lockfile dependencies unchanged",
+  "npm_ci_run": false
 }

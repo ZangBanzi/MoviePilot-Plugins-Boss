@@ -1,10 +1,18 @@
 # 媒体虚拟库 · MoviePilot v2
 
-版本 **4.6.1** · 作者 **Boss**
+版本 **4.6.2** · 作者 **Boss**
 
 在 Emby 首页展示属性专区与平台榜单，继续使用原媒体 ItemId。4.5.0 把封面生成改为整台 Emby 服务器逐库处理，并用真实海报轮播替代旧版进度条动画。
 
-## 4.6.1 稳定性与工程优化
+## 4.6.2 并发与生命周期修复
+
+- 停止服务或重载配置使旧封面批次失效；取材、绘图、原图备份与发送原生图片前校验本批次令牌，恢复原生旧图也使用相同边界。重载后新任务使用新令牌，不能恢复旧任务。
+- 已发出的原生 POST 无法撤回；重载会等待它结束后再继续。独立发布锁避免网络请求占用进度读取锁。仍按原超时处理请求，不承诺取消已发送的网络写入。
+- 普通“停止”继续完成当前封面再结束后续库；服务停止或重载提前终止尚未发布的库，已完成记录仍保存，取消不记作库失败。
+- 保存单库/全局方案及重置方案实际获取生成互斥锁，修复“先检查再保存”的并发窗口。本批次固定各库方案和历史保存开关。
+- 进度、结果和错误返回独立快照；计数与逐库结果一起更新，接口响应不随后台任务变化。线程启动失败释放互斥锁，可以重试。
+
+## 保留 4.6.1 稳定性与工程优化
 
 - 播放端成品图片缓存最多 96 项 / 64 MiB，海报缓存最多 48 项 / 32 MiB，按最近使用淘汰，海报存入后 60 秒到期。单项超过预算不缓存；预算仅计算已编码图片字节，不代表整个进程的内存上限。缓存命中无需等待其他库的冷 GIF 绘制；冷绘图仍串行，控制瞬时 CPU 与内存。
 - 配置更新或清理会替换成品缓存，正在绘制的旧结果不能重新填入新缓存；用户凭据、当前权限、ImageTag、原 ItemId 和 302 继续按原逻辑处理。
@@ -144,12 +152,12 @@
 
 ## 上传和升级
 
-本地发布包：`releases/MediaArchiver-v4.6.1.zip`。解压后按原目录上传文件，不要只把 ZIP 放进仓库。
+本地发布包：`releases/MediaArchiver-v4.6.2.zip`。解压后按原目录上传文件，不要只把 ZIP 放进仓库。
 
 1. **完整覆盖 `plugins.v2/mediaarchiver/`**：包括 `__init__.py`、`coverstudio.py`、`cache.py`、`requirements.txt`、`fonts/` 和 **`dist/assets/` 全部文件**。只上传主 Python 文件会缺失工坊组件。
-2. 更新根目录 **`package.v2.json`** 的 `MediaArchiver` 条目到 **4.6.1**；仓库有其他插件时保留它们。同步图标、说明、字体许可与校验文件。`frontend/` 是可复现源码，NAS 运行不需要 Node。
+2. 更新根目录 **`package.v2.json`** 的 `MediaArchiver` 条目到 **4.6.2**；仓库有其他插件时保留它们。同步图标、说明、字体许可与校验文件。`frontend/` 是可复现源码，NAS 运行不需要 Node。
 3. 刷新 MoviePilot 插件市场并升级，使 MP 安装插件依赖。随后重启 MoviePilot，确保旧网关代码退出。
-4. 检查 `http://NAS地址:3334/__mediaarchiver__/health`：`version` 和 `cover_engine` 应为 `4.6.1`，`code_sha256` 对照 `SHA256SUMS` 中主文件；`decoders.br/zstd` 应启用。
+4. 检查 `http://NAS地址:3334/__mediaarchiver__/health`：`version` 和 `cover_engine` 应为 `4.6.2`，`code_sha256` 对照 `SHA256SUMS` 中主文件；`decoders.br/zstd` 应启用。
 5. 打开插件配置保存原有专区设置，执行“一键重建”，再进入封面工坊。客户端继续连接 8098，并刷新媒体库/图片缓存。
 
 新版页面使用 MoviePilot v2 的 Vue 远程组件机制，管理接口校验管理员身份。仍保留旧的原生配置表单/状态页供兼容调用。完整工坊需宿主支持 Vue 插件页面和管理员依赖；本包未在你的实际 MP 镜像中安装验证。
@@ -186,6 +194,6 @@ python scripts/release.py --check
 
 `check.py` 执行完整 pytest 和四个独立回归脚本；普通 `pytest` 不再误收集会污染 FastAPI 的独立脚本。`check_ui.py` 为每个浏览器套件启动全新随机回环服务并自动关闭，仅使用本地构造的 Emby 数据。可用环境变量 `MEDIAARCHIVER_BROWSER` 指定已有 Chrome/Edge 可执行文件，`MEDIAARCHIVER_NODE` 指定 Node 路径。
 
-正式前端输出到插件 `dist/assets/`，预览输出到本项目 `.work/preview`，浏览器截图、结果和临时数据均保存在忽略目录 `.work/`。`release.py` 同步完整 SHA256SUMS 并生成 `releases/MediaArchiver-v4.6.1.zip`；ZIP 包含完整插件、源码、测试和说明，不包含虚拟环境、node_modules、运行数据和其他发布包。上传时完整覆盖插件目录，保留目标仓库其他插件。
+正式前端输出到插件 `dist/assets/`，预览输出到本项目 `.work/preview`，浏览器截图、结果和临时数据均保存在忽略目录 `.work/`。`release.py` 同步完整 SHA256SUMS 并生成 `releases/MediaArchiver-v4.6.2.zip`；ZIP 包含完整插件、源码、测试和说明，不包含虚拟环境、node_modules、运行数据和其他发布包。上传时完整覆盖插件目录，保留目标仓库其他插件。
 
-4.6.1 的实际本地验证见 [TEST_REPORT.md](TEST_REPORT.md)，交接见 [HANDOFF.md](HANDOFF.md)，现场验收见 [ACCEPTANCE.md](ACCEPTANCE.md)。本地验证不代表 NAS 部署或所有播放器、榜单兼容性保证；外部源故障仍需分别处理。
+4.6.2 的实际本地验证见 [TEST_REPORT.md](TEST_REPORT.md)，交接见 [HANDOFF.md](HANDOFF.md)，现场验收见 [ACCEPTANCE.md](ACCEPTANCE.md)。本地验证不代表 NAS 部署或所有播放器、榜单兼容性保证；外部源故障仍需分别处理。

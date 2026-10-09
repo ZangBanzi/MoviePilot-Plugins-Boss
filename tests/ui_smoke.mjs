@@ -133,7 +133,7 @@ try {
   await page.getByRole('button', { name: '生成并更新原生库封面', exact: true }).click()
   await page.getByRole('status').filter({ hasText: '已开始生成' }).waitFor()
   await page.waitForFunction(() => document.querySelector('.ma-job') === null)
-  await page.getByRole('status').filter({ hasText: '原生封面更新完成：0 GIF，1 静态，0 失败' }).waitFor()
+  await page.locator('.ma-note[role=status]').filter({ hasText: '原生封面更新完成：0 GIF，1 静态，0 失败' }).waitFor()
   done('Native publish performs real base64 image POST to the isolated Emby fixture')
   await page.getByRole('button', { name: /历史封面/ }).first().click()
   const beforeCard = page.locator('.ma-history-card').filter({ hasText: '更新前备份' }).first()

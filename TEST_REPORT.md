@@ -1,55 +1,41 @@
-# MediaArchiver 4.6.1 验证记录
+# MediaArchiver 4.6.2 验证记录
 
-日期：2026-10-08。作者：Boss。基线：GitHub main 4fc86fa7d9806e021aeda5ba629b798814bfd7c7 / 4.6.0。
+日期：2026-10-09。作者：Boss。基线：本地 b93ea03 / 4.6.1；GitHub main 基线 4fc86fa / 4.6.0。所有原生图片写入只发生在随机回环 Emby 替身，未连接或部署NAS。
 
-原有137项pytest在修改前全部通过。新版完整回归155项（原137项+新增18项资源/故障回归），另4个独立脚本、42个浏览器场景通过。正式federation与preview构建成功，npm ci成功，依赖审计0漏洞。所有媒体接口操作只发生在随机回环Emby替身，未连接或部署NAS。
+## 复现与修复
 
-## 后端
+新增 tests/test_job_lifecycle.py 共20项：停止/重载 × 取材/绘图/原图备份/POST派发前（8）；普通取消完成当前库；保存方案竞态；生成期间重置拒绝；完整/轻量状态深复制（2）；历史开关固定（2）；读取目标时重载；原生恢复停止/重载（2）；已完成历史保留；线程启动失败释放锁及重试。
 
-新增tests/test_resource_limits.py覆盖：LRU按字节淘汰/替换/超限不缓存；嵌套海报计数和固定TTL；四线程读写清理预算；冷GIF期间已缓存图片及时返回；配置重置期间旧绘图不填入新缓存；同步与榜单响应在解析前截断（2项）；重复分页停止；正常分页；缺总数的完整页继续读取；重试等待即时取消；无效历史图片不落盘；缩略图写入失败清理新原图；保留预算仅计算入选记录；超限记录不阻止后续小图；history/fonts/backups目录符号链接越界拒绝（3项）。
+首批13项在4.6.1运行结果为12失败、1通过，原生HTTP替身实际记录到停止/重载后POST；另复现检查后保存的竞态、重置绕过生成锁、嵌套状态共享引用和历史开关中途改变。修复没有更改源站诊断、鉴权、虚拟成员/原媒体接口。
 
-原有识别/排名、用户权限与票据、静态/GIF回退、大图限额、原生备份恢复、批量选择、历史清理、压缩协议、流式断开与302回归继续通过。四个旧脚本用独立Python进程运行，避免导入时替换FastAPI造成pytest收集失败。
+针对性66项通过；最后新增边界后生命周期20项全部通过。完整后端与浏览器最终结果见下文。
 
-冷画廊测试曾连接失败，定位为本地ThreadingHTTPServer默认backlog=5，八库并发超出队列。改为服务器激活前声明request_queue_size=128，不放宽断言或插件超时；最终完整回归通过。运行时未增加监听端口。
+## 最终验证
 
-## 前端与浏览器
+最终完整运行 scripts/check.py：175项pytest全部通过（43.49秒），另4个独立脚本通过。包含4.6.1原155项与本次新增20项。原302 Location、ItemId/MediaSource、识别、权限撤销、分页、GIF/静态回退、原生原字节备份及历史清理均继续通过。
 
-| 套件 | 场景数 | 验证 |
-|---|---:|---|
-| ui_smoke.mjs | 17 | 画布/字体/方案/配置/历史、federation共享Vue、原生发布恢复、批量与真实GIF |
-| ui_templates.mjs | 8 | 十款实际输出、旧方案配色、适用控件、独立草稿、批量与390px页面 |
-| ui_selection.mjs | 10 | 全选/反选/逐库、草稿、当前/保存方案、历史删除/清空/故障重试 |
-| ui_output_diagnostics.mjs | 4 | 固定响应展示空库/单图/旧记录/备份失败，手机无横向溢出 |
-| ui_reliability.mjs | 3 | 单库失败仍处理余库、重试恢复、延迟旧状态不覆盖新选择 |
+正式federation与preview构建成功，插件/引擎/前端/市场索引统一4.6.2。浏览器五套件全部通过：smoke17、templates8、selection10、diagnostics4、reliability3，共42场景。所有pageerror为空，实际API套件apiErrors为空；故障注入套件仅按测试预期模拟失败。桌面及390px简体中文页面截图目视检查可用。
 
-共42项：原34项实际回环API流程、原5项展示响应、新3项故障/延迟流程。pageerror全部为空；真实API套件无非预期apiErrors。异常套件注入一次预期400验证错误处理。桌面与390px截图已目视，简体中文文字和方案布局可用。
+首轮浏览器smoke第12场景因严格定位匹配两处完成文案失败：持续进度节点与临时toast同时出现。将断言限定 .ma-note[role=status] 后全套42场景通过，没有改动应用提示或放宽业务断言。
 
-浏览器使用本机Chrome，截图/结果保存在忽略目录.work/，不替换docs里4.6.0示例。check_ui.py为每个套件重启独立QA服务并关闭。旧报告的39场景不是本次验证的替代。
+scripts/release.py生成完整SHA256SUMS并逐文件核对ZIP字节，重复打包校验一致；发布包不包含运行数据、.work、虚拟环境、node_modules或凭据。差异检查通过，原CRLF/混合换行按未修改行保留。
 
-## 构建、审计与打包
-
-Python3.12.14、Pillow12.3.0、HTTPX0.28.1、FastAPI0.115.14、Node24.19.0、Vite7.3.7、@vitejs/plugin-vue6.0.9。测试环境隔离在.venv，不修改MoviePilot依赖。
-
-基线npm audit为3项（1 moderate/2 high）；升级Vite/Vue构建插件并更新source-map-js后，npm ci与audit为0漏洞。锁文件与正式组件一起提交，NAS无需Node。正式dist约488KiB → 120KiB，清理过时JS/CSS，只保留当前组件；federation通过真实浏览器加载。
-
-scripts/release.py检查插件/引擎/前端/市场索引统一4.6.1，生成完整SHA256SUMS与固定ZIP时间戳，逐文件验证包内原字节。相同源码重复打包SHA256一致。GitHub Actions已配置；本地通过不冒充远程Actions已运行。
-
-## 复现与边界
+## 复现
 
 ```bash
 python scripts/check.py
 cd frontend
 npm ci
-npm audit --audit-level=moderate
 npm run build
 npm run build:preview
-npx playwright install chromium
 cd ..
 python scripts/check_ui.py
 python scripts/release.py
 python scripts/release.py --check
 ```
 
-原CRLF/混合换行保留，差异检查用cr-at-eol处理CR，没有整仓格式化。cache.py必须随完整插件更新。预算只约束常驻编码缓存，不是Pillow绘制/Python对象/网络开销的总RSS；冷图仍串行，没有NAS负载或量化播放性能保证。未改变媒体文件、ItemId、MediaSource、Collection/BoxSet、端口和302 Location。现场验收见ACCEPTANCE.md。
+测试沿用 .venv 与现有锁定 node_modules，未安装/更新新依赖；本次不冒充重新执行 npm ci 或 npm audit。4.6.1依赖审计记录见 docs/TEST_REPORT-4.6.1.md。本次浏览器使用本地Chrome，截图和结果位于忽略目录.work/，不覆盖docs旧截图。
 
-远程同步结果：GitHub插件create_branch返回403 Resource not accessible by integration，终端HTTPS没有可用登录凭据，因此未上传代码、未创建PR；已配置的Actions尚未远程执行。
+发送前检查与生命周期切换串行；已发出POST无法撤回，重载等待请求结束。正在绘图/取材仍需返回到检查点，沿用原请求超时。预算只限制编码缓存，不限制进程RSS。未现场部署、未验证NAS性能或全客户端兼容。
+
+远程同步：上轮GitHub集成create_branch返回403 Resource not accessible by integration，终端HTTPS无登录凭据；本次未重试远程写入，未上传、未创建PR、未远程执行Actions。

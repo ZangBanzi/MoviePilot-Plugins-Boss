@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 import urllib.parse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -177,14 +177,20 @@ def normalize_artwork(payload: bytes) -> bytes:
     return output.getvalue()
 
 
+class JobInvalidated(ValueError):
+    """The host stopped or reloaded while an administration operation was running."""
+
+
 class CoverStudio:
-    engine_version = "4.6.1"
+    engine_version = "4.6.2"
     def __init__(self, plugin):
         self.plugin = plugin
         self.lock = threading.RLock()
         self.render_lock = threading.Lock()
         self.job_lock = threading.Lock()
+        self._publish_lock = threading.Lock()
         self.cancel = threading.Event()
+        self._lifecycle = threading.Event()
         self.job = {"running": False, "done": 0, "total": 0, "message": "尚未生成"}
         self.art_cache = ImageCache(max_entries=48, max_bytes=32 * 1024 * 1024, ttl=60)
         self.font_cache: dict = {}
@@ -193,6 +199,26 @@ class CoverStudio:
         self.native_views: list = []
         self.native_owner = ""
         self._client_context = threading.local()
+
+    def invalidate_jobs(self) -> None:
+        # An already dispatched POST finishes before host reinitialization proceeds.
+        # A separate lock keeps progress polling available during network I/O.
+        with self._publish_lock, self.lock:
+            self._lifecycle.set()
+            self.cancel.set()
+
+    def activate_jobs(self) -> None:
+        with self.lock:
+            self._lifecycle = threading.Event()
+
+    def _check_lifecycle(self, event=None) -> None:
+        event = event if event is not None else getattr(self._client_context, "lifecycle", None) or self._lifecycle
+        if self.plugin._stopping or (event is not None and event.is_set()):
+            raise JobInvalidated("插件已停止或重载，请刷新后重新生成")
+
+    def job_snapshot(self) -> dict:
+        with self.lock:
+            return copy.deepcopy(self.job)
 
     @staticmethod
     def server_id(client) -> str:
@@ -293,18 +319,22 @@ class CoverStudio:
         self.plugin._refresh_cover_tags()
 
     def save_options(self, key: str, options: dict, global_scope: bool = False) -> dict:
-        if self.job_lock.locked():
-            raise ValueError("封面正在生成，完成或停止后再保存方案")
+        lifecycle = getattr(self._client_context, "lifecycle", None) or self._lifecycle
         options = normalize_options(options)
-        with self.lock:
-            cfg = copy.deepcopy(self.config)
-            if global_scope:
-                cfg["defaults"] = options
-            else:
-                self.view(key)
-                overrides = cfg.setdefault("overrides", {})
-                overrides[key] = options
-            self._save_studio(cfg)
+        if not self.job_lock.acquire(blocking=False):
+            raise ValueError("封面正在生成，完成或停止后再保存方案")
+        try:
+            with self.lock:
+                self._check_lifecycle(lifecycle)
+                cfg = copy.deepcopy(self.config)
+                if global_scope:
+                    cfg["defaults"] = options
+                else:
+                    self.view(key)
+                    cfg.setdefault("overrides", {})[key] = options
+                self._save_studio(cfg)
+        finally:
+            self.job_lock.release()
         return options
 
     def font_path(self, identifier: str) -> Path:
@@ -714,15 +744,18 @@ class CoverStudio:
             headers["Content-Type"] = mime
         limit = MAX_JSON if max_bytes is None else max_bytes
         try:
-            with httpx.Client(timeout=8, follow_redirects=False, trust_env=False) as http:
-                with http.stream(method, client.api_root.rstrip("/")+path, params=query,
-                                 content=payload, headers=headers) as response:
-                    body = bytearray()
-                    for chunk in response.iter_bytes(chunk_size=64*1024):
-                        if len(body) + len(chunk) > limit:
-                            raise ValueError(f"{purpose}：Emby 返回内容超过 {limit / (1024 * 1024):g} MiB，已停止操作")
-                        body.extend(chunk)
-                    return response.status_code, response.headers.get("content-type", "").split(";")[0].strip().lower(), bytes(body)
+            with self._publish_lock if method == "POST" else nullcontext():
+                if method == "POST":
+                    self._check_lifecycle()
+                with httpx.Client(timeout=8, follow_redirects=False, trust_env=False) as http:
+                    with http.stream(method, client.api_root.rstrip("/")+path, params=query,
+                                     content=payload, headers=headers) as response:
+                        body = bytearray()
+                        for chunk in response.iter_bytes(chunk_size=64*1024):
+                            if len(body) + len(chunk) > limit:
+                                raise ValueError(f"{purpose}：Emby 返回内容超过 {limit / (1024 * 1024):g} MiB，已停止操作")
+                            body.extend(chunk)
+                        return response.status_code, response.headers.get("content-type", "").split(";")[0].strip().lower(), bytes(body)
         except httpx.HTTPError:
             raise ValueError(f"{purpose}：Emby 请求未完成，请检查连接和服务器状态") from None
 
@@ -797,6 +830,7 @@ class CoverStudio:
         return dict(view, item_ids=list(index), _items=index, total_count=total)
 
     def _upload_native(self, view: Mapping, mime: str, payload: bytes, batch: str = "") -> None:
+        self._check_lifecycle()
         # Revalidate the exact target against the configured server; names never identify libraries.
         target = next((v for v in self.load_native() if v["key"] == view["key"]), None)
         if target is None:
@@ -804,6 +838,7 @@ class CoverStudio:
         path = f"/Items/{target['id']}/Images/Primary"
         status, old_mime, old = self._admin_request("GET", path, max_bytes=MAX_ORIGINAL_IMAGE,
                                                   purpose="备份原生库旧封面（失败时不上传）")
+        self._check_lifecycle()
         if status == 200:
             # Validate the first frame without resizing/re-encoding the backup.
             # GIF bytes (including all frames, loop and durations) stay exact.
@@ -818,11 +853,13 @@ class CoverStudio:
             except Exception:
                 raise ValueError("备份原生库旧封面：图片格式或像素无效，未上传") from None
             with self.lock:
+                self._check_lifecycle()
                 row = self._history_entry(target, self.options(target), old_mime, old, batch or uuid.uuid4().hex)
                 row["purpose"] = "before_native_publish"
                 self._commit_history([row]+self._read_index("history"))
         elif status != 404:
             raise ValueError(f"无法备份原生库旧封面：HTTP {status}，未上传")
+        self._check_lifecycle()
         status, _, _ = self._admin_request("POST", path, payload=base64.b64encode(payload), mime=mime,
                                           purpose="上传原生库封面")
         if status not in {200, 204}:
@@ -976,6 +1013,7 @@ class CoverStudio:
 
     def start_generate(self, key: str = "", publish: bool = False, server: str = "",
                        keys: list | None = None, options: dict | None = None) -> dict:
+        lifecycle = getattr(self._client_context, "lifecycle", None) or self._lifecycle
         if keys is not None:
             if (not server or key or not isinstance(keys, list) or not keys or len(keys) > 4096
                     or any(not isinstance(value, str) or not value or len(value) > 180 for value in keys)):
@@ -990,6 +1028,8 @@ class CoverStudio:
         if not self.job_lock.acquire(blocking=False):
             raise ValueError("封面生成正在进行中")
         try:
+            with self.lock:
+                self._check_lifecycle(lifecycle)
             if server:
                 if server != self.server_id(client):
                     raise ValueError("所选服务器与当前操作范围不一致，请刷新后重试")
@@ -1012,6 +1052,7 @@ class CoverStudio:
             if not views:
                 raise ValueError("没有可生成的媒体库，请先读取媒体库或重建虚拟库")
             with self.lock:
+                self._check_lifecycle(lifecycle)
                 # Persist the same explicit plan to every selected target in one write.
                 # This also updates virtual playback tags, not just history thumbnails.
                 if normalized is not None:
@@ -1022,71 +1063,89 @@ class CoverStudio:
                     self._save_studio(cfg)
                 # Freeze each plan now: later default/config changes cannot switch layouts mid-batch.
                 plans = [(view, self.options(view)) for view in views]
+                history_enabled = self.config.get("history_enabled", True)
+                cancel = threading.Event()
+                self.cancel = cancel
+                job = {"running": True, "done": 0, "total": len(views), "failed": 0,
+                       "animated": 0, "static": 0, "fallback": 0, "message": "准备生成"}
+                self.job = job
+                started = copy.deepcopy(job)
         except Exception:
             self.job_lock.release()
             raise
-        self.cancel.clear()
-        self.job = {"running": True, "done": 0, "total": len(views), "failed": 0,
-                    "animated": 0, "static": 0, "fallback": 0, "message": "准备生成"}
-
         def work():
             self._client_context.client = client
+            self._client_context.lifecycle = lifecycle
             batch = uuid.uuid4().hex
             rows = []
             try:
                 for view, options in plans:
-                    if self.cancel.is_set() or self.plugin._stopping:
+                    if cancel.is_set() or lifecycle.is_set() or self.plugin._stopping:
                         break
                     try:
                         art, notices = self.admin_artwork(view, options)
+                        self._check_lifecycle(lifecycle)
                         report = {}
                         mime, payload = self.encode(view, options, art, "gif" if options["animated"] else "png", report)
+                        self._check_lifecycle(lifecycle)
                         if publish and view.get("native"):
                             if options["source"] != "brand" and not art:
                                 raise ValueError("未匹配到海报，保留原生库现有封面；可先预览或选择纯品牌画面")
                             self._upload_native(view, mime, payload, batch)
-                        if self.config.get("history_enabled", True):
+                        if history_enabled:
                             with self.lock:
                                 row = self._history_entry(view, options, mime, payload, batch)
                                 row["render_info"] = report
                                 rows.append(row)
-                        self.job["animated" if mime == "image/gif" else "static"] += 1
-                        if report["requested_format"] == "gif" and mime != "image/gif":
-                            self.job["fallback"] += 1
-                        self.job.setdefault("results", []).append({"key": view["key"], "name": view["name"],
-                            "native": bool(view.get("native")), "artwork_count": report["artwork_count"], "mime": mime,
-                            "render_info": report, "style": options["style"],
-                            "status": "published" if publish and view.get("native") else "generated",
-                            "notice": "；".join(notices)})
-                        self.job["message"] = view["name"] + (" · 已生成 GIF" if mime == "image/gif" else " · 已生成静态封面")
+                        with self.lock:
+                            job["animated" if mime == "image/gif" else "static"] += 1
+                            if report["requested_format"] == "gif" and mime != "image/gif":
+                                job["fallback"] += 1
+                            job.setdefault("results", []).append({"key": view["key"], "name": view["name"],
+                                "native": bool(view.get("native")), "artwork_count": report["artwork_count"], "mime": mime,
+                                "render_info": report, "style": options["style"],
+                                "status": "published" if publish and view.get("native") else "generated",
+                                "notice": "；".join(notices)})
+                            job["message"] = view["name"] + (" · 已生成 GIF" if mime == "image/gif" else " · 已生成静态封面")
+                            job["done"] += 1
+                    except JobInvalidated:
+                        break
                     except Exception as exc:
-                        self.job["failed"] += 1
+                        # Network failures during shutdown belong to cancellation, not a failed library.
+                        if lifecycle.is_set() or self.plugin._stopping:
+                            break
                         detail = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
-                        self.job.setdefault("errors", []).append(f"{view['name']} · {detail}")
-                        self.job.setdefault("results", []).append({"key": view["key"], "name": view["name"],
-                            "native": bool(view.get("native")), "status": "failed", "notice": detail})
-                        self.job["message"] = f"{view['name']} · 生成失败"
-                    self.job["done"] += 1
-                if rows:
-                    with self.lock:
+                        with self.lock:
+                            job["failed"] += 1
+                            job.setdefault("errors", []).append(f"{view['name']} · {detail}")
+                            job.setdefault("results", []).append({"key": view["key"], "name": view["name"],
+                                "native": bool(view.get("native")), "status": "failed", "notice": detail})
+                            job["message"] = f"{view['name']} · 生成失败"
+                            job["done"] += 1
+                with self.lock:
+                    if rows:
                         self._commit_history(rows + self._read_index("history"))
-                self.job["message"] = ("已停止" if self.cancel.is_set() else
-                    f"{'服务器封面' if server else '原生封面更新' if publish else '生成'}完成：{self.job['animated']} GIF，{self.job['static']} 静态，{self.job['failed']} 失败")
+                    job["message"] = ("已停止" if cancel.is_set() or lifecycle.is_set() or self.plugin._stopping else
+                        f"{'服务器封面' if server else '原生封面更新' if publish else '生成'}完成：{job['animated']} GIF，{job['static']} 静态，{job['failed']} 失败")
             except Exception as exc:
-                self.job["message"] = f"保存历史失败（{type(exc).__name__}）"
-                self.job["failed"] = max(1, self.job["failed"])
+                with self.lock:
+                    job["message"] = f"保存历史失败（{type(exc).__name__}）"
+                    job["failed"] = max(1, job["failed"])
             finally:
                 self._client_context.client = None
-                self.job["running"] = False
-                self.job_lock.release()
+                self._client_context.lifecycle = None
+                with self.lock:
+                    job["running"] = False
+                    self.job_lock.release()
         try:
             threading.Thread(target=work, name="MediaArchiverCoverStudio", daemon=True).start()
         except Exception:
-            self.job["running"] = False
-            self.job["message"] = "生成任务未能启动，请重试"
-            self.job_lock.release()
+            with self.lock:
+                job["running"] = False
+                job["message"] = "生成任务未能启动，请重试"
+                self.job_lock.release()
             raise
-        return dict(self.job)
+        return started
 
     def state(self) -> dict:
         with self.plugin._proxy_lock:
@@ -1133,7 +1192,7 @@ class CoverStudio:
                 "custom_presets": self.config.get("presets", []), "options": self.options({}),
                 "fonts": [{"id": "default", "name": "思源风格 · Noto Sans SC（内置）"}] + fonts,
                 "history": recent, "history_count": len(history), "backups": backups, "native_views": native_views,
-                "job": dict(self.job), "studio_config": copy.deepcopy(self.config),
+                "job": self.job_snapshot(), "studio_config": copy.deepcopy(self.config),
                 "config": copy.deepcopy(self.plugin._saved_config),
                 "defaults": self.plugin.get_form()[1], "servers": self.plugin._server_options(),
                 "rules": [{"key": key, "name": rule["name"], "hint": rule["hint"]}
@@ -1260,6 +1319,7 @@ class CoverStudio:
             self.job_lock.release()
 
     def action(self, data: dict) -> dict:
+        lifecycle = self._lifecycle
         if data.get("action") in {"delete_history", "clear_history"}:
             return self._action(data)
         key = str(data.get("key") or "")
@@ -1268,8 +1328,13 @@ class CoverStudio:
                 row = next((r for r in self._read_index("history") if r["id"] == data.get("id")), {})
             key = str(row.get("key") or "")
         server = key.split(":")[1] if key.startswith("native:") else str(data.get("server") or "")
-        with self.on_server(server):
-            return self._action(data)
+        previous = getattr(self._client_context, "lifecycle", None)
+        try:
+            with self.on_server(server):
+                self._client_context.lifecycle = previous or lifecycle
+                return self._action(data)
+        finally:
+            self._client_context.lifecycle = previous
 
     def _action(self, data: dict) -> dict:
         action = data.get("action")
@@ -1290,8 +1355,11 @@ class CoverStudio:
         if action == "restore_native_image":
             if not self.job_lock.acquire(blocking=False):
                 raise ValueError("封面生成中，请等待完成后恢复原生库图片")
+            previous = getattr(self._client_context, "lifecycle", None)
             try:
                 with self.lock:
+                    self._client_context.lifecycle = previous or self._lifecycle
+                    self._check_lifecycle()
                     row = next((r for r in self._read_index("history") if r["id"] == data.get("id")), None)
                     if row is None or not str(row.get("key", "")).startswith("native:"):
                         raise ValueError("请选择原生媒体库的历史图片")
@@ -1299,9 +1367,11 @@ class CoverStudio:
                 self._upload_native(row, row["mime"], payload)
                 return {"message": "原生媒体库图片已恢复"}
             finally:
+                self._client_context.lifecycle = previous
                 self.job_lock.release()
         if action == "cancel":
-            self.cancel.set()
+            with self.lock:
+                self.cancel.set()
             return {"message": "将在当前封面处理结束后停止"}
         if action == "upload_font":
             return self.upload_font(data)
@@ -1315,6 +1385,24 @@ class CoverStudio:
             if data.get("confirm") is not True:
                 raise ValueError("请确认清空全部历史封面；此操作也会删除历史中的原生封面备份")
             return self.delete_history(clear_all=True)
+        if action == "reset_override":
+            if not self.job_lock.acquire(blocking=False):
+                raise ValueError("封面正在生成，完成或停止后再重置方案")
+            try:
+                with self.lock:
+                    self._check_lifecycle()
+                    cfg = copy.deepcopy(self.config)
+                    cfg.setdefault("overrides", {}).pop(str(data.get("key")), None)
+                    self._save_studio(cfg)
+            finally:
+                self.job_lock.release()
+            return {}
+        if action == "restore_history":
+            with self.lock:
+                row = next((r for r in self._read_index("history") if r["id"] == data.get("id")), None)
+                if row is None:
+                    raise ValueError("历史封面已不存在")
+            return {"options": self.save_options(row["key"], row["options"])}
         with self.lock:
             if action == "save_preset":
                 cfg = copy.deepcopy(self.config)
@@ -1331,17 +1419,6 @@ class CoverStudio:
                 cfg["presets"] = [p for p in cfg.get("presets", []) if p["id"] != data.get("id")]
                 self._save_studio(cfg)
                 return {}
-            if action == "reset_override":
-                cfg = copy.deepcopy(self.config)
-                cfg.setdefault("overrides", {}).pop(str(data.get("key")), None)
-                self._save_studio(cfg)
-                return {}
-            if action == "restore_history":
-                rows = self._read_index("history")
-                row = next((r for r in rows if r["id"] == data.get("id")), None)
-                if row is None:
-                    raise ValueError("历史封面已不存在")
-                return {"options": self.save_options(row["key"], row["options"])}
             if action == "backup":
                 identifier = uuid.uuid4().hex
                 snapshot = {"format": "mediaarchiver-config-v1", "version": self.plugin.plugin_version,
