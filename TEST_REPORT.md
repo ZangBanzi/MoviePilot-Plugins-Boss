@@ -38,4 +38,4 @@ python scripts/release.py --check
 
 发送前检查与生命周期切换串行；已发出POST无法撤回，重载等待请求结束。正在绘图/取材仍需返回到检查点，沿用原请求超时。预算只限制编码缓存，不限制进程RSS。未现场部署、未验证NAS性能或全客户端兼容。
 
-远程同步：上轮GitHub集成create_branch返回403 Resource not accessible by integration，终端HTTPS无登录凭据；本次未重试远程写入，未上传、未创建PR、未远程执行Actions。
+远程同步（2026-10-10）：GitHub集成仍返回403，终端HTTPS仍无凭据；已通过现有 GitHub Desktop 登录将两个提交快进推送main。GitHub读取远程SHA为31fa2db5a8b68080065836784e67c7e1dd238921，与本地一致；未创建PR，未部署NAS。本文中的175项后端/42场景仍为本地结果，远程Actions状态单独核实。

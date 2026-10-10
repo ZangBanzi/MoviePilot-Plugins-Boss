@@ -40,10 +40,14 @@
     "history_total": 256
   },
   "github_upload": {
-    "uploaded": false,
+    "uploaded": true,
+    "date": "2026-10-10",
+    "branch": "main",
+    "method": "GitHub Desktop existing sign-in",
+    "verified_code_commit": "31fa2db5a8b68080065836784e67c7e1dd238921",
     "pull_request_created": false,
-    "reason": "GitHub integration create_branch returned 403 Resource not accessible by integration; terminal HTTPS has no configured credential",
-    "attempted_this_version": false
+    "integration_write_available": false,
+    "terminal_auth_available": false
   },
   "new_lifecycle_tests": 20,
   "pytest_seconds": 43.49,

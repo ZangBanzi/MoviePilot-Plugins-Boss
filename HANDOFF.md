@@ -12,4 +12,4 @@
 
 旧报告保存在 docs/HANDOFF-4.6.1.md、docs/TEST_REPORT-4.6.1.md，4.6.0归档仍保留。完整发布包 releases/MediaArchiver-v4.6.2.zip，解压按原目录更新，不把ZIP直接当市场插件安装。
 
-本次未访问、部署NAS，未更新真实Emby图片、未重启MoviePilot、未改媒体/ItemId/MediaSource/端口/302。本地验证不代表现场部署。远程交付沿用已知阻碍：终端HTTPS无凭据、GitHub集成创建分支403；本次未重试远程写入，未上传GitHub或创建PR。
+本次未访问、部署NAS，未更新真实Emby图片、未重启MoviePilot、未改媒体/ItemId/MediaSource/端口/302。本地验证不代表现场部署。2026-10-10 已通过现有 GitHub Desktop 登录将4.6.1和4.6.2两个提交快进上传 main，远程提交31fa2db5a8b68080065836784e67c7e1dd238921与本地一致。终端HTTPS无凭据和GitHub集成403仍存在，Desktop通道可用；未创建PR。自动回归结果另行读取，NAS部署仍未执行。
