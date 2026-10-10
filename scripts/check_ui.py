@@ -13,8 +13,7 @@ WORK = ROOT / '.work'
 def main():
     WORK.mkdir(exist_ok=True)
     node = os.environ.get('MEDIAARCHIVER_NODE', 'node')
-    for suite in ('ui_smoke.mjs', 'ui_templates.mjs', 'ui_selection.mjs',
-                  'ui_output_diagnostics.mjs', 'ui_reliability.mjs'):
+    for suite in ('ui_virtual_library.mjs',):
         port_file = WORK / 'preview-port.txt'
         port_file.unlink(missing_ok=True)
         with (WORK / f'{suite}.server.log').open('w') as log:

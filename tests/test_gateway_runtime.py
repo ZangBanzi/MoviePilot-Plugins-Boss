@@ -73,7 +73,14 @@ class Origin(BaseHTTPRequestHandler):
         cls.observed.append((self.path, dict(self.headers), body))
         headers = [('Content-Type', 'application/json')]
         status = 200
-        if url.path.endswith('/Views'):
+        if url.path == '/Users/u':
+            status = 401 if self.headers.get('X-Emby-Token') == 'expired' else 200
+            data = json.dumps({'Id': 'u'}).encode()
+        elif url.path == '/Users/Me':
+            status = 404; data = b'{}'
+        elif url.path == '/Users/other':
+            status = 403; data = b'{}'
+        elif url.path.endswith('/Views'):
             payload = {'Items': [{'Id': 'native', 'Name': '原始媒体库'}], 'TotalRecordCount': 1}
             data = json.dumps(payload, ensure_ascii=False).encode()
             mode = query.get('encoding', [''])[0]
@@ -191,7 +198,7 @@ async def close_pool(p):
     p._remove_gateway_routes()
 
 
-def test_ponytail_sync_and_cover_do_not_block_browsing(plugin_module, origin):
+def test_identity_and_snapshot_build_do_not_block_browsing(plugin_module, origin):
     # 排名匹配仍兼容别名、同名电影的年份和重复条目。
     module = plugin_module
     items = [
@@ -234,37 +241,6 @@ def test_ponytail_sync_and_cover_do_not_block_browsing(plugin_module, origin):
         assert task.result(timeout=2)['scanned'] == 2
     assert set(p._proxy_item_index) == {'a', 'b'}
 
-    async def check_cover():
-        p, app, view_id = setup_gateway(module, origin)
-        started, release = asyncio.Event(), threading.Event()
-        loop = asyncio.get_running_loop()
-        calls = []
-
-        def slow_render(view):
-            calls.append(view['id'])
-            loop.call_soon_threadsafe(started.set)
-            assert release.wait(3), '封面绘图阻塞了请求事件循环'
-            return b'\x89PNG\r\n\x1a\n'
-
-        p._render_cover_animated = lambda view: ('image/png', slow_render(view))
-        tasks = []
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://gateway') as client:
-            try:
-                tasks = [asyncio.create_task(client.get(f'/Items/{view_id}/Images/Primary')) for _ in range(2)]
-                await asyncio.wait_for(started.wait(), timeout=2)
-                assert all(not task.done() for task in tasks)
-                health = await asyncio.wait_for(client.get('/__mediaarchiver__/health'), timeout=1)
-                assert health.status_code == 200 and not release.is_set()
-            finally:
-                release.set()
-                responses = await asyncio.gather(*tasks, return_exceptions=True)
-                await close_pool(p)
-        assert all(isinstance(response, httpx.Response) and response.status_code == 200 for response in responses)
-        assert calls == [view_id], '同一封面并发请求只应绘制一次'
-
-    asyncio.run(check_cover())
-
-
 @pytest.mark.parametrize('encoding', ['', 'gzip', 'gzip_noheader', 'gzip_stale', 'stacked',
     'br', 'br_noheader', 'br_wrongheader', 'deflate', 'deflate_noheader', 'deflate_raw', 'utf16', 'zstd_unknownsize', 'retry'])
 def test_json_views(plugin_module, origin, encoding):
@@ -293,7 +269,7 @@ def test_invalid_json_diagnostics_and_retry(plugin_module, origin):
                 response = await client.get('/Users/u/Views?encoding=broken&api_key=never-log-this')
                 assert response.status_code == 502
             health = (await client.get('/__mediaarchiver__/health')).json()
-            assert health['version'] == '4.6.2'
+            assert health['version'] == '5.0.0'
             assert len(health['code_sha256']) == 64
             assert health['performance']['failures'] == 2
             assert health['performance']['suppressed_errors'] == 1
@@ -330,7 +306,7 @@ def test_cookies_headers_and_proxy_transparency(plugin_module, origin):
                 assert r.status_code == status and r.content == b''
             r = await client.head('/echo')
             assert r.status_code == 200 and r.content == b''
-            r = await client.head('/Users/u/Views')
+            r = await client.head('/Users/u/Views', headers={'X-Emby-Token': 'u'})
             assert r.status_code == 200 and r.content == b'' and int(r.headers['content-length']) > 0
         await close_pool(p)
     asyncio.run(check())
@@ -349,11 +325,12 @@ def test_routes_paging_and_user_isolation(plugin_module, origin):
             for route in ('/QuickConnect/Enabled', '/Trailers', '/MediaInfo'):
                 assert (await client.get(route)).status_code == 200
             for route in ('/Users/u/Items', '/Items'):
-                response = await client.get(route, params={'UserId': 'u', 'ParentId': view_id, 'StartIndex': 1, 'Limit': 1}, headers={'X-Emby-Token': 'limited'})
+                response = await client.get(route, params={'UserId': 'u', 'ParentId': view_id, 'StartIndex': 0, 'Limit': 1}, headers={'X-Emby-Token': 'limited'})
                 payload = response.json()
                 assert [x['Id'] for x in payload['Items']] == ['m2']
+                assert payload['TotalRecordCount'] == 1
                 assert payload['Items'][0]['MediaSources'][0]['Path'] == '/original/m2'
-            response = await client.get('/Items/Latest', params={'UserId': 'u', 'ParentId': view_id})
+            response = await client.get('/Items/Latest', params={'UserId': 'u', 'ParentId': view_id}, headers={'X-Emby-Token': 'u'})
             assert isinstance(response.json(), list)
         await close_pool(p)
     asyncio.run(check())
@@ -489,59 +466,25 @@ def test_websocket_real_upstream(plugin_module):
     asyncio.run(check())
 
 
-def test_real_animated_cover_and_static_client_formats(plugin_module, origin):
-    """用实际 Pillow 编码经过 FastAPI 路由，验证封面不会污染播放或缓存格式。"""
-    import io
-    from PIL import Image
 
+
+def test_virtual_detail_empty_and_expired_permission_scope(plugin_module, origin):
     async def check():
         p, app, view_id = setup_gateway(plugin_module, origin)
-        p._virtual_views[view_id]['key'] = 'attribute:remux'
-        from test_coverstudio import poster
-        p._virtual_views[view_id]['_cover_artwork'] = [poster('red'), poster('green'), poster('blue')]
-        try:
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://gateway') as client:
-                url = f'/Items/{view_id}/Images/Primary'
-                gif = await client.get(url)
-                assert gif.status_code == 200 and gif.headers['content-type'] == 'image/gif'
-                with Image.open(io.BytesIO(gif.content)) as image:
-                    assert image.n_frames == 15 and image.info['loop'] == 0
-                tags = {gif.headers['etag']}
-                for requested, expected in [('png', 'PNG'), ('jpg', 'JPEG'), ('webp', 'WEBP')]:
-                    response = await client.get(url, params={'Format': requested})
-                    assert response.status_code == 200
-                    with Image.open(io.BytesIO(response.content)) as image:
-                        assert image.format == expected and not getattr(image, 'is_animated', False)
-                    assert response.headers['etag'] not in tags
-                    tags.add(response.headers['etag'])
-                    cached = await client.get(url, params={'Format': requested},
-                                              headers={'If-None-Match': response.headers['etag']})
-                    assert cached.status_code == 304
-                head = await client.head(url)
-                assert head.status_code == 200 and not head.content
-                assert int(head.headers['content-length']) == len(gif.content)
-                assert (await client.get('/__mediaarchiver__/health')).status_code == 200
-                assert (await client.get(url)).content == gif.content
-        finally:
-            await close_pool(p)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://gateway') as client:
+            response = await client.get('/Users/u/Views', headers={'X-Emby-Token': 'limited'})
+            view = next(row for row in response.json()['Items'] if row['Id'] == view_id)
+            assert view['ChildCount'] == 1 and view['ImageTags'] == {}
+            assert (await client.get('/Users/other/Items/' + view_id, headers={'X-Emby-Token': 'u'})).status_code == 403
+            detail = await client.get('/Users/u/Items/' + view_id, headers={'X-Emby-Token': 'limited'})
+            assert detail.json()['ChildCount'] == 1
+            for route in ['/Users/u/Items/' + view_id, '/Users/u/Items?ParentId=' + view_id, '/Users/u/Views']:
+                assert (await client.get(route, headers={'X-Emby-Token': 'expired'})).status_code == 401
+            assert (await client.get('/Users/u/Items?ParentId=' + view_id)).status_code == 401
+            p._virtual_views[view_id]['item_ids'] = []
+            assert (await client.get('/Users/u/Items?ParentId=' + view_id, headers={'X-Emby-Token': 'expired'})).status_code == 401
+            assert (await client.get('/Users/u/Items/' + view_id, headers={'X-Emby-Token': 'u'})).status_code == 404
+            head = await client.head('/Users/u/Items?ParentId=' + view_id, headers={'X-Emby-Token': 'u'})
+            assert head.status_code == 200 and head.content == b'' and int(head.headers['content-length']) > 0
+        await close_pool(p)
     asyncio.run(check())
-
-
-def test_gif_encoding_failure_preserves_valid_png(plugin_module, monkeypatch):
-    import io
-    from PIL import Image
-    original = Image.Image.save
-
-    def fail_gif(self, fp, format=None, **kwargs):
-        if format == 'GIF':
-            raise OSError('simulated GIF encoder failure')
-        return original(self, fp, format=format, **kwargs)
-
-    monkeypatch.setattr(Image.Image, 'save', fail_gif)
-    p = plugin_module.MediaArchiver()
-    from test_coverstudio import poster
-    mime, data = p._render_cover_animated({'key': 'attribute:remux', 'item_ids': [], '_cover_artwork': [poster('red'), poster('green')]})
-    assert mime == 'image/png'
-    with Image.open(io.BytesIO(data)) as image:
-        image.load()
-        assert image.format == 'PNG'

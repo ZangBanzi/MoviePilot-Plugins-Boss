@@ -80,7 +80,7 @@ class _ASGIResponse:
     def __init__(self, content=b"", status_code=200, headers=None, media_type=None, **_kwargs):
         self.body = content if isinstance(content, bytes) else str(content).encode()
         self.status_code = status_code
-        self.headers = dict(headers or {})
+        self.headers = dict(headers if headers is not None else {"X-Emby-Token": "fixture-user"})
         if media_type:
             self.headers.setdefault("content-type", media_type)
 
@@ -124,7 +124,7 @@ class _FakeRequest:
     def __init__(self, path, query="", method="GET", headers=None, body=b""):
         self.url = types.SimpleNamespace(path=path, query=query, scheme="http")
         self.method = method
-        self.headers = dict(headers or {})
+        self.headers = dict(headers if headers is not None else {"X-Emby-Token": "fixture-user"})
         self.client = types.SimpleNamespace(host="127.0.0.1")
         self._body = body
 
@@ -147,6 +147,8 @@ def _install_moviepilot_stubs():
         "app.schemas": types.ModuleType("app.schemas"),
         "app.schemas.types": types.ModuleType("app.schemas.types"),
         "app.factory": types.ModuleType("app.factory"),
+        "app.db": types.ModuleType("app.db"),
+        "app.db.user_oper": types.ModuleType("app.db.user_oper"),
         "fastapi": types.ModuleType("fastapi"),
         "fastapi.routing": types.ModuleType("fastapi.routing"),
         "starlette": types.ModuleType("starlette"),
@@ -166,6 +168,8 @@ def _install_moviepilot_stubs():
     modules["app.plugins"]._PluginBase = _PluginBase
     modules["app.schemas.types"].EventType = types.SimpleNamespace(WebhookMessage="webhook")
     modules["app.factory"].app = _FakeApp()
+    modules["app.db.user_oper"].get_current_active_superuser = lambda: {"is_superuser": True}
+    modules["fastapi"].Depends = lambda dependency: dependency
     modules["fastapi"].Request = _FakeRequest
     modules["fastapi"].Response = _ASGIResponse
     modules["fastapi"].WebSocket = object
@@ -240,6 +244,9 @@ class _FakeOriginHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         route = parsed.path[5:] if parsed.path.startswith("/emby/") else parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        if route == "/Users/u":
+            self._json({"Id": "u"})
+            return
         if route == "/System/Info":
             self._json({"ServerName": "Fake", "Version": "4.9"})
             return
@@ -524,7 +531,6 @@ def main():
         "attribute:remux", "REMUX", "attribute", {"m1"},
         proxy._proxy_item_index, "2026-08-31T10:00:00Z",
     )
-    assert remux_single["cover_tag"] != remux["cover_tag"], "成员变化后封面标签必须刷新"
     proxy._virtual_views = {view["id"]: view for view in (remux, mixed, adult_view)}
     proxy._gateway_client_cache = module.EmbyClient(
         f"http://127.0.0.1:{origin.server_port}", "key"
@@ -557,9 +563,7 @@ def main():
     views_payload = json.loads(views_response.body)
     injected = [item for item in views_payload["Items"] if item["Id"] == remux["id"]]
     assert len(injected) == 1 and injected[0]["Type"] == "CollectionFolder"
-    assert injected[0]["ImageTags"]["Primary"] == remux["cover_tag"]
-    assert len(remux["cover_tag"]) == 32
-    assert injected[0]["PrimaryImageAspectRatio"] == 16 / 9
+    assert injected[0]["ImageTags"] == {}
     mixed_dto = next(item for item in views_payload["Items"] if item["Id"] == mixed["id"])
     assert mixed_dto["CollectionType"] is None, "混合电影/剧集库必须使用 null CollectionType"
     # 某些 Emby/反代即使收到 identity 仍返回压缩 JSON；网关必须先解压再注入。
@@ -626,31 +630,9 @@ def main():
     )).body)
     assert [item["Id"] for item in root_latest] == ["m2"]
     detail = json.loads(asyncio.run(proxy._emby_gateway(
-        _FakeRequest(f"/Items/{remux['id']}"), f"/Items/{remux['id']}"
+        _FakeRequest(f"/Items/{remux['id']}", "UserId=u"), f"/Items/{remux['id']}"
     )).body)
     assert detail["Name"] == "REMUX" and detail["ChildCount"] == 2
-    cover_response = asyncio.run(proxy._emby_gateway(
-        _FakeRequest(f"/Items/{remux['id']}/Images/Primary"),
-        f"/Items/{remux['id']}/Images/Primary",
-    ))
-    assert cover_response.headers.get("ETag") == f'"{remux["cover_tag"]}"'
-    assert cover_response.body.startswith((b"\x89PNG", b"GIF89a"))
-    original_pillow_renderer = proxy._render_cover_pillow
-    proxy._render_cover_pillow = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        RuntimeError("Pillow unavailable")
-    )
-    proxy._cover_cache.clear()
-    fallback_cover = proxy._render_cover_png(remux)
-    assert fallback_cover.startswith(b"\x89PNG"), "无 Pillow 时也必须输出动态 PNG 封面"
-    proxy._render_cover_pillow = original_pillow_renderer
-    cached = asyncio.run(proxy._emby_gateway(
-        _FakeRequest(
-            f"/Items/{remux['id']}/Images/Primary",
-            headers={"If-None-Match": f'"{remux["cover_tag"]}"'},
-        ),
-        f"/Items/{remux['id']}/Images/Primary",
-    ))
-    assert cached.status_code == 304
     redirect = asyncio.run(proxy._emby_gateway(
         _FakeRequest("/Videos/m1/stream"), "/Videos/m1/stream"
     ))
@@ -708,7 +690,12 @@ def main():
             self.peak_inflight = max(self.peak_inflight, self.inflight)
             await asyncio.sleep(0.002)
             self.inflight -= 1
-            if "/Users/u/Views" in request["url"]:
+            if urllib.parse.urlsplit(request["url"]).path == "/Users/u":
+                body = json.dumps({"Id": "u"}).encode()
+            elif "/Users/u/Items" in request["url"]:
+                ids = urllib.parse.parse_qs(urllib.parse.urlsplit(request["url"]).query)['Ids'][0].split(',')
+                body = json.dumps({"Items": [{"Id": key} for key in ids]}).encode()
+            elif "/Users/u/Views" in request["url"]:
                 body = json.dumps({"Items": [], "TotalRecordCount": 0}).encode()
             else:
                 body = json.dumps({"path": urllib.parse.urlsplit(request["url"]).path}).encode()
@@ -763,7 +750,7 @@ def main():
     asyncio.run(_exercise_pool())
     assert len(_FakeHttpx.clients) == 1, "全部网关请求应复用同一个异步连接池"
     assert _FakeHttpx.clients[0].peak_inflight > 1, "并发请求不应排队串行处理"
-    assert _FakeHttpx.clients[0].send_count == 33
+    assert _FakeHttpx.clients[0].send_count == 35
     assert fast_proxy._gateway_metrics["failures"] == 0
     fast_proxy.stop_service()
     assert _FakeHttpx.clients[0].is_closed, "插件停止时必须关闭连接池"
@@ -836,9 +823,9 @@ def main():
     assert fetcher._provider_id("apple_tv", "Movie") == 350
 
     assert module.MediaArchiver.PUBLIC_GATEWAY_PORT == 8098
-    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "4.6.2"
+    assert package["MediaArchiver"]["version"] == module.MediaArchiver.plugin_version == "5.0.0"
     assert module.MediaArchiver.plugin_author == "Boss"
-    print("PASS: 定时全量、增量校准、3334网关、首页View、动态封面、原ItemId、分页、Latest与302透传通过")
+    print("PASS: 定时全量、增量校准、3334网关、首页View、原生功能页、原ItemId、分页、Latest与302透传通过")
 
 
 if __name__ == "__main__":

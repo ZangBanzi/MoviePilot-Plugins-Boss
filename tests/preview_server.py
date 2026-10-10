@@ -1,92 +1,71 @@
-"""Local QA host. Uses constructed metadata/posters and only binds loopback.
-
-Not installed as a plugin component. Run after `npm run build:preview`.
-"""
-import argparse
+"""Random loopback native MoviePilot QA host, never installed in the plugin."""
 import json
+import socket
 import sys
+import time
 import types
-import uuid
 from pathlib import Path
-
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.staticfiles import StaticFiles
 import uvicorn
-from test_coverstudio import make_plugin, poster
-from test_native_covers import origin
+from test_gateway_runtime import load_plugin
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def build_app(work: Path):
-    root = Path(__file__).resolve().parents[1]
-    p, module, _ = make_plugin(work / 'preview-data' / uuid.uuid4().hex)
-    p._saved_config['tmdb_api_key'] = ''
-    p._virtual_views = {}
-    for key, name in [('4k', '4K 极清影院'), ('remux', 'Remux 原盘'), ('tvb', 'TVB 港剧'), ('hdr', 'HDR 视界')]:
-        view = p._make_virtual_view('attribute:'+key, name, 'attribute', ['m1', 'm2'], p._proxy_item_index, '2026-09-13')
-        p._virtual_views[view['id']] = view
-    p._proxy_status.update({'running': True, 'message': '本地构造样本 · 未连接 NAS', 'api_port': 3334, 'public_port': 8098})
-    p._runtime.update({'state': 'completed', 'message': '构造元数据用于页面验证'})
-    qa_origin = origin.__wrapped__()
-    _, emby_address = next(qa_origin)
-    p._gateway_client_cache = module.EmbyClient(emby_address, 'admin', timeout=5)
-    native_artwork = p._cover_studio.admin_artwork
-    p._cover_studio.admin_artwork = lambda view, opts: native_artwork(view, opts) if view.get('native') else ([poster('#143c57'), poster('#653f36'), poster('#27463f')], [])
-    p._cover_studio._save_studio_original = p._cover_studio._save_studio
+def build_app():
+    module = load_plugin()
+    plugin = module.MediaArchiver()
+    data = [{'Id': 'm1', 'Name': 'Alpha', 'Type': 'Movie', 'Path': '/Alpha.Remux.mkv',
+             'MediaSources': [{'MediaStreams': [{'Type': 'Video', 'Width': 3840, 'Height': 2160}]}]}]
+    class Client:
+        api_root = 'http://qa.invalid'
+        def library_items(self): time.sleep(.15); return data
+        def request_json(self, *args, **kwargs): return {'ServerName': '本地 Emby 替身', 'Version': 'fixture'}
+    plugin._create_clients = lambda: [(Client(), '本地 Emby 替身')]
+    plugin._server_options = lambda: [{'title': '本地 Emby 替身', 'value': '本地 Emby 替身'}]
+    plugin._install_gateway_routes = lambda: None  # QA tests host-rendering only.
+    plugin.init_plugin({'virtual_enabled': True, 'auto_sync': False, 'daily_sync_enabled': True})
     app = FastAPI()
-    app.add_event_handler('shutdown', qa_origin.close)
-    user_module = types.ModuleType('app.db.user_oper')
+    failure = {'page': False}
     def admin(request: Request):
-        if request.headers.get('Authorization') != 'Bearer local-test':
-            raise HTTPException(status_code=403)
-    user_module.get_current_active_superuser = admin
-    sys.modules['app.db.user_oper'] = user_module
-    for api in p.get_api():
-        route = dict(api); route.pop('auth')
-        route['path'] = '/api/v1/plugin/MediaArchiver'+route['path']
-        app.add_api_route(**route)
+        if request.headers.get('Authorization') != 'Bearer local-test': raise HTTPException(403)
+    sys.modules['app.db.user_oper'].get_current_active_superuser = admin
+    for api in plugin.get_api():
+        route = dict(api)
+        route.pop('auth')
+        route['path'] = '/api/v1/plugin/MediaArchiver' + route['path']
+        app.add_api_route(**route, response_model=None)
 
-    @app.post('/api/v1/plugin/MediaArchiver')
-    async def save_config(request: Request):
-        admin(request)
-        cfg = p._validate_studio_config(await request.json())
-        p._saved_config = cfg
-        p.update_config(cfg)
-        p._refresh_cover_tags()
-        return {'success': True}
+    @app.get('/api/v1/plugin/page/MediaArchiver', dependencies=[Depends(admin)])
+    def page():
+        if failure['page']:
+            failure['page'] = False
+            raise HTTPException(503)
+        return {'render_mode': plugin.get_render_mode()[0], 'page': plugin.get_page()}
 
-    @app.get('/host-vue.js')
-    def host_vue():
-        return FileResponse(root / 'frontend/node_modules/vue/dist/vue.esm-browser.prod.js', media_type='application/javascript')
+    @app.get('/api/v1/plugin/form/MediaArchiver', dependencies=[Depends(admin)])
+    def form():
+        fields, defaults = plugin.get_form()
+        return {'render_mode': plugin.get_render_mode()[0], 'conf': fields, 'model': {**defaults, **plugin._saved_config}}
 
-    @app.get('/federation')
-    def federation():
-        return HTMLResponse('''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="margin:0"><div id="fed"></div><script type="module">
-import * as Vue from '/host-vue.js';
-import {init,get} from '/api/v1/plugin/file/mediaarchiver/dist/assets/remoteEntry.js';
-init({vue:{[Vue.version]:{get:()=>()=>Vue,loaded:true}}});
-const api={get:async p=>(await fetch('/api/v1/'+p,{headers:{Authorization:'Bearer local-test'}})).json(),post:async(p,d)=>(await fetch('/api/v1/'+p,{method:'POST',headers:{Authorization:'Bearer local-test','Content-Type':'application/json'},body:JSON.stringify(d)})).json()};
-const factory=await get('./Page');const Page=factory();
-Vue.createApp({render:()=>Vue.h(Page,{api})}).mount('#fed');
-window.__federationReady=true;
-</script></body></html>''')
+    @app.put('/api/v1/plugin/MediaArchiver', dependencies=[Depends(admin)])
+    async def save(request: Request):
+        plugin.init_plugin(await request.json())
+        return {'success': True, 'message': '配置已保存'}
 
-    app.mount('/api/v1/plugin/file/mediaarchiver/dist/assets', StaticFiles(directory=root / 'plugins.v2/mediaarchiver/dist/assets'))
-    app.mount('/', StaticFiles(directory=work / 'preview', html=True))
+    @app.post('/api/v1/qa/fail-page', dependencies=[Depends(admin)])
+    def fail_page(): failure['page'] = True; return {'success': True}
+
+    app.mount('/', StaticFiles(directory=ROOT / '.work/preview', html=True), name='qa-static')
+    app.add_event_handler('shutdown', plugin.stop_service)
     return app
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=0)
-    parser.add_argument('--work', type=Path, default=Path(__file__).resolve().parents[1] / '.work')
-    args = parser.parse_args()
-    import socket
     sock = socket.socket()
-    sock.bind(('127.0.0.1', args.port))
+    sock.bind(('127.0.0.1', 0))
     port = sock.getsockname()[1]
-    args.work.mkdir(parents=True, exist_ok=True)
-    (args.work / 'preview-port.txt').write_text(str(port), encoding='utf-8')
-    print(f'QA preview: http://127.0.0.1:{port}', flush=True)
-    server = uvicorn.Server(uvicorn.Config(build_app(args.work), log_level='warning'))
-    server.run(sockets=[sock])
+    (ROOT / '.work').mkdir(exist_ok=True)
+    (ROOT / '.work/preview-port.txt').write_text(str(port))
+    uvicorn.Server(uvicorn.Config(build_app(), log_level='warning')).run(sockets=[sock])

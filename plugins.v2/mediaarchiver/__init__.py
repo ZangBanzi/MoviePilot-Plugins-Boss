@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import gzip
 import html
 import hashlib
@@ -19,7 +20,6 @@ import math
 import os
 import re
 import ssl
-import struct
 import threading
 import time
 import traceback
@@ -33,8 +33,9 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from .coverstudio import CoverStudio, DEFAULTS as COVER_DEFAULTS, MAX_IMAGE, normalize_options, normalize_artwork
-from .cache import ImageCache
+
+from .catalog import ViewerCatalog, CatalogDenied
+from . import native_ui
 
 from app import schemas
 from app.core.config import settings
@@ -1124,7 +1125,7 @@ class MediaArchiver(_PluginBase):
     plugin_name = "媒体虚拟库"
     plugin_desc = "复用MoviePilot与NextEmby现有端口输出一级虚拟库，不创建合集。"
     plugin_icon = "folder-move.svg"
-    plugin_version = "4.6.2"
+    plugin_version = "5.0.0"
     plugin_author = "Boss"
     author_url = "https://github.com/ZangBanzi"
     plugin_config_prefix = "mediaarchiver_"
@@ -1132,7 +1133,8 @@ class MediaArchiver(_PluginBase):
     auth_level = 1
     PUBLIC_GATEWAY_PORT = 8098
     GATEWAY_ROUTE_NAME = "MediaArchiver_emby_gateway"
-    SELECTION_CACHE_LIMIT = 192
+    SELECTION_CACHE_LIMIT = 64
+    SELECTION_CACHE_IDS = 250_000
 
     ATTRIBUTE_RULES: Dict[str, Dict[str, Any]] = {
         "remux": {"name": "Remux专区", "icon": "mdi-disc", "hint": "具体文件名或媒体源名称含独立Remux标记", "types": {"movie"}},
@@ -1142,30 +1144,6 @@ class MediaArchiver(_PluginBase):
         "atmos": {"name": "Atmos专区", "icon": "mdi-surround-sound", "hint": "音频流 Atmos/JOC 信息", "types": {"movie"}},
         "tvb": {"name": "TVB港剧专区", "icon": "mdi-television-classic", "hint": "明确TVB厂牌或标签；港剧和平台可播不等于TVB出品", "types": {"movie", "series"}},
         "adult": {"name": "伦理专区", "icon": "mdi-lock-alert", "hint": "明确情色类型/标签；Emby标签“伦理”加入，“排除伦理”排除", "types": {"movie", "series"}},
-    }
-    # 一级虚拟库封面模板。只保存品牌识别色与文字标志，不在线下载图片；
-    # 这样断网也能生成封面，同时避免把外部图片地址写入 Emby。
-    COVER_THEMES: Dict[str, Dict[str, str]] = {
-        "remux": {"logo": "REMUX", "bg": "#090B10", "bg2": "#242A35", "accent": "#D4AF37", "fg": "#FFFFFF"},
-        "4k": {"logo": "4K UHD", "bg": "#07131C", "bg2": "#123C52", "accent": "#00C8FF", "fg": "#FFFFFF"},
-        "dolby_vision": {"logo": "DOLBY VISION", "bg": "#050505", "bg2": "#262626", "accent": "#FFFFFF", "fg": "#FFFFFF"},
-        "hdr": {"logo": "HDR", "bg": "#180A25", "bg2": "#5B1B72", "accent": "#FFB000", "fg": "#FFFFFF"},
-        "atmos": {"logo": "DOLBY ATMOS", "bg": "#07121A", "bg2": "#173A4E", "accent": "#7BD8FF", "fg": "#FFFFFF"},
-        "popular": {"logo": "HOT", "bg": "#2A0B24", "bg2": "#6E1933", "accent": "#FF7139", "fg": "#FFFFFF"},
-        "netflix": {"logo": "N", "bg": "#050505", "bg2": "#1A0507", "accent": "#E50914", "fg": "#FFFFFF"},
-        "hbo": {"logo": "HBO", "bg": "#050505", "bg2": "#242424", "accent": "#F2F2F2", "fg": "#FFFFFF"},
-        "apple_tv": {"logo": "tv+", "bg": "#050505", "bg2": "#252525", "accent": "#FFFFFF", "fg": "#FFFFFF"},
-        "disney_plus": {"logo": "Disney+", "bg": "#06143F", "bg2": "#123F95", "accent": "#55B7FF", "fg": "#FFFFFF"},
-        "crunchyroll": {"logo": "CRUNCHYROLL", "bg": "#2B160A", "bg2": "#6A2A0B", "accent": "#F47521", "fg": "#FFFFFF"},
-        "amazon_prime": {"logo": "prime video", "bg": "#061D2A", "bg2": "#063E59", "accent": "#00A8E1", "fg": "#FFFFFF"},
-        "amazon": {"logo": "amazon", "bg": "#101820", "bg2": "#273746", "accent": "#FF9900", "fg": "#FFFFFF"},
-        "hulu": {"logo": "hulu", "bg": "#041F16", "bg2": "#07452E", "accent": "#1CE783", "fg": "#FFFFFF"},
-        "maoyan": {"logo": "MAOYAN", "bg": "#2D070A", "bg2": "#83151E", "accent": "#F03D37", "fg": "#FFFFFF"},
-        "douban": {"logo": "DOUBAN", "bg": "#062116", "bg2": "#0B5D37", "accent": "#00B51D", "fg": "#FFFFFF"},
-        "tencent": {"logo": "TENCENT VIDEO", "bg": "#07172C", "bg2": "#0C4165", "accent": "#20D36B", "fg": "#FFFFFF"},
-        "tvb": {"logo": "TVB", "bg": "#061C3D", "bg2": "#0B55A0", "accent": "#F5C542", "fg": "#FFFFFF"},
-        "adult": {"logo": "18+", "bg": "#1C0B12", "bg2": "#4A1025", "accent": "#FF6B8A", "fg": "#FFFFFF"},
-        "default": {"logo": "VIRTUAL", "bg": "#111827", "bg2": "#3730A3", "accent": "#818CF8", "fg": "#FFFFFF"},
     }
     TVB_LABELS = frozenset({
         "tvb", "television broadcasts", "television broadcasts limited", "无线电视",
@@ -1189,7 +1167,6 @@ class MediaArchiver(_PluginBase):
     def __init__(self) -> None:
         super().__init__()
         self._saved_config: Dict[str, Any] = {}
-        self._cover_studio = CoverStudio(self)
         self._enabled = False
         self._attribute_enabled = False
         self._ranking_enabled = False
@@ -1201,8 +1178,6 @@ class MediaArchiver(_PluginBase):
         self._proxy_lock = threading.RLock()
         self._virtual_views: Dict[str, Dict[str, Any]] = {}
         self._proxy_item_index: Dict[str, Dict[str, Any]] = {}
-        self._cover_cache = ImageCache()
-        self._cover_lock = threading.Lock()
         self._selection_cache: OrderedDict = OrderedDict()
         self._selection_index: Any = None
         self._proxy_status: Dict[str, Any] = {
@@ -1225,9 +1200,6 @@ class MediaArchiver(_PluginBase):
         self._gateway_last_error_at = float("-inf")
         self._gateway_suppressed_errors = 0
         self._gateway_last_error: Dict[str, Any] = {}
-        self._cover_users: Dict[str, tuple] = {}
-        self._cover_tickets: Dict[str, dict] = {}
-        self._cover_ticket_secret = os.urandom(32)
         self._decoder_status = {
             "gzip": True, "deflate": True,
             "br": bool(importlib.util.find_spec("brotli") or importlib.util.find_spec("brotlicffi")),
@@ -1259,19 +1231,22 @@ class MediaArchiver(_PluginBase):
         self._ranking_cache: Dict[str, RankingResult] = {}
 
     def init_plugin(self, config: Optional[dict] = None) -> None:
-        self._cover_studio.invalidate_jobs()
-        self._sync_cancel.set()
-        self._sync_cancel = threading.Event()
         with self._proxy_lock:
-            self._cover_users.clear()
-            self._cover_tickets.clear()
-            self._cover_ticket_secret = os.urandom(32)
-        self._remove_gateway_routes()
+            self._initialize(config)
+
+    def _initialize(self, config: Optional[dict] = None) -> None:
+        with self._proxy_lock:
+            self._sync_cancel.set()
+            self._sync_cancel = threading.Event()
+            self._runtime = {"state": "idle", "message": "配置已载入，等待同步", "mode": "", "stats": {}}
+            self._remove_gateway_routes()
         self._close_httpx_client()
         self._cancel_timers()
         self._stopping = False
-        cfg = dict(config or {})
+        cfg = dict(config) if isinstance(config, Mapping) else {}
+        cfg.pop("cover_studio", None)
         self._saved_config = cfg
+        self._ranking_cache = {}
         # v3.2 起主页面只保留功能开关：任一虚拟库开启即视为插件启用。
         # 仍读取旧 enabled 字段，保证从 v3.1 及更早版本无损升级。
         self._enabled = bool(
@@ -1289,6 +1264,8 @@ class MediaArchiver(_PluginBase):
         selected_servers = cfg.get("emby_servers") or []
         if isinstance(selected_servers, str):
             selected_servers = [selected_servers]
+        if not isinstance(selected_servers, (list, tuple)):
+            selected_servers = []
         selected_server = str(cfg.get("emby_server") or "").strip()
         # 新界面为单服务器选择；一旦用户明确选择，就不要被旧版隐藏的
         # emby_servers 列表抢占优先级。仅在新字段为空时兼容旧配置。
@@ -1314,6 +1291,8 @@ class MediaArchiver(_PluginBase):
         region_value = cfg.get("ranking_regions") or "US,GB,JP,KR,HK,TW"
         if isinstance(region_value, str):
             region_value = region_value.split(",")
+        if not isinstance(region_value, (list, tuple)):
+            region_value = ["US", "GB", "JP", "KR", "HK", "TW"]
         self._ranking_regions = [str(x).strip().upper() for x in region_value if str(x).strip()][:12]
         self._ranking_feed_url = str(cfg.get("ranking_feed_url") or "").strip()
         self._ranking_feed_token = str(cfg.get("ranking_feed_token") or "").strip()
@@ -1335,7 +1314,6 @@ class MediaArchiver(_PluginBase):
             self._boot_timer = threading.Timer(15.0, self._scheduled_sync)
             self._boot_timer.daemon = True
             self._boot_timer.start()
-        self._cover_studio.activate_jobs()
 
     @staticmethod
     def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -1377,7 +1355,7 @@ class MediaArchiver(_PluginBase):
             logs = self.get_data("virtual_logs") or []
             if isinstance(state, dict):
                 if "servers" in state:
-                    self._state.update(state)
+                    self._state.update(copy.deepcopy(state))
                 elif state.get("server"):
                     # v3.0.0 单服务器状态迁移。
                     self._state["servers"] = {
@@ -1393,6 +1371,34 @@ class MediaArchiver(_PluginBase):
                 self._logs = deque(logs[-300:], maxlen=300)
         except Exception as err:
             logger.warning("[媒体虚拟库] 读取状态失败：%s", err)
+        self._normalize_state()
+
+    def _normalize_state(self) -> None:
+        state = self._state
+        servers = state.get("servers")
+        state["servers"] = {str(key): dict(value) for key, value in servers.items()
+                            if isinstance(value, Mapping)} if isinstance(servers, Mapping) else {}
+        for server in state["servers"].values():
+            for key in ("virtual_views", "attribute_counts", "ranking_counts", "item_index"):
+                if not isinstance(server.get(key), Mapping):
+                    server[key] = {}
+            server["item_index"] = {str(key): dict(value) for key, value in server["item_index"].items()
+                                     if isinstance(value, Mapping)}
+            views = {}
+            for key, view in server["virtual_views"].items():
+                if not isinstance(view, Mapping):
+                    continue
+                view = dict(view)
+                values = view.get("item_ids")
+                view["item_ids"] = list(dict.fromkeys(str(value) for value in values if value)) if isinstance(values, (list, tuple)) else []
+                views[str(key)] = view
+            server["virtual_views"] = views
+        for key in ("source_status", "connection_test"):
+            value = state.get(key)
+            state[key] = dict(value) if isinstance(value, Mapping) else {}
+        state["source_status"] = {key: dict(value) for key, value in state["source_status"].items()
+                                  if isinstance(value, Mapping)}
+        self._logs = deque((dict(row) for row in self._logs if isinstance(row, Mapping)), maxlen=300)
 
     def _save_state(self) -> None:
         self.save_data("virtual_state", self._state)
@@ -1416,7 +1422,7 @@ class MediaArchiver(_PluginBase):
                 if str(value.get("name") or "") == wanted_name:
                     selected = value
                     break
-        if selected is None and states:
+        if selected is None and states and not wanted_name:
             selected = states[0]
         restored: Dict[str, Dict[str, Any]] = {}
         if selected:
@@ -1430,12 +1436,12 @@ class MediaArchiver(_PluginBase):
                     "id": str(view.get("id") or self._view_id(str(key))),
                     "item_ids": list(dict.fromkeys(item_ids)),
                 })
-                normalized["cover_tag"] = str(
-                    self._cover_tag(str(normalized["key"]), normalized["item_ids"])
-                )
+                normalized.pop("cover_tag", None)
                 restored[str(normalized["id"])] = normalized
         with self._proxy_lock:
             self._virtual_views = restored
+            self._proxy_item_index = dict((selected or {}).get("item_index") or {})
+            self._selection_cache.clear()
 
     @staticmethod
     def _moviepilot_api_port() -> int:
@@ -1563,101 +1569,21 @@ class MediaArchiver(_PluginBase):
             {"path": "/status", "endpoint": self.status, "methods": ["GET"],
              "auth": "bear", "summary": "查询同步状态"},
         ]
-        studio_apis = [
-            {"path": "/studio", "endpoint": self.studio_state, "methods": ["GET"],
-             "auth": "bear", "summary": "封面工坊状态"},
-            {"path": "/studio/action", "endpoint": self.studio_action, "methods": ["POST"],
-             "auth": "bear", "summary": "封面预览、方案、字体及历史操作"},
-        ]
         try:
             from fastapi import Depends
             from app.db.user_oper import get_current_active_superuser
-            for api in studio_apis:
+            for api in apis:
                 api["dependencies"] = [Depends(get_current_active_superuser)]
         except ImportError:
-            # Fail closed on hosts without the administrator dependency; legacy APIs remain.
-            studio_apis = []
-        return apis + studio_apis
+            # A host without administrator authentication cannot expose management APIs.
+            return []
+        apis.append({"path": "/refresh", "endpoint": self.status, "methods": ["GET"],
+                     "auth": "bear", "dependencies": apis[-1]["dependencies"],
+                     "summary": "刷新虚拟库页面"})
+        return apis
 
     def get_render_mode(self) -> Tuple[str, str]:
-        return "vue", "dist/assets"
-
-    def studio_state(self, light: bool = False) -> schemas.Response:
-        try:
-            if light:
-                return schemas.Response(success=True, data={
-                    "job": self._cover_studio.job_snapshot(), "runtime": self.status().data})
-            data = self._cover_studio.state()
-            data["ranking_groups"] = [dict(group) for group in RANK_GROUPS]
-            data["rankings"] = RANK_META
-            data["runtime"] = self.status().data
-            return schemas.Response(success=True, data=data)
-        except Exception as err:
-            logger.error("[媒体虚拟库] 读取封面工坊失败：%s", type(err).__name__)
-            return schemas.Response(success=False, message="封面工坊数据读取失败，请检查插件数据目录与依赖")
-
-    async def studio_action(self, request: Request) -> Response:
-        try:
-            # Base64 font upload is bounded even if Content-Length is absent or forged.
-            body = bytearray()
-            async for chunk in request.stream():
-                body.extend(chunk)
-                if len(body) > 33 * 1024 * 1024:
-                    return self._json_response(413, {"success": False, "message": "请求超过大小限制"})
-            data = json.loads(body)
-            if not isinstance(data, dict):
-                raise ValueError("请求必须是 JSON 对象")
-            if data.get("action") == "validate_config":
-                cfg = await asyncio.to_thread(self._validate_studio_config, data.get("config"))
-                return self._json_response(200, {"success": True, "data": {"config": cfg}})
-            result = await asyncio.to_thread(self._cover_studio.action, data)
-            return self._json_response(200, {"success": True, "data": result})
-        except (ValueError, TypeError, KeyError) as err:
-            return self._json_response(400, {"success": False, "message": str(err)[:180]})
-        except Exception as err:
-            logger.error("[媒体虚拟库] 封面工坊操作失败：%s", type(err).__name__)
-            return self._json_response(500, {"success": False, "message": "操作失败，请检查插件依赖和数据目录"})
-
-    def _validate_studio_config(self, value: Any) -> dict:
-        if self._cover_studio.job_lock.locked():
-            raise ValueError("封面正在生成，完成或停止后再保存配置")
-        if not isinstance(value, dict):
-            raise ValueError("配置格式无效")
-        cfg = dict(self._saved_config)
-        defaults = self.get_form()[1]
-        cfg.update({key: val for key, val in value.items() if key in defaults})
-        for key, default in defaults.items():
-            if isinstance(default, bool) and key in cfg and not isinstance(cfg[key], bool):
-                raise ValueError(f"{key} 必须是开关值")
-        if cfg.get("daily_sync_enabled", True):
-            _, error = self._normalize_sync_cron(cfg.get("sync_cron", "0 4 * * *"))
-            if error:
-                raise ValueError("Cron 无效："+error)
-        studio = cfg.get("cover_studio") or {}
-        if not isinstance(studio, dict):
-            raise ValueError("封面配置格式无效")
-        clean = {"defaults": normalize_options(studio.get("defaults") or {}),
-                 "history_enabled": studio.get("history_enabled", True) is True,
-                 "history_limit": self._bounded_int(studio.get("history_limit"), 30, 1, 100)}
-        overrides = studio.get("overrides") or {}
-        if not isinstance(overrides, dict) or len(overrides) > 256:
-            raise ValueError("独立封面配置过多或格式无效")
-        clean["overrides"] = {str(key)[:120]: normalize_options(opts) for key, opts in overrides.items()}
-        presets = studio.get("presets") or []
-        if not isinstance(presets, list) or len(presets) > 20:
-            raise ValueError("自定义方案最多 20 个")
-        clean["presets"] = [{"id": str(p["id"])[:40], "name": str(p["name"])[:40],
-                             "options": normalize_options(p["options"])} for p in presets]
-        cfg["cover_studio"] = clean
-        return cfg
-
-    def _refresh_cover_tags(self) -> None:
-        with self._proxy_lock:
-            self._virtual_views = {identifier: dict(view, cover_tag=self._cover_tag(
-                str(view.get("key")), view.get("item_ids") or []))
-                for identifier, view in self._virtual_views.items()}
-        # Swap the reference; never acquire the rendering lock while holding the studio lock.
-        self._cover_cache = ImageCache()
+        return "vuetify", ""
 
     def rebuild(self) -> schemas.Response:
         return self._start_sync("rebuild")
@@ -1686,7 +1612,11 @@ class MediaArchiver(_PluginBase):
         return schemas.Response(success=bool(result["ok"]), message=message, data=result)
 
     def status(self) -> schemas.Response:
-        data = dict(self._runtime)
+        with self._proxy_lock:
+            return self._status_snapshot()
+
+    def _status_snapshot(self) -> schemas.Response:
+        data = copy.deepcopy(self._runtime)
         active_servers = sum(
             1 for state in (self._state.get("servers") or {}).values()
             if not isinstance(state, dict) or state.get("active", True)
@@ -1696,14 +1626,14 @@ class MediaArchiver(_PluginBase):
             "last_sync": self._state.get("last_sync") or "",
             "selected_rankings": len(self._selected_rankings),
             "active_servers": active_servers,
-            "source_status": self._state.get("source_status") or {},
+            "source_status": copy.deepcopy(self._state.get("source_status") or {}),
             "proxy": dict(self._proxy_status),
             "virtual_views": len(self._virtual_views),
             "daily_sync_enabled": self._daily_sync_enabled,
             "sync_cron": self._sync_cron,
         })
         return schemas.Response(
-            success=data.get("state") != "failed", message=str(data.get("message") or ""), data=data
+            success=True, message=str(data.get("message") or ""), data=data
         )
 
     # ------------------------------------------------------------------
@@ -1761,7 +1691,6 @@ class MediaArchiver(_PluginBase):
             performance["async_pool"] = bool(httpx is not None)
             return self._json_response(200, {
                 "ok": True, "version": self.plugin_version, "code_sha256": SOURCE_SHA256,
-                "cover_engine": getattr(self._cover_studio, "engine_version", "reload-required"),
                 "sync_state": self._runtime.get("state", "unknown"),
                 "pid": os.getpid(), "gateway": dict(self._proxy_status),
                 "views": len(self._virtual_views), "items": len(self._proxy_item_index),
@@ -1784,9 +1713,6 @@ class MediaArchiver(_PluginBase):
         detail_match = re.fullmatch(
             r"/(?:Users/[^/]+/)?Items/([0-9a-f]{32})/?", route, flags=re.I
         )
-        image_match = re.fullmatch(
-            r"/Items/([0-9a-f]{32})/Images/Primary(?:/\d+)?/?", route, flags=re.I
-        )
         with self._proxy_lock:
             view = dict(self._virtual_views.get(self._query_value(query, "ParentId")) or {})
 
@@ -1794,27 +1720,36 @@ class MediaArchiver(_PluginBase):
             with self._proxy_lock:
                 detail_view = dict(self._virtual_views.get(detail_match.group(1)) or {})
             if detail_view:
-                return self._json_response(200, self._synthetic_view(detail_view))
-
-        if image_match:
-            with self._proxy_lock:
-                image_view = dict(self._virtual_views.get(image_match.group(1)) or {})
-            if image_view:
-                return await self._studio_gateway_cover(request, image_view)
+                try:
+                    visible = await ViewerCatalog(self, request, route).views([detail_view])
+                    if not visible:
+                        return self._json_response(404, {"error": "Virtual library unavailable"})
+                    return self._virtual_json(request, self._synthetic_view(visible[0]))
+                except CatalogDenied as denied:
+                    return denied.response
+                except Exception as err:
+                    self._gateway_failed(err, request, route, "authorize_catalog")
+                    return self._json_response(502, {"error": "Emby catalog authorization failed"})
 
         if (items_match or latest_match) and view:
             return await self._virtual_items_response(
                 request, route, view, query, latest=bool(latest_match)
             )
         if views_match:
-            def scoped_views(status, headers, body):
-                status, headers, body = self._inject_views(status, headers, body)
-                if status == 200:
-                    body = self._scope_cover_views(request, route, body)
-                return status, headers, body
-            return await self._gateway_buffered_response(
-                request, route, transform=scoped_views, force_identity=True
-            )
+            try:
+                with self._proxy_lock:
+                    views = [dict(value) for value in self._virtual_views.values()]
+                visible = await ViewerCatalog(self, request, route).views(views)
+                return await self._gateway_buffered_response(
+                    request, route,
+                    transform=lambda status, headers, body: self._inject_views(status, headers, body, visible),
+                    force_identity=True,
+                )
+            except CatalogDenied as denied:
+                return denied.response
+            except Exception as err:
+                self._gateway_failed(err, request, route, "authorize_catalog")
+                return self._json_response(502, {"error": "Emby catalog authorization failed"})
         return await self._gateway_stream_response(request, route)
 
     def _synthetic_view(
@@ -1824,10 +1759,6 @@ class MediaArchiver(_PluginBase):
         view_id = str(view.get("id") or self._view_id(str(view.get("key") or view.get("name"))))
         name = str(view.get("name") or "虚拟媒体库")
         count = len(view.get("item_ids") or [])
-        cover_tag = str(
-            view.get("cover_tag")
-            or self._cover_tag(str(view.get("key") or name), view.get("item_ids") or [])
-        )
         raw_collection_type = str(view.get("collection_type") or "").casefold()
         # Emby 的混合电影/剧集库不是名为 "mixed" 的 CollectionType；协议要求
         # 返回 null，让客户端采用通用浏览页面。返回未知字符串会令部分客户端
@@ -1840,7 +1771,7 @@ class MediaArchiver(_PluginBase):
             "ServerId": str(template.get("ServerId") or view.get("server_id") or ""),
             "Id": view_id,
             "Guid": view_id,
-            "Etag": cover_tag,
+            "Etag": hashlib.md5(json.dumps([view_id, view.get("updated"), view.get("item_ids")], sort_keys=True).encode()).hexdigest(),
             "DisplayPreferencesId": view_id,
             "PresentationUniqueKey": view_id,
             "DateCreated": str(view.get("updated") or "2000-01-01T00:00:00.0000000Z"),
@@ -1860,9 +1791,8 @@ class MediaArchiver(_PluginBase):
             "CollectionType": collection_type,
             "ChildCount": count,
             "RecursiveItemCount": count,
-            "ImageTags": {"Primary": cover_tag},
+            "ImageTags": {},
             "BackdropImageTags": [],
-            "PrimaryImageAspectRatio": 1.7777777777777777,
             "SupportsSync": True,
             "UserData": {
                 "PlaybackPositionTicks": 0, "IsFavorite": False, "Played": False,
@@ -1871,6 +1801,7 @@ class MediaArchiver(_PluginBase):
 
     def _inject_views(
         self, status: int, headers: List[Tuple[str, str]], body: bytes,
+        visible: Optional[List[dict]] = None,
     ) -> Tuple[int, List[Tuple[str, str]], bytes]:
         if status < 200 or status >= 300:
             return status, headers, body
@@ -1884,7 +1815,7 @@ class MediaArchiver(_PluginBase):
         existing = {str(item.get("Id")) for item in items if isinstance(item, Mapping)}
         template = next((item for item in items if isinstance(item, Mapping)), {})
         with self._proxy_lock:
-            views = [dict(value) for value in self._virtual_views.values()]
+            views = visible if visible is not None else [dict(value) for value in self._virtual_views.values()]
         for view in views:
             if str(view.get("id")) not in existing:
                 items.append(self._synthetic_view(view, template))
@@ -1901,61 +1832,28 @@ class MediaArchiver(_PluginBase):
         query: Mapping[str, List[str]],
         latest: bool,
     ) -> Response:
-        selected, total = self._select_view_item_ids(view, query, latest)
-        if not selected:
-            return self._json_response(
-                200,
-                [] if latest else {"Items": [], "TotalRecordCount": total, "StartIndex": 0},
-            )
+        try:
+            result = await ViewerCatalog(self, request, route).page(view, query, latest)
+            return self._virtual_json(request, result)
+        except CatalogDenied as denied:
+            return denied.response
+        except Exception as err:
+            self._gateway_failed(err, request, route, "authorize_catalog")
+            return self._json_response(502, {"error": "Emby catalog read failed"})
 
-        pairs = urllib.parse.parse_qsl(
-            str(request.url.query or ""), keep_blank_values=True
-        )
-        discarded = {"parentid", "startindex", "limit", "ids", "sortby", "sortorder"}
-        pairs = [(key, value) for key, value in pairs if key.casefold() not in discarded]
-        pairs.extend([
-            ("Ids", ",".join(selected)),
-            ("Recursive", "true"),
-            ("StartIndex", "0"),
-            ("Limit", str(len(selected))),
-        ])
-        user_match = re.match(r"/Users/([^/]+)/", route, flags=re.I)
-        upstream_route = (
-            f"/Users/{user_match.group(1)}/Items" if user_match else "/Items"
-        )
-        target = upstream_route + "?" + urllib.parse.urlencode(pairs, doseq=True)
-
-        def transform(
-            status: int, headers: List[Tuple[str, str]], body: bytes,
-        ) -> Tuple[int, List[Tuple[str, str]], bytes]:
-            if status < 200 or status >= 300:
-                return status, headers, body
-            value = json.loads(body.decode("utf-8"))
-            raw_items = value.get("Items") if isinstance(value, dict) else value
-            if not isinstance(raw_items, list):
-                raw_items = []
-            by_id = {
-                str(item.get("Id")): item for item in raw_items if isinstance(item, Mapping)
-            }
-            ordered = [by_id[item_id] for item_id in selected if item_id in by_id]
-            result: Any = ordered if latest else {
-                "Items": ordered,
-                "TotalRecordCount": total,
-                "StartIndex": self._int_query(query, "StartIndex", 0, 0, 1_000_000),
-            }
-            return status, headers, json.dumps(
-                result, ensure_ascii=False, separators=(",", ":")
-            ).encode("utf-8")
-
-        return await self._gateway_buffered_response(
-            request, target, transform=transform, force_identity=True
-        )
+    def _virtual_json(self, request: Request, result: Any) -> Response:
+        response = self._json_response(200, result)
+        if str(request.method).upper() == "HEAD":
+            response.headers["Content-Length"] = str(len(response.body))
+            response.body = b""
+        return response
 
     def _select_view_item_ids(
         self,
         view: Mapping[str, Any],
         query: Mapping[str, List[str]],
         latest: bool,
+        paginate: bool = True,
     ) -> Tuple[List[str], int]:
         # 同步线程只会整体替换该字典，不会原地修改；保留当前引用即可，
         # 避免每个浏览请求都复制整个媒体索引。
@@ -1975,7 +1873,7 @@ class MediaArchiver(_PluginBase):
             cached = self._selection_cache.get(cache_key)
             if cached and time.monotonic() - cached[0] < 30:
                 self._selection_cache.move_to_end(cache_key)
-                return list(cached[1][start:start + limit]), len(cached[1])
+                return list(cached[1][start:start + limit] if paginate else cached[1]), len(cached[1])
         ids = list(dict.fromkeys(str(x) for x in (view.get("item_ids") or []) if str(x)))
         include_types = {
             value.strip().casefold()
@@ -2016,7 +1914,12 @@ class MediaArchiver(_PluginBase):
             if key in {"datecreated", "datelastcontentadded", "datelastsaved", "premieredate"}:
                 value: Any = str(item.get(sort_by) or item.get("DateCreated") or item.get("PremiereDate") or "")
             elif key in {"productionyear", "communityrating", "criticrating"}:
-                value = float(item.get(sort_by) or item.get("ProductionYear") or 0)
+                try:
+                    value = float(item.get(sort_by) or item.get("ProductionYear") or 0)
+                    if not math.isfinite(value):
+                        value = 0.0
+                except (TypeError, ValueError):
+                    value = 0.0
             elif key == "random":
                 value = hashlib.sha1(item_id.encode("utf-8")).hexdigest()
             else:
@@ -2028,9 +1931,10 @@ class MediaArchiver(_PluginBase):
         with self._proxy_lock:
             if self._selection_index is index:
                 self._selection_cache[cache_key] = (time.monotonic(), tuple(ids))
-                while len(self._selection_cache) > self.SELECTION_CACHE_LIMIT:
+                while (len(self._selection_cache) > self.SELECTION_CACHE_LIMIT
+                       or sum(len(entry[1]) for entry in self._selection_cache.values()) > self.SELECTION_CACHE_IDS):
                     self._selection_cache.popitem(last=False)
-        return ids[start:start + limit], total
+        return (ids[start:start + limit] if paginate else ids), total
 
     def _int_query(
         self, query: Mapping[str, List[str]], name: str, default: int,
@@ -2045,419 +1949,6 @@ class MediaArchiver(_PluginBase):
             content=payload, status_code=status,
             headers={"Cache-Control": "no-store"},
             media_type="application/json; charset=utf-8",
-        )
-
-    def _cover_tag(self, key: str, item_ids: Iterable[str], options: Optional[dict] = None) -> str:
-        """成员未变化时保持稳定；成员变化后让 Emby 客户端自动刷新封面。"""
-        members = ",".join(sorted({str(value) for value in item_ids if str(value)}))
-        # Emby Web 的部分版本按 32 位 ImageTag 处理，使用完整 MD5 避免不发起图片请求。
-        style = self._cover_studio.fingerprint(key, options)
-        return hashlib.md5(f"cover-studio-v2|{style}|{key}|{members}".encode("utf-8")).hexdigest()
-
-    def _cover_theme(self, view: Mapping[str, Any]) -> Dict[str, str]:
-        key = str(view.get("key") or "")
-        theme_key = "default"
-        if key.startswith("attribute:"):
-            theme_key = key.split(":", 1)[1]
-        elif key.startswith("ranking:"):
-            rank_key = key.split(":", 1)[1]
-            theme_key = str((RANK_META.get(rank_key) or {}).get("group") or "default")
-        return dict(self.COVER_THEMES.get(theme_key) or self.COVER_THEMES["default"])
-
-    @staticmethod
-    def _hex_rgb(value: str) -> Tuple[int, int, int]:
-        text = str(value or "#000000").lstrip("#")
-        if len(text) == 3:
-            text = "".join(char * 2 for char in text)
-        try:
-            return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
-        except (TypeError, ValueError):
-            return 0, 0, 0
-
-    @staticmethod
-    def _pillow_font(image_font: Any, size: int, bold: bool = True) -> Any:
-        candidates = (
-            os.path.join(os.path.dirname(__file__), "fonts", "NotoSansSC.ttf"),
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
-            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        )
-        for path in candidates:
-            try:
-                return image_font.truetype(path, size=size)
-            except Exception:
-                continue
-        return image_font.load_default()
-
-    def _render_cover_pillow(self, view: Mapping[str, Any]) -> Optional[bytes]:
-        try:
-            options = view.get('_cover_options') or self._cover_studio.options(view)
-            image = self._cover_studio.render_frame(view, options, view.get('_cover_artwork'))
-            output = io.BytesIO()
-            image.save(output, format='PNG', optimize=True)
-            return output.getvalue()
-        except ImportError:
-            return None
-
-    _BITMAP_FONT: Dict[str, Tuple[str, ...]] = {
-        "A": ("01110","10001","10001","11111","10001","10001","10001"),
-        "B": ("11110","10001","10001","11110","10001","10001","11110"),
-        "C": ("01111","10000","10000","10000","10000","10000","01111"),
-        "D": ("11110","10001","10001","10001","10001","10001","11110"),
-        "E": ("11111","10000","10000","11110","10000","10000","11111"),
-        "F": ("11111","10000","10000","11110","10000","10000","10000"),
-        "G": ("01111","10000","10000","10111","10001","10001","01111"),
-        "H": ("10001","10001","10001","11111","10001","10001","10001"),
-        "I": ("11111","00100","00100","00100","00100","00100","11111"),
-        "J": ("00111","00010","00010","00010","10010","10010","01100"),
-        "K": ("10001","10010","10100","11000","10100","10010","10001"),
-        "L": ("10000","10000","10000","10000","10000","10000","11111"),
-        "M": ("10001","11011","10101","10101","10001","10001","10001"),
-        "N": ("10001","11001","10101","10011","10001","10001","10001"),
-        "O": ("01110","10001","10001","10001","10001","10001","01110"),
-        "P": ("11110","10001","10001","11110","10000","10000","10000"),
-        "Q": ("01110","10001","10001","10001","10101","10010","01101"),
-        "R": ("11110","10001","10001","11110","10100","10010","10001"),
-        "S": ("01111","10000","10000","01110","00001","00001","11110"),
-        "T": ("11111","00100","00100","00100","00100","00100","00100"),
-        "U": ("10001","10001","10001","10001","10001","10001","01110"),
-        "V": ("10001","10001","10001","10001","10001","01010","00100"),
-        "W": ("10001","10001","10001","10101","10101","10101","01010"),
-        "X": ("10001","10001","01010","00100","01010","10001","10001"),
-        "Y": ("10001","10001","01010","00100","00100","00100","00100"),
-        "Z": ("11111","00001","00010","00100","01000","10000","11111"),
-        "0": ("01110","10001","10011","10101","11001","10001","01110"),
-        "1": ("00100","01100","00100","00100","00100","00100","01110"),
-        "2": ("01110","10001","00001","00010","00100","01000","11111"),
-        "3": ("11110","00001","00001","01110","00001","00001","11110"),
-        "4": ("00010","00110","01010","10010","11111","00010","00010"),
-        "5": ("11111","10000","10000","11110","00001","00001","11110"),
-        "6": ("01110","10000","10000","11110","10001","10001","01110"),
-        "7": ("11111","00001","00010","00100","01000","01000","01000"),
-        "8": ("01110","10001","10001","01110","10001","10001","01110"),
-        "9": ("01110","10001","10001","01111","00001","00001","01110"),
-        "+": ("00000","00100","00100","11111","00100","00100","00000"),
-        "-": ("00000","00000","00000","11111","00000","00000","00000"),
-        " ": ("00000","00000","00000","00000","00000","00000","00000"),
-    }
-
-    @staticmethod
-    def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(payload)) + chunk_type + payload
-            + struct.pack(">I", zlib.crc32(chunk_type + payload) & 0xFFFFFFFF)
-        )
-
-    def _render_cover_basic_png(self, view: Mapping[str, Any]) -> bytes:
-        """纯标准库 PNG，确保精简容器无 Pillow/中文字体时封面仍可显示。"""
-        width, height = 960, 540
-        theme = self._cover_theme(view)
-        start, end = self._hex_rgb(theme["bg"]), self._hex_rgb(theme["bg2"])
-        accent, foreground = self._hex_rgb(theme["accent"]), self._hex_rgb(theme["fg"])
-        pixels = bytearray(width * height * 3)
-        for y in range(height):
-            factor = y / max(1, height - 1)
-            color = bytes(round(start[i] * (1 - factor) + end[i] * factor) for i in range(3))
-            offset = y * width * 3
-            pixels[offset:offset + width * 3] = color * width
-
-        def rectangle(x1: int, y1: int, x2: int, y2: int, color: Tuple[int, int, int]) -> None:
-            left, right = max(0, x1), min(width, x2)
-            row = bytes(color) * max(0, right - left)
-            for y in range(max(0, y1), min(height, y2)):
-                offset = (y * width + left) * 3
-                pixels[offset:offset + len(row)] = row
-
-        def draw_text(text: str, center_y: int, scale: int, color: Tuple[int, int, int]) -> None:
-            text = "".join(char for char in text.upper() if char in self._BITMAP_FONT)
-            if not text:
-                return
-            character_width = 6 * scale
-            total_width = max(0, len(text) * character_width - scale)
-            x_start = max(88, (width - total_width) // 2)
-            y_start = center_y - (7 * scale) // 2
-            for index, char in enumerate(text):
-                glyph = self._BITMAP_FONT[char]
-                for row_index, row_bits in enumerate(glyph):
-                    for column_index, bit in enumerate(row_bits):
-                        if bit == "1":
-                            x = x_start + index * character_width + column_index * scale
-                            y = y_start + row_index * scale
-                            rectangle(x, y, x + scale, y + scale, color)
-
-        rectangle(54, 62, 70, 478, accent)
-        logo = str(theme.get("logo") or "VIRTUAL")
-        scale = 24 if len(logo) <= 2 else 17 if len(logo) <= 5 else 10 if len(logo) <= 11 else 7
-        draw_text(logo, 225, scale, accent)
-        draw_text("VIRTUAL LIBRARY", 355, 8, foreground)
-        draw_text(f"{len(view.get('item_ids') or [])} ITEMS - LIVE", 435, 5, foreground)
-        raw = b"".join(
-            b"\x00" + bytes(pixels[y * width * 3:(y + 1) * width * 3])
-            for y in range(height)
-        )
-        signature = b"\x89PNG\r\n\x1a\n"
-        return (
-            signature
-            + self._png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-            + self._png_chunk(b"IDAT", zlib.compress(raw, 6))
-            + self._png_chunk(b"IEND", b"")
-        )
-
-    def _render_cover_png(self, view: Mapping[str, Any]) -> bytes:
-        try:
-            payload = self._render_cover_pillow(view)
-            if payload:
-                return payload
-        except Exception as err:
-            logger.warning("[媒体虚拟库] Pillow封面生成失败，已切换无依赖PNG：%s", err)
-        return self._render_cover_basic_png(view)
-
-    def _render_cover_animated(self, view: Mapping[str, Any]) -> Tuple[str, bytes]:
-        try:
-            options = view.get('_cover_options') or self._cover_studio.options(view)
-            return self._cover_studio.encode(view, options, view.get('_cover_artwork'), 'gif')
-        except Exception:
-            return 'image/png', self._render_cover_png(view)
-
-    @staticmethod
-    def _cover_auth(request):
-        pairs = [(k, v) for k, v in urllib.parse.parse_qsl(str(request.url.query or ""), keep_blank_values=True)
-                 if k.casefold() in {"api_key", "apikey", "token", "x-emby-token", "x-mediabrowser-token"}]
-        headers = [(str(k).casefold(), str(v)) for k, v in request.headers.items()
-                   if str(k).casefold() in {"authorization", "x-emby-authorization", "x-emby-token",
-                                           "x-mediabrowser-token", "cookie"}]
-        tokens = [v for _, v in pairs] + [v for k, v in headers if k in {"x-emby-token", "x-mediabrowser-token"}]
-        for k, v in headers:
-            if k in {"authorization", "x-emby-authorization"}:
-                match = re.search(r'\bToken\s*=\s*"?([^",\s]+)', v, flags=re.I)
-                if match:
-                    tokens.append(match.group(1))
-        identity = sorted(set(tokens)) or sorted(headers)
-        if not tokens and not any(k == "cookie" or (k == "authorization" and v.lower().startswith(("bearer ", "basic ")))
-                                  for k, v in headers):
-            headers = []  # A device-only X-Emby-Authorization header is not a credential.
-        return pairs, headers, hashlib.sha256(json.dumps(identity).encode()).hexdigest()
-
-    def _scope_cover_views(self, request, route, body):
-        """Emby image elements often omit authentication headers. Issue an opaque,
-        short-lived, per-view capability from a successful authenticated Views read.
-        It is only usable for that cover; the upstream user's permissions are still
-        revalidated on every request. It never uses the MoviePilot administrator key.
-        """
-        pairs, headers, identity = self._cover_auth(request)
-        if not (pairs or headers):
-            return body
-        user_id = route.strip('/').split('/')[1]
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
-            return body
-        payload = json.loads(body)
-        now = time.monotonic()
-        with self._proxy_lock:
-            if len(self._cover_users) >= 512:
-                self._cover_users.pop(next(iter(self._cover_users)))
-            self._cover_users[identity] = (now, user_id)
-            for item in payload.get("Items", []):
-                if str(item.get("Id")) not in self._virtual_views:
-                    continue
-                revision = (item.get("ImageTags") or {}).get("Primary", "")
-                ticket = hashlib.blake2b(f"{identity}|{user_id}|{item['Id']}|{revision}".encode(),
-                    key=self._cover_ticket_secret, digest_size=16).hexdigest()
-                if len(self._cover_tickets) >= 2048:
-                    self._cover_tickets.pop(next(iter(self._cover_tickets)))
-                self._cover_tickets[ticket] = {"time": now, "view": item["Id"], "user": user_id,
-                                               "pairs": pairs, "headers": headers}
-                item["ImageTags"]["Primary"] = ticket
-        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
-
-    def _render_cover_static(self, view: Mapping[str, Any], image_format: str) -> Tuple[str, bytes]:
-        png = self._render_cover_png(view)
-        if image_format == "png":
-            return "image/png", png
-        try:
-            from PIL import Image
-            with Image.open(io.BytesIO(png)) as source:
-                output = io.BytesIO()
-                source.convert("RGB").save(output, format=image_format.upper(), quality=85)
-                return "image/" + image_format, output.getvalue()
-        except Exception:
-            return "image/png", png
-
-    async def _studio_gateway_cover(self, request: Request, view: dict) -> Response:
-        """Read poster metadata with the incoming user's credentials, never the MP admin key."""
-        studio = self._cover_studio
-        options = studio.options(view)
-        view = dict(view, _cover_options=options)
-        auth_pairs, auth_headers, identity = self._cover_auth(request)
-        verified_hint = ""
-        with self._proxy_lock:
-            known = self._cover_users.get(identity)
-            if known and time.monotonic()-known[0] < 3600:
-                verified_hint = known[1]
-            if not (auth_pairs or auth_headers):
-                tag = next((v for k, v in urllib.parse.parse_qsl(str(request.url.query or "")) if k.casefold() == "tag"), "")
-                ticket = self._cover_tickets.get(tag)
-                if ticket and ticket["view"] == view.get("id") and time.monotonic()-ticket["time"] < 3600:
-                    auth_pairs, auth_headers = ticket["pairs"], ticket["headers"]
-                    verified_hint = ticket["user"]
-        outcome = "fallback"
-        if options["source"] == "brand" or not (auth_pairs or auth_headers) or not view.get("item_ids"):
-            # Unauthenticated requests can only see a locally drawn brand graphic.
-            response = await asyncio.to_thread(self._virtual_cover_response, request, view)
-            response.headers["Cache-Control"] = "private, no-store"
-            response.headers["X-MediaArchiver-Cover"] = "brand" if options["source"] == "brand" else "fallback"
-            response.headers["Vary"] = "Authorization, X-Emby-Token, X-MediaBrowser-Token, X-Emby-Authorization, Cookie"
-            return response
-        try:
-            client = self._gateway_client_cache or await asyncio.to_thread(self._gateway_client)
-            target, _ = self._upstream_target(client, "/Users/Me")
-            headers = self._forward_request_headers(request, target, b"", True)
-            headers = {k: v for k, v in headers.items() if k.casefold() not in {
-                "if-none-match", "if-modified-since", "range", "accept", "content-type"}}
-            headers.update(dict(auth_headers))
-            headers["Accept"] = "application/json"
-
-            async def get_json(path, query):
-                route = path + "?" + urllib.parse.urlencode(auth_pairs + query)
-                status, response_headers, body = await asyncio.wait_for(
-                    self._fetch_gateway_bytes(client, "GET", route, headers, b""), timeout=5)
-                if status != 200:
-                    return status, {}
-                return status, json.loads(self._decode_buffered_body(response_headers, body))
-
-            status, user = await get_json(f"/Users/{verified_hint}" if verified_hint else "/Users/Me", [])
-            user_id = str(user.get("Id") or "") if isinstance(user, dict) else ""
-            if status in {401, 403}:
-                raise ValueError("authentication-unavailable")
-            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
-                # Unknown identity may use the brand fallback, but must never fetch admin artwork.
-                view["_cover_scope"] = "identity-unavailable"
-            else:
-                ids = studio.select_ids(view, options)
-                status, payload = await get_json(f"/Users/{user_id}/Items", [
-                    ("Ids", ",".join(ids)), ("Recursive", "true"), ("Limit", str(len(ids))),
-                    ("Fields", "DateCreated,SortName"), ("EnableImages", "true"),
-                ])
-                if status in {401, 403}:
-                    raise ValueError("permission-unavailable")
-                permitted = {str(item.get("Id")): item for item in payload.get("Items", [])
-                             if isinstance(item, dict) and str(item.get("Id")) in ids} if isinstance(payload, dict) else {}
-                selected = [identifier for identifier in ids if identifier in permitted]
-                selected.sort(key=lambda identifier: studio.image_priority(permitted[identifier], options))
-                revision = [(identifier, permitted[identifier].get("ImageTags"),
-                             permitted[identifier].get("BackdropImageTags")) for identifier in selected]
-                scope = hashlib.sha256(json.dumps([sorted(auth_headers), sorted(auth_pairs), user_id,
-                    revision, studio.fingerprint(str(view.get("key")), options)], sort_keys=True).encode()).hexdigest()
-                view["_cover_scope"] = scope
-                cache_key = ("user", client.api_root, scope)
-                with studio.lock:
-                    cached = studio.art_cache.get(cache_key)
-                if cached and time.monotonic() - cached[0] < 60:
-                    view["_cover_artwork"] = cached[1]
-                elif selected:
-                    async def get_image(identifier):
-                        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", identifier):
-                            return None
-                        for kind in studio.image_kinds(options):
-                            route = f"/Items/{identifier}/Images/{kind}?" + urllib.parse.urlencode(
-                                auth_pairs + [("MaxWidth", "720"), ("MaxHeight", "720"), ("Format", "jpg")])
-                            try:
-                                status, image_headers, body = await asyncio.wait_for(self._fetch_gateway_bytes(
-                                    client, "GET", route, dict(headers, Accept="image/*"), b""), timeout=3)
-                                if status == 200 and len(body) <= MAX_IMAGE:
-                                    try:
-                                        picture = await asyncio.to_thread(normalize_artwork, body)
-                                    except Exception:
-                                        # A proxy may compress images despite Accept-Encoding: identity.
-                                        # Decode transport compression before checking the image itself.
-                                        for encoding in reversed(self._content_encodings(image_headers)):
-                                            body = self._decode_codec(encoding, body)
-                                        if len(body) > MAX_IMAGE:
-                                            continue
-                                        picture = await asyncio.to_thread(normalize_artwork, body)
-                                    return picture
-                            except Exception:
-                                continue
-                        return None
-                    artwork, seen = [], set()
-                    async def collect_artwork():
-                        wanted = studio.artwork_limit(options)
-                        # Three at a time; continue after missing/corrupt/duplicate images.
-                        for offset in range(0, len(selected), 3):
-                            for data in await asyncio.gather(*(get_image(i) for i in selected[offset:offset+3])):
-                                if data and hashlib.sha256(data).digest() not in seen:
-                                    seen.add(hashlib.sha256(data).digest())
-                                    artwork.append(data)
-                            if len(artwork) >= wanted:
-                                break
-                    try:
-                        await asyncio.wait_for(collect_artwork(), timeout=12)
-                    except asyncio.TimeoutError:
-                        pass
-                    artwork = artwork[:studio.artwork_limit(options)]
-                    view["_cover_artwork"] = artwork
-                    with studio.lock:
-                        studio.art_cache[cache_key] = (time.monotonic(), artwork)
-                # Byte changes and recovered artwork must invalidate a previously cached fallback.
-                art_digest = hashlib.sha256(b"".join(hashlib.sha256(data).digest()
-                    for data in view.get("_cover_artwork", []))).hexdigest()
-                view["_cover_scope"] = scope + ":" + art_digest
-                outcome = "artwork" if view.get("_cover_artwork") else "no-artwork"
-        except Exception:
-            view["_cover_scope"] = "artwork-unavailable"
-        response = await asyncio.to_thread(self._virtual_cover_response, request, view)
-        response.headers["Cache-Control"] = "private, no-cache" if outcome == "artwork" else "private, no-store"
-        response.headers["X-MediaArchiver-Cover"] = outcome
-        response.headers["Vary"] = "Authorization, X-Emby-Token, X-MediaBrowser-Token, X-Emby-Authorization, Cookie"
-        return response
-
-    def _virtual_cover_response(
-        self, request: Request, view: Mapping[str, Any],
-    ) -> Response:
-        options = view.get("_cover_options") or self._cover_studio.options(view)
-        view = dict(view, _cover_options=options)
-        tag = self._cover_tag(str(view.get("key") or view.get("name")), view.get("item_ids") or [], options)
-        if view.get("_cover_scope"):
-            tag = hashlib.md5(f"{tag}|{view['_cover_scope']}".encode()).hexdigest()
-        # 客户端明确要求静态格式时尊重其能力；缓存与 ETag 按格式隔离。
-        query = getattr(request, "query_params", {})
-        default_format = "gif" if options["animated"] else "png"
-        image_format = str(next((value for key, value in query.items()
-                                 if str(key).casefold() == "format"), default_format)).casefold()
-        image_format = {"jpg": "jpeg"}.get(image_format, image_format)
-        if image_format not in {"png", "jpeg", "webp", "gif"}:
-            image_format = default_format
-        if image_format == "gif" and not options["animated"]:
-            image_format = "png"
-        if image_format != "gif":
-            tag = hashlib.md5(f"{tag}|{image_format}".encode("utf-8")).hexdigest()
-        etag = f'"{tag}"'
-        if str(request.headers.get("If-None-Match") or "").strip() == etag:
-            return Response(status_code=304, headers={"ETag": etag})
-        # A warm cover must not wait for another library's cold GIF encode.
-        # Keep cold renders serialized to bound transient Pillow memory and CPU.
-        cache = self._cover_cache
-        cached = cache.get(tag)
-        if cached is None:
-            with self._cover_lock:
-                cached = cache.get(tag)
-                if cached is None:
-                    cached = (self._render_cover_animated(view) if image_format == "gif"
-                              else self._render_cover_static(view, image_format))
-                    # A config/cache reset swaps the cache. In-flight renders only
-                    # update their old instance, never repopulate the new cache.
-                    cache[tag] = cached
-        mime_type, payload = cached
-        return Response(
-            content=b"" if str(request.method).upper() == "HEAD" else payload,
-            status_code=200,
-            headers={
-                "Cache-Control": "public, max-age=86400", "ETag": etag,
-                "X-Content-Type-Options": "nosniff",
-                "Content-Length": str(len(payload)),
-            },
-            media_type=mime_type,
         )
 
     def _gateway_client(self) -> EmbyClient:
@@ -3115,494 +2606,42 @@ class MediaArchiver(_PluginBase):
         attributes = {key: 0 for key in self.ATTRIBUTE_RULES}
         rankings = {key: 0 for key in RANK_META}
         for state in (self._state.get("servers") or {}).values():
-            if isinstance(state, dict) and not state.get("active", True):
+            if not isinstance(state, dict) or not state.get("active", True):
                 continue
             for key, value in (state.get("attribute_counts") or {}).items():
-                attributes[key] = attributes.get(key, 0) + int(value or 0)
+                attributes[key] = attributes.get(key, 0) + self._bounded_int(value, 0, 0, 1_000_000_000)
             for key, value in (state.get("ranking_counts") or {}).items():
-                rankings[key] = rankings.get(key, 0) + int(value or 0)
+                rankings[key] = rankings.get(key, 0) + self._bounded_int(value, 0, 0, 1_000_000_000)
         return attributes, rankings
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """傻瓜式配置：选择 MoviePilot Emby、专区和自动维护即可。"""
-        attribute_counts, ranking_counts = self._aggregate_counts()
-        active_server_count = sum(
-            1 for state in (self._state.get("servers") or {}).values()
-            if not isinstance(state, dict) or state.get("active", True)
-        )
-        connection_test = self._state.get("connection_test") or {}
-        if connection_test:
-            connection_type = "success" if connection_test.get("ok") else "error"
-            connection_text = str(connection_test.get("message") or "连接状态未知")
-            if connection_test.get("time"):
-                connection_text += f"｜{connection_test['time']}"
-        else:
-            connection_type = "info"
-            connection_text = "尚未测试；插件会直接读取 MoviePilot 已保存的 Emby 配置。"
-        proxy_type = "success" if self._proxy_status.get("running") else "warning"
-        proxy_text = (
-            f"{self._proxy_status.get('message') or 'MoviePilot 内置网关未注册'}；"
-            f"NextEmby 对外地址仍为 NAS-IP:{self.PUBLIC_GATEWAY_PORT}"
-        )
-
-        attribute_cards: List[dict] = []
-        for key, rule in self.ATTRIBUTE_RULES.items():
-            attribute_cards.append({"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
-                {"component": "VCard", "props": {"variant": "outlined", "class": "h-100"}, "content": [
-                    {"component": "VCardText", "content": [
-                        {"component": "div", "props": {"class": "d-flex align-center mb-2"}, "content": [
-                            {"component": "VIcon", "props": {"icon": rule["icon"], "class": "mr-2 text-primary"}},
-                            {"component": "div", "props": {"class": "font-weight-bold"}, "text": rule["name"]},
-                            {"component": "VSpacer"},
-                            {"component": "VChip", "props": {"size": "small", "variant": "tonal"},
-                             "text": f"{attribute_counts.get(key, 0)} 项"},
-                        ]},
-                        {"component": "VCheckbox", "props": {
-                            "model": f"zone_{key}", "label": "启用此专区", "hide-details": True,
-                        }},
-                        {"component": "div", "props": {"class": "text-caption mt-1"}, "text": rule["hint"]},
-                    ]},
-                ]},
-            ]})
-
-        ranking_cards: List[dict] = []
-        for group in RANK_GROUPS:
-            checks: List[dict] = []
-            for key, label in group["items"]:
-                checks.append({"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 4}, "content": [
-                    {"component": "VCheckbox", "props": {
-                        "model": f"rank_{key}", "label": RANK_META[key]["label"], "hide-details": True,
-                    }},
-                ]})
-            selected = sum(1 for key, _ in group["items"] if key in self._selected_rankings)
-            hits = sum(ranking_counts.get(key, 0) for key, _ in group["items"])
-            ranking_cards.append({"component": "VCol", "props": {"cols": 12}, "content": [
-                {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2"}, "content": [
-                    {"component": "VCardTitle", "props": {"class": "d-flex align-center flex-wrap"}, "content": [
-                        {"component": "VIcon", "props": {"icon": group["icon"], "class": "mr-3"}},
-                        {"component": "div", "content": [
-                            {"component": "div", "text": group["name"]},
-                            {"component": "div", "props": {"class": "text-caption"}, "text": group["subtitle"]},
-                        ]},
-                        {"component": "VSpacer"},
-                        {"component": "VChip", "props": {"size": "small", "variant": "tonal"},
-                         "text": f"已选 {selected}｜命中 {hits}"},
-                    ]},
-                    {"component": "VCardText", "content": [{"component": "VRow", "content": checks}]},
-                ]},
-            ]})
-
-        token = self._secret(getattr(settings, "API_TOKEN", ""))
-        form = {"component": "VForm", "content": [
-            {"component": "VCard", "props": {"variant": "tonal", "color": "primary", "class": "mb-4"}, "content": [
-                {"component": "VCardText", "content": [
-                    {"component": "div", "props": {"class": "text-overline text-primary"},
-                     "text": "EMBY VIRTUAL LIBRARY"},
-                    {"component": "div", "props": {"class": "text-h4 font-weight-bold mb-2"},
-                     "text": "Emby 媒体虚拟库"},
-                    {"component": "div", "props": {"class": "text-body-1 mb-4"},
-                     "text": "选择 MoviePilot 已配置的 Emby，勾选专区并重建；客户端继续使用 NextEmby 8098。"},
-                    {"component": "VAlert", "props": {
-                        "type": "success", "variant": "tonal", "class": "mb-4",
-                        "title": "零新增端口",
-                        "text": f"插件复用 MoviePilot API 端口 {self._moviepilot_api_port()}；NextEmby 继续独占并对外提供 8098，插件不会监听 8097、8098 或 8099。",
-                    }},
-                    {"component": "VSelect", "props": {
-                        "model": "emby_server", "label": "MoviePilot 已配置的 Emby",
-                        "items": self._server_options(), "clearable": True,
-                        "prepend-inner-icon": "mdi-server-network",
-                        "hint": "留空会自动使用第一台 Emby；当前你的 MoviePilot 配置仍应指向原生 8096。",
-                        "persistent-hint": True,
-                    }},
-                    {"component": "VAlert", "props": {
-                        "type": connection_type, "variant": "tonal", "class": "my-3",
-                        "title": "Emby 连接状态", "text": connection_text,
-                    }},
-                    {"component": "VAlert", "props": {
-                        "type": proxy_type, "variant": "tonal", "class": "my-3",
-                        "title": "8098 虚拟库链路", "text": proxy_text,
-                    }},
-                    {"component": "div", "props": {"class": "d-flex flex-wrap ga-3"}, "content": [
-                        {"component": "VBtn", "props": {
-                            "color": "primary", "variant": "outlined", "prepend-icon": "mdi-lan-connect",
-                        }, "text": "测试连接", "events": {"click": {
-                            "api": "plugin/MediaArchiver/test_connection", "method": "post",
-                            "params": {"token": token},
-                        }}},
-                        {"component": "VBtn", "props": {
-                            "color": "primary", "variant": "flat", "prepend-icon": "mdi-refresh",
-                        }, "text": "一键重建", "events": {"click": {
-                            "api": "plugin/MediaArchiver/rebuild", "method": "post",
-                            "params": {"token": token},
-                        }}},
-                    ]},
-                ]},
-            ]},
-            {"component": "VRow", "props": {"class": "mb-3"}, "content": [
-                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "tonal", "class": "h-100"}, "content": [
-                        {"component": "VCardText", "content": [
-                            {"component": "VSwitch", "props": {
-                                "model": "ranking_enabled", "label": "启用榜单虚拟库",
-                                "color": "primary", "hide-details": True,
-                            }},
-                            {"component": "div", "props": {"class": "text-caption mt-2"},
-                             "text": "把勾选的平台榜单显示成首页独立栏目。"},
-                        ]},
-                    ]},
-                ]},
-                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "tonal", "class": "h-100"}, "content": [
-                        {"component": "VCardText", "content": [
-                            {"component": "VSwitch", "props": {
-                                "model": "virtual_enabled", "label": "启用媒体属性专区",
-                                "color": "primary", "hide-details": True,
-                            }},
-                            {"component": "div", "props": {"class": "text-caption mt-2"},
-                             "text": "Remux、4K、Dolby Vision、HDR、Atmos。"},
-                        ]},
-                    ]},
-                ]},
-                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "tonal", "class": "h-100"}, "content": [
-                        {"component": "VCardText", "content": [
-                            {"component": "VSwitch", "props": {
-                                "model": "auto_sync", "label": "实时增量维护",
-                                "color": "primary", "hide-details": True,
-                            }},
-                            {"component": "div", "props": {"class": "text-caption mt-2"},
-                             "text": "自动跟踪新增、更新和删除，并轻量校准。"},
-                        ]},
-                    ]},
-                ]},
-                {"component": "VCol", "props": {"cols": 12, "sm": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "tonal", "class": "h-100"}, "content": [
-                        {"component": "VCardText", "content": [
-                            {"component": "VSwitch", "props": {
-                                "model": "daily_sync_enabled", "label": "定时更新全部专区",
-                                "color": "primary", "hide-details": True,
-                            }},
-                            {"component": "VTextField", "props": {
-                                "model": "sync_cron", "label": "更新时间（Cron）",
-                                "placeholder": "0 4 * * *", "density": "compact", "class": "mt-2",
-                                "prepend-inner-icon": "mdi-clock-outline",
-                                "hint": "标准5段Cron；每天4点：0 4 * * *",
-                                "persistent-hint": True,
-                            }},
-                        ]},
-                    ]},
-                ]},
-            ]},
-            {"component": "VRow", "props": {"class": "mb-4"}, "content": [
-                {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "outlined"}, "content": [
-                        {"component": "VCardText", "text": f"{len(self._selected_rankings)}\n已选榜单"},
-                    ]},
-                ]},
-                {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "outlined"}, "content": [
-                        {"component": "VCardText", "text": f"{sum(ranking_counts.values())}\n榜单命中"},
-                    ]},
-                ]},
-                {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "outlined"}, "content": [
-                        {"component": "VCardText", "text": f"{sum(attribute_counts.values())}\n属性命中"},
-                    ]},
-                ]},
-                {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "outlined"}, "content": [
-                        {"component": "VCardText", "text": f"{active_server_count}\n生效服务器"},
-                    ]},
-                ]},
-            ]},
-            {"component": "div", "props": {"class": "text-h5 font-weight-bold mb-1"}, "text": "选择榜单"},
-            {"component": "div", "props": {"class": "text-body-2 mb-3"},
-             "text": "先勾选上方“启用榜单虚拟库”，再选择需要的榜单；每一项都会成为首页一级虚拟库。"},
-            {"component": "VRow", "content": ranking_cards},
-            {"component": "div", "props": {"class": "text-h5 font-weight-bold mt-5 mb-1"},
-             "text": "媒体属性专区"},
-            {"component": "div", "props": {"class": "text-body-2 mb-3"},
-             "text": "先勾选上方“启用媒体属性专区”，再选择需要自动维护的专区。"},
-            {"component": "VRow", "content": attribute_cards},
-            {"component": "VExpansionPanels", "props": {
-                "multiple": True, "variant": "accordion", "class": "mt-5",
-            }, "content": [
-                {"component": "VExpansionPanel", "content": [
-                    {"component": "VExpansionPanelTitle", "content": [
-                        {"component": "VIcon", "props": {"icon": "mdi-cog-outline", "class": "mr-2"}},
-                        {"component": "span", "text": "高级设置（通常不用改）"},
-                    ]},
-                    {"component": "VExpansionPanelText", "content": [
-                        {"component": "VAlert", "props": {
-                            "type": "warning", "variant": "tonal", "class": "mb-3",
-                            "text": "增量间隔用于轻量维护；Cron 触发时会全量刷新所有专区和榜单。时间按 MoviePilot 容器时区执行。",
-                        }},
-                        {"component": "VRow", "content": [
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {
-                                    "model": "sync_interval", "label": "校准间隔（分钟）", "type": "number",
-                                }},
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {
-                                    "model": "timeout", "label": "连接超时（秒）", "type": "number",
-                                }},
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {
-                                    "model": "ranking_limit", "label": "每榜最多条目", "type": "number",
-                                }},
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 3}, "content": [
-                                {"component": "VTextField", "props": {
-                                    "model": "ranking_language", "label": "榜单语言",
-                                }},
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {
-                                    "model": "ranking_regions", "label": "平台榜地区（英文逗号分隔）",
-                                }},
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {
-                                    "model": "tmdb_domain", "label": "TMDB API 域名覆盖（通常留空）",
-                                }},
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {
-                                    "model": "tmdb_api_key", "label": "TMDB API Key 覆盖（通常留空）",
-                                    "type": "password",
-                                }},
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {
-                                    "model": "ranking_feed_url", "label": "自定义榜单 JSON Feed（可选）",
-                                }},
-                            ]},
-                            {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                                {"component": "VTextField", "props": {
-                                    "model": "ranking_feed_token", "label": "Feed Bearer Token（可选）",
-                                    "type": "password",
-                                }},
-                            ]},
-                        ]},
-                    ]},
-                ]},
-            ]},
-            {"component": "VAlert", "props": {
-                "type": "success", "variant": "tonal", "class": "mt-5",
-                "title": "最简单的使用方法",
-                "text": f"MoviePilot继续连接原生Emby:8096 → NextEmby的原始服务器端口改为{self._moviepilot_api_port()} → 插件一键重建 → 客户端仍访问NAS-IP:8098。",
-            }},
-        ]}
-        defaults: Dict[str, Any] = {
-            "enabled": True, "virtual_enabled": True, "ranking_enabled": False,
-            "auto_sync": True, "daily_sync_enabled": True,
-            "sync_cron": "0 4 * * *",
-            "emby_server": "", "emby_servers": [],
-            "sync_interval": 60, "timeout": 30, "tmdb_api_key": "", "tmdb_domain": "",
-            "ranking_regions": "US,GB,JP,KR,HK,TW", "ranking_limit": 100,
-            "ranking_language": "zh-CN", "ranking_feed_url": "", "ranking_feed_token": "",
-        }
-        defaults.update({f"zone_{key}": True for key in self.ATTRIBUTE_RULES})
-        defaults.update({f"rank_{key}": key in DEFAULT_RANKINGS for key in RANK_META})
-        defaults["cover_studio"] = {"defaults": dict(COVER_DEFAULTS), "overrides": {}, "presets": [],
-                                    "history_enabled": True, "history_limit": 30}
-        return [form], defaults
+        with self._proxy_lock:
+            return native_ui.form(self, RANK_GROUPS, RANK_META, DEFAULT_RANKINGS)
 
     def get_page(self) -> List[dict]:
-        """简洁结果页；技术日志默认折叠，仅在排障时展开。"""
-        attribute_counts, ranking_counts = self._aggregate_counts()
-        active_server_count = sum(
-            1 for state in (self._state.get("servers") or {}).values()
-            if not isinstance(state, dict) or state.get("active", True)
-        )
-        runtime_state = str(self._runtime.get("state") or "idle")
-        state_meta = {
-            "idle": ("尚未运行", "info"),
-            "running": ("正在同步", "info"),
-            "completed": ("同步成功", "success"),
-            "completed_with_warnings": ("已完成，有少量警告", "warning"),
-            "failed": ("同步失败", "error"),
-        }
-        state_label, state_type = state_meta.get(runtime_state, (runtime_state, "info"))
-        stats = self._runtime.get("stats") or {}
-        result_rows: List[dict] = []
-        if self._attribute_enabled:
-            for key, rule in self.ATTRIBUTE_RULES.items():
-                if key not in self._enabled_rules:
-                    continue
-                result_rows.append({"component": "tr", "content": [
-                    {"component": "td", "text": "属性专区"},
-                    {"component": "td", "text": rule["name"]},
-                    {"component": "td", "text": "已启用"},
-                    {"component": "td", "text": str(attribute_counts.get(key, 0))},
-                ]})
-        source_rows: List[dict] = []
-        if self._ranking_enabled:
-            for key in sorted(self._selected_rankings):
-                meta = RANK_META[key]
-                status = (self._state.get("source_status") or {}).get(key) or {}
-                if status.get("ok"):
-                    label = "正常"
-                    detail = str(status.get("source") or "")
-                elif status:
-                    label = "失败，已保留旧内容"
-                    detail = str(status.get("error") or "")
-                else:
-                    label = "等待首次同步"
-                    detail = ""
-                result_rows.append({"component": "tr", "content": [
-                    {"component": "td", "text": "榜单"},
-                    {"component": "td", "text": meta["collection"]},
-                    {"component": "td", "text": label},
-                    {"component": "td", "text": str(ranking_counts.get(key, 0))},
-                ]})
-                source_rows.append({"component": "tr", "content": [
-                    {"component": "td", "text": meta["collection"]},
-                    {"component": "td", "text": label},
-                    {"component": "td", "text": detail},
-                ]})
-        if not result_rows:
-            result_rows = [{"component": "tr", "content": [
-                {"component": "td", "props": {"colspan": 4},
-                 "text": "尚未启用虚拟库，请回到配置页勾选后保存。"},
-            ]}]
-        log_rows = [{"component": "tr", "content": [
-            {"component": "td", "text": str(item.get("time", ""))},
-            {"component": "td", "text": str(item.get("level", "INFO"))},
-            {"component": "td", "text": str(item.get("message", ""))},
-        ]} for item in reversed(list(self._logs)[-50:])]
-        connection_test = self._state.get("connection_test") or {}
-        connection_type = (
-            "success" if connection_test.get("ok") else "error" if connection_test else "info"
-        )
-        connection_message = str(
-            connection_test.get("message") or "尚未测试；将复用 MoviePilot 已配置的 Emby。"
-        )
-        schedule_message = (
-            f"Cron {self._sync_cron}"
-            if self._daily_sync_enabled else "未启用定时更新"
-        )
-        token = self._secret(getattr(settings, "API_TOKEN", ""))
-        return [{"component": "div", "props": {"class": "pa-3"}, "content": [
-            {"component": "VAlert", "props": {
-                "type": state_type, "variant": "tonal", "class": "mb-3",
-                "title": state_label,
-                "text": (
-                    f"{self._runtime.get('message') or '保存配置后点击一键重建。'}\n"
-                    f"最后成功同步：{self._state.get('last_sync') or '暂无'}\n"
-                    f"定时更新：{schedule_message}"
-                ),
-            }},
-            {"component": "VAlert", "props": {
-                "type": connection_type, "variant": "tonal", "class": "mb-3",
-                "title": "Emby 连接", "text": connection_message,
-            }},
-            {"component": "VAlert", "props": {
-                "type": "success" if self._proxy_status.get("running") else "warning",
-                "variant": "tonal", "class": "mb-3",
-                "title": "8098 虚拟库入口",
-                "text": (
-                    f"{self._proxy_status.get('message') or 'MoviePilot 内置网关未注册'}；"
-                    f"NextEmby 对外地址固定为 http://NAS-IP:{self.PUBLIC_GATEWAY_PORT}"
-                ),
-            }},
-            {"component": "div", "props": {"class": "d-flex flex-wrap ga-3 mb-3"}, "content": [
-                {"component": "VBtn", "props": {
-                    "color": "primary", "variant": "outlined", "prepend-icon": "mdi-lan-connect",
-                }, "text": "测试连接", "events": {"click": {
-                    "api": "plugin/MediaArchiver/test_connection", "method": "post",
-                    "params": {"token": token},
-                }}},
-                {"component": "VBtn", "props": {
-                    "color": "primary", "variant": "flat", "prepend-icon": "mdi-refresh",
-                }, "text": "一键重建", "events": {"click": {
-                    "api": "plugin/MediaArchiver/rebuild", "method": "post",
-                    "params": {"token": token},
-                }}},
-            ]},
-            {"component": "VRow", "props": {"class": "mb-3"}, "content": [
-                {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "tonal"}, "content": [
-                        {"component": "VCardText", "text": f"{int(stats.get('scanned') or 0)}\n本次扫描"},
-                    ]},
-                ]},
-                {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "tonal"}, "content": [
-                        {"component": "VCardText", "text": f"{sum(ranking_counts.values())}\n榜单命中"},
-                    ]},
-                ]},
-                {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "tonal"}, "content": [
-                        {"component": "VCardText", "text": f"{sum(attribute_counts.values())}\n属性命中"},
-                    ]},
-                ]},
-                {"component": "VCol", "props": {"cols": 6, "md": 3}, "content": [
-                    {"component": "VCard", "props": {"variant": "tonal"}, "content": [
-                        {"component": "VCardText", "text": f"{active_server_count}\n生效服务器"},
-                    ]},
-                ]},
-            ]},
-            {"component": "div", "props": {"class": "text-h5 font-weight-bold mb-2"},
-             "text": "虚拟库结果"},
-            {"component": "VTable", "props": {"density": "compact", "hover": True}, "content": [
-                {"component": "thead", "content": [{"component": "tr", "content": [
-                    {"component": "th", "text": "类型"}, {"component": "th", "text": "名称"},
-                    {"component": "th", "text": "状态"}, {"component": "th", "text": "命中"},
-                ]}]},
-                {"component": "tbody", "content": result_rows},
-            ]},
-            {"component": "VExpansionPanels", "props": {
-                "multiple": True, "variant": "accordion", "class": "mt-4",
-            }, "content": [
-                {"component": "VExpansionPanel", "content": [
-                    {"component": "VExpansionPanelTitle", "content": [
-                        {"component": "VIcon", "props": {"icon": "mdi-tools", "class": "mr-2"}},
-                        {"component": "span", "text": "故障详情与运行日志（需要时展开）"},
-                    ]},
-                    {"component": "VExpansionPanelText", "content": [
-                        {"component": "div", "props": {"class": "text-h6 mb-2"}, "text": "榜单数据源"},
-                        {"component": "VTable", "props": {"density": "compact", "hover": True}, "content": [
-                            {"component": "thead", "content": [{"component": "tr", "content": [
-                                {"component": "th", "text": "榜单"}, {"component": "th", "text": "状态"},
-                                {"component": "th", "text": "来源或错误"},
-                            ]}]},
-                            {"component": "tbody", "content": source_rows or [{"component": "tr", "content": [
-                                {"component": "td", "props": {"colspan": 3}, "text": "暂无榜单运行记录"},
-                            ]}]},
-                        ]},
-                        {"component": "div", "props": {"class": "text-h6 my-2"}, "text": "最近 50 条日志"},
-                        {"component": "VTable", "props": {"density": "compact", "hover": True}, "content": [
-                            {"component": "thead", "content": [{"component": "tr", "content": [
-                                {"component": "th", "text": "时间"}, {"component": "th", "text": "级别"},
-                                {"component": "th", "text": "内容"},
-                            ]}]},
-                            {"component": "tbody", "content": log_rows or [{"component": "tr", "content": [
-                                {"component": "td", "props": {"colspan": 3}, "text": "暂无日志"},
-                            ]}]},
-                        ]},
-                    ]},
-                ]},
-            ]},
-        ]}]
+        with self._proxy_lock:
+            return native_ui.page(self, RANK_META)
 
     def _start_sync(self, mode: str = "rebuild") -> schemas.Response:
         """启动后台同步，避免在 MoviePilot API/UI 请求线程中长时间阻塞。"""
-        if not self.get_state():
-            return schemas.Response(
-                success=False, message="请至少启用媒体属性专区或榜单虚拟库其中一项"
-            )
-        if self._stopping:
-            return schemas.Response(success=False, message="插件正在停止")
-        if not self._run_lock.acquire(blocking=False):
-            return schemas.Response(success=False, message="已有同步任务运行中，请勿重复点击")
-        worker = threading.Thread(
-            target=self._sync_worker, args=(mode, self._sync_cancel),
-            name="MediaVirtualLibrarySync", daemon=True,
-        )
-        worker.start()
-        return schemas.Response(success=True, message="已启动后台同步，请在插件数据页查看进度")
+        with self._proxy_lock:
+            if not self.get_state():
+                self._runtime = {"state": "idle", "message": "请先启用属性专区或榜单虚拟库并保存配置", "stats": {}}
+                return schemas.Response(success=False, message=self._runtime["message"])
+            if self._stopping:
+                return schemas.Response(success=False, message="插件正在停止")
+            if not self._run_lock.acquire(blocking=False):
+                return schemas.Response(success=False, message="已有同步任务运行中，请勿重复点击")
+            try:
+                worker = threading.Thread(target=self._sync_worker, args=(mode, self._sync_cancel),
+                                          name="MediaVirtualLibrarySync", daemon=True)
+                self._runtime = {"state": "running", "message": "同步任务已启动", "mode": mode, "stats": {}}
+                worker.start()
+            except Exception as err:
+                self._run_lock.release()
+                self._runtime = {"state": "failed", "message": f"同步线程启动失败：{type(err).__name__}", "mode": mode, "stats": {}}
+                return schemas.Response(success=False, message=self._runtime["message"])
+        return schemas.Response(success=True, message="已启动后台同步，请点击刷新进度查看结果")
 
     def _scheduled_sync(self, mode: str = "scheduled", schedule: str = "") -> None:
         if self.get_state() and not self._stopping:
@@ -3615,108 +2654,84 @@ class MediaArchiver(_PluginBase):
     def _sync_worker(self, mode: str, cancel_event=None) -> None:
         cancel_event = cancel_event or self._sync_cancel
         started = time.monotonic()
-        self._runtime = {
-            "state": "running", "message": "正在连接 Emby 并计算差异……",
-            "mode": mode, "stats": {},
-        }
-        mode_name = {
-            "incremental": "增量校准",
-            "timed": "定时全量更新",
-            "scheduled": "启动校准",
-            "rebuild": "全量重建",
-        }.get(mode, "全量重建")
-        self._record("INFO", f"开始{mode_name}")
         try:
-            clients = self._create_clients()
-            servers_state = self._state.setdefault("servers", {})
-
-            ranking_results: Dict[str, RankingResult] = {}
-            if self._ranking_enabled and self._selected_rankings:
-                cache_complete = all(key in self._ranking_cache for key in self._selected_rankings)
-                if mode == "incremental" and cache_complete:
-                    ranking_results = {
-                        key: self._ranking_cache[key] for key in self._selected_rankings
-                    }
-                    self._record("INFO", "增量校准复用榜单缓存，不重复请求外部榜单源")
+            with self._proxy_lock:
+                self._check_sync_lifecycle(cancel_event)
+                # Detached computation context: reload cannot alter this batch's settings.
+                worker = copy.copy(self)
+                for key in ("_enabled_rules", "_selected_rankings", "_emby_servers", "_ranking_regions"):
+                    setattr(worker, key, copy.copy(getattr(self, key)))
+                worker._ranking_cache = dict(self._ranking_cache)
+                self._runtime = {"state": "running", "message": "正在连接 Emby 并计算差异……",
+                                 "mode": mode, "stats": {}}
+            clients = worker._create_clients()
+            ranking_results = {}
+            if worker._ranking_enabled and worker._selected_rankings:
+                if mode == "incremental" and all(key in worker._ranking_cache for key in worker._selected_rankings):
+                    ranking_results = {key: worker._ranking_cache[key] for key in worker._selected_rankings}
                 else:
-                    fetcher = self._make_fetcher()
+                    fetcher = worker._make_fetcher()
                     fetcher.cancel_event = cancel_event
-                    ranking_results = fetcher.fetch(self._selected_rankings)
-                    if cancel_event.is_set():
-                        raise CancelledError()
-                    self._ranking_cache = dict(ranking_results)
-            elif not self._ranking_enabled:
-                self._ranking_cache = {}
-
-            if cancel_event.is_set():
-                raise CancelledError()
-            self._state["source_status"] = {
-                key: {
-                    "ok": result.ok, "source": result.source,
-                    "error": result.error, "items": len(result.entries),
-                    "complete": result.complete,
-                }
-                for key, result in ranking_results.items()
-            }
-
-            totals = {
-                "servers": 0, "scanned": 0, "added": 0, "removed": 0,
-                "attribute_hits": 0, "ranking_hits": 0, "ranking_failed": 0,
-            }
-            failures: List[str] = []
+                    ranking_results = fetcher.fetch(worker._selected_rankings)
+            source_status = {key: {"ok": result.ok, "source": result.source, "error": result.error,
+                                   "items": len(result.entries), "complete": result.complete}
+                             for key, result in ranking_results.items()}
+            with self._proxy_lock:
+                self._check_sync_lifecycle(cancel_event)
+                self._ranking_cache = dict(ranking_results)
+                self._state["source_status"] = source_status
+            totals = {key: 0 for key in ("servers", "scanned", "added", "removed", "attribute_hits", "ranking_hits", "ranking_failed")}
+            failures = []
             for client, server_name in clients:
-                if self._stopping or cancel_event.is_set():
-                    raise CancelledError()
+                with self._proxy_lock:
+                    self._check_sync_lifecycle(cancel_event)
                 try:
-                    stats = self._sync_server(client, server_name, ranking_results, cancel_event)
+                    # The worker computes against its fixed inputs; this owner publishes.
+                    stats = worker._sync_server(client, server_name, ranking_results, cancel_event, owner=self)
                     totals["servers"] += 1
-                    for key in ("scanned", "added", "removed", "attribute_hits",
-                                "ranking_hits", "ranking_failed"):
-                        totals[key] += int(stats.get(key) or 0)
+                    for key in totals:
+                        if key != "servers": totals[key] += int(stats.get(key) or 0)
+                    with self._proxy_lock:
+                        self._check_sync_lifecycle(cancel_event)
+                        self._runtime["stats"] = dict(totals)
+                        self._runtime["message"] = f"已完成 {server_name}，继续同步……"
                 except CancelledError:
                     raise
                 except Exception as err:
-                    message = f"{server_name}：{err}"
-                    failures.append(message)
-                    self._record("ERROR", f"服务器同步失败：{message}")
-
+                    failures.append(f"{server_name}：{err}")
             if not totals["servers"]:
                 raise RuntimeError("所有 Emby 服务器均同步失败；" + "；".join(failures))
-            # 临时断线不能让已保存的虚拟库失效。仅当用户明确选择了服务器，
-            # 且至少一台完成同步后，才停用已经不在选择列表中的旧状态。
-            selected_names = set(self._emby_servers)
-            if selected_names:
-                for value in servers_state.values():
-                    if isinstance(value, dict) and str(value.get("name") or "") not in selected_names:
-                        value["active"] = False
-            now = datetime.now().astimezone().isoformat(timespec="seconds")
-            self._state["last_sync"] = now
-            self._save_state()
             seconds = round(time.monotonic() - started, 2)
-            suffix = f"；{len(failures)} 台服务器失败" if failures else ""
-            message = (
-                f"完成：{totals['servers']} 台 Emby，扫描 {totals['scanned']} 项，"
-                f"新增 {totals['added']}，移除 {totals['removed']}，用时 {seconds}s{suffix}"
-            )
-            self._runtime = {
-                "state": "completed_with_warnings" if failures else "completed",
-                "message": message, "mode": mode, "stats": totals,
-            }
-            self._record("WARNING" if failures else "INFO", message)
-        except CancelledError:
-            if cancel_event is self._sync_cancel:
-                self._runtime = {"state": "cancelled", "message": "同步已取消，保留已有虚拟库", "mode": mode, "stats": {}}
-            self._record("INFO", "同步已取消：插件停止或配置重载；保留已有虚拟库")
-        except Exception as err:
-            message = str(err)
-            self._runtime = {"state": "failed", "message": message, "mode": mode, "stats": {}}
-            self._record("ERROR", f"同步终止：{message}")
-            try:
+            warnings = bool(failures or totals["ranking_failed"] or any(not result.complete for result in ranking_results.values()))
+            message = (f"完成：{totals['servers']} 台 Emby，扫描 {totals['scanned']} 项，"
+                       f"新增 {totals['added']}，移除 {totals['removed']}，用时 {seconds}s")
+            if failures: message += "；" + "；".join(failures)
+            if totals["ranking_failed"]: message += f"；{totals['ranking_failed']} 个榜单源失败，保留可信旧内容"
+            with self._proxy_lock:
+                self._check_sync_lifecycle(cancel_event)
+                selected = set(worker._emby_servers)
+                for state in self._state["servers"].values():
+                    if selected and state.get("name") not in selected: state["active"] = False
+                self._state["last_sync"] = datetime.now().astimezone().isoformat(timespec="seconds")
                 self._save_state()
-            except Exception:
-                pass
+                self._runtime = {"state": "completed_with_warnings" if warnings else "completed",
+                                 "message": message, "mode": mode, "stats": totals}
+                self._record("WARNING" if warnings else "INFO", message)
+        except CancelledError:
+            with self._proxy_lock:
+                if cancel_event is self._sync_cancel:
+                    self._runtime = {"state": "cancelled", "message": "同步已取消，保留已有虚拟库", "mode": mode, "stats": {}}
+        except Exception as err:
+            with self._proxy_lock:
+                if cancel_event is self._sync_cancel and not cancel_event.is_set():
+                    self._runtime = {"state": "failed", "message": str(err), "mode": mode, "stats": {}}
+                    self._record("ERROR", f"同步终止：{err}")
         finally:
             self._run_lock.release()
+
+    def _check_sync_lifecycle(self, event) -> None:
+        if self._stopping or event.is_set() or event is not self._sync_cancel:
+            raise CancelledError()
 
     def _make_fetcher(self) -> RankingFetcher:
         tmdb_key = self._tmdb_key or self._secret(getattr(settings, "TMDB_API_KEY", ""))
@@ -3737,6 +2752,7 @@ class MediaArchiver(_PluginBase):
         server_name: str,
         ranking_results: Mapping[str, RankingResult],
         cancel_event=None,
+        owner=None,
     ) -> Dict[str, int]:
         """计算首页虚拟库成员；不调用 ``/Collections``。"""
         # 去重集中在此处；后续复用字典视图，不再复制整库列表。
@@ -3747,7 +2763,7 @@ class MediaArchiver(_PluginBase):
         index = None
         identity = f"{server_name}|{client.api_root}"
         servers = self._state.setdefault("servers", {})
-        state = servers.setdefault(identity, {})
+        state = copy.deepcopy(servers.get(identity) or {})
         state.update({
             "name": server_name, "api_root": client.api_root,
             "active": True, "last_error": "",
@@ -3796,7 +2812,6 @@ class MediaArchiver(_PluginBase):
                 if old and old.get("recognition_policy") == "strict-v1":
                     old = dict(old)
                     old["item_ids"] = sorted(set(old.get("item_ids") or []) & item_map.keys())
-                    old["cover_tag"] = self._cover_tag(view_key, old["item_ids"])
                     next_views[view_key] = old
                     ranking_counts[key] = len(old["item_ids"])
                 else:
@@ -3836,32 +2851,24 @@ class MediaArchiver(_PluginBase):
             added += len(new_ids - old_ids)
             removed += len(old_ids - new_ids)
 
-        if cancel_event is not None and cancel_event.is_set():
-            raise CancelledError()
-        state.update({
-            "attribute_counts": attribute_counts,
-            "ranking_counts": ranking_counts,
-            "virtual_views": next_views,
-            "last_sync": now,
-        })
+        proxy_index = {key: self._compact_proxy_item(value) for key, value in item_map.items()}
+        state.update({"attribute_counts": attribute_counts, "ranking_counts": ranking_counts,
+                      "virtual_views": next_views, "last_sync": now, "item_index": proxy_index})
         primary_name = self._emby_servers[0] if self._emby_servers else ""
-        is_primary = (
-            self._is_proxy_origin(client.api_root)
-            or (not self._gateway_api_root and (not primary_name or server_name == primary_name))
-        )
-        if is_primary:
-            self._gateway_client_cache = client
-            self._gateway_server_name = server_name
-            self._gateway_api_root = client.api_root
-            # 先构造完整快照，持锁时只替换引用，浏览请求不等待整库整理。
-            proxy_views = {
-                str(value["id"]): dict(value) for value in next_views.values()
-                if value.get("id")
-            }
-            proxy_index = {key: self._compact_proxy_item(value) for key, value in item_map.items()}
-            with self._proxy_lock:
-                self._virtual_views = proxy_views
-                self._proxy_item_index = proxy_index
+        is_primary = (self._is_proxy_origin(client.api_root)
+                      or (not self._gateway_api_root and (not primary_name or server_name == primary_name)))
+        proxy_views = {str(value["id"]): dict(value) for value in next_views.values() if value.get("id")}
+        owner = owner or self
+        with owner._proxy_lock:
+            if cancel_event is not None:
+                owner._check_sync_lifecycle(cancel_event)
+            owner._state.setdefault("servers", {})[identity] = state
+            if is_primary:
+                owner._gateway_client_cache = client
+                owner._gateway_server_name = server_name
+                owner._gateway_api_root = client.api_root
+                owner._virtual_views = proxy_views
+                owner._proxy_item_index = proxy_index
         attribute_hits = sum(attribute_counts.values())
         ranking_hits = sum(ranking_counts.values())
         self._record(
@@ -3906,7 +2913,6 @@ class MediaArchiver(_PluginBase):
             "id": self._view_id(key), "key": key, "name": name, "kind": kind,
             "collection_type": collection_type, "item_ids": ids,
             "server_id": server_id, "updated": updated,
-            "cover_tag": self._cover_tag(key, ids),
         }
 
     @staticmethod
@@ -4294,9 +3300,9 @@ class MediaArchiver(_PluginBase):
         self._boot_timer = None
 
     def stop_service(self) -> None:
-        self._stopping = True
-        self._sync_cancel.set()
-        self._cover_studio.invalidate_jobs()
+        with self._proxy_lock:
+            self._stopping = True
+            self._sync_cancel.set()
         self._cancel_timers()
         self._remove_gateway_routes()
         self._close_httpx_client()

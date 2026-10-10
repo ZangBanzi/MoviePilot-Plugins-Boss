@@ -33,8 +33,7 @@ def main():
         print(f'校验通过：{len(files)} 个文件')
         return
     version = json.loads((ROOT / 'package.v2.json').read_text())['MediaArchiver']['version']
-    for name, pattern in [('plugins.v2/mediaarchiver/__init__.py', r'plugin_version = "([^"]+)"'),
-                          ('plugins.v2/mediaarchiver/coverstudio.py', r'engine_version = "([^"]+)"')]:
+    for name, pattern in [('plugins.v2/mediaarchiver/__init__.py', r'plugin_version = "([^"]+)"')]:
         match = re.search(pattern, (ROOT / name).read_text())
         if not match or match[1] != version:
             raise SystemExit(f'版本不一致：{name}')
