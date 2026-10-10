@@ -19,6 +19,8 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+      - name: Verify committed release files
+        run: python scripts/release.py --check
       - run: pip install -r requirements-dev.txt
       - run: python scripts/check.py
       - run: npm ci
@@ -32,9 +34,18 @@ jobs:
       - run: npx playwright install --with-deps chromium
         working-directory: frontend
       - run: python scripts/check_ui.py
-      - run: python scripts/release.py --check
+      - name: Package rebuilt release
+        run: |
+          python scripts/release.py
+          python scripts/release.py --check
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mediaarchiver-release
+          path: releases/*.zip
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: local-qa-diagnostics
           path: .work/
+          include-hidden-files: true

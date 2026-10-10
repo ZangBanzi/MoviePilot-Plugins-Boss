@@ -13,3 +13,6 @@
 旧报告保存在 docs/HANDOFF-4.6.1.md、docs/TEST_REPORT-4.6.1.md，4.6.0归档仍保留。完整发布包 releases/MediaArchiver-v4.6.2.zip，解压按原目录更新，不把ZIP直接当市场插件安装。
 
 本次未访问、部署NAS，未更新真实Emby图片、未重启MoviePilot、未改媒体/ItemId/MediaSource/端口/302。本地验证不代表现场部署。2026-10-10 已通过现有 GitHub Desktop 登录将4.6.1和4.6.2两个提交快进上传 main，远程提交31fa2db5a8b68080065836784e67c7e1dd238921与本地一致。终端HTTPS无凭据和GitHub集成403仍存在，Desktop通道可用；未创建PR。自动回归结果另行读取，NAS部署仍未执行。
+
+
+2026-10-10 首次远程Actions的后端、依赖审计、构建和浏览器步骤通过，最后校验失败：Linux重建产物与macOS提交产物的完整清单不一致。CI现先在构建前验证已提交SHA256SUMS，再对本次重建输出打包并校验；二者分别验证，不能用重建清单代替原始提交校验。CI成功后提供完整ZIP artifact，失败诊断显式包含隐藏.work目录。最新修复的远程结果待核实。

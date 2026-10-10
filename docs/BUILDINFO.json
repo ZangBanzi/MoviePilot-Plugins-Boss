@@ -53,5 +53,14 @@
   "pytest_seconds": 43.49,
   "frontend_audit_run": false,
   "frontend_audit_baseline": "4.6.1; lockfile dependencies unchanged",
-  "npm_ci_run": false
+  "npm_ci_run": false,
+  "remote_ci": {
+    "first_run": "38018401368",
+    "code_commit": "31fa2db",
+    "result": "failure",
+    "failure_step": "post-build release.py --check",
+    "earlier_steps": "backend, audit, builds, browser succeeded",
+    "fix": "verify committed manifest before builds; package and verify rebuilt release afterward",
+    "fixed_run_result": "pending"
+  }
 }
